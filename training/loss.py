@@ -48,9 +48,15 @@ def momentum_continuity_loss(mu_trajectory: mx.array) -> mx.array:
 
 
 
-def decoder_reconstruction_loss(logits: mx.array, target_tokens: mx.array) -> mx.array:
+def decoder_reconstruction_loss(logits: mx.array, target_tokens: mx.array, mask: mx.array = None) -> mx.array:
     """
-    L_recon = Cross Entropy Loss
+    L_recon = Cross Entropy Loss with optional padding mask.
     """
-    loss = nn.losses.cross_entropy(logits, target_tokens, reduction='mean')
-    return loss
+    loss = nn.losses.cross_entropy(logits, target_tokens, reduction='none')
+    
+    if mask is not None:
+        loss = loss * mask
+        num_valid = mx.maximum(mask.sum(), 1)
+        return loss.sum() / num_valid
+        
+    return loss.mean()

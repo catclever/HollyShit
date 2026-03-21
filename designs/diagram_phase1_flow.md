@@ -9,21 +9,31 @@
 ```mermaid
 graph TD
     %% 阶段与输入定义
-    Sentence_t["第 t 句文本数据\n(如: '苹果落地了')"] --> Emb1["External Emb 1\n(e.g., BGE)"]
-    Sentence_t --> Emb2["External Emb 2\n(e.g., OpenAI)"]
-    
-    %% 通用表征层
-    Emb1 --> Concat["Concatenate"]
-    Emb2 --> Concat
-    Concat --> Adapter["通用的 Adapter 层\n(MLP / 降维)"]
-    Adapter --> F_t["当前句感官特征的统一定义 (F_t)"]
+    Sentence_t["第 t 句文本数据\n(如: '苹果落地了')"] -.-> Emb1["Emb 1 (BGE 1024D)"]
+    Sentence_t -.-> Emb2["Emb 2 (GTE 1024D)"]
+    Sentence_t -.-> Emb3["Emb 3 (RoBERTa 768D)"]
+    Sentence_t -.-> Emb4["Emb 4 (Text2Vec 768D)"]
 
     %% ----------------------------------------------------
-    %% 右路：上帝的真理打点器 (定义物理常数)
+    %% 右路：多视角翻译官矩阵 (并列独立非线性映射)
     %% ----------------------------------------------------
-    subgraph God_Camp ["右路：上帝真理打点 (The Deterministic)"]
-        F_t --> GodEncoder["上帝 Encoder \n(浅层映射网)"]
-        GodEncoder --> z_target["绝对确定性坐标\n(z_target)"]
+    subgraph God_Camp ["右路：翻译官矩阵与上帝融合 (The Deterministic)"]
+        Emb1 --> God1["GodEncoder 1"]
+        Emb2 --> God2["GodEncoder 2"]
+        Emb3 --> God3["GodEncoder 3"]
+        Emb4 --> God4["GodEncoder 4"]
+
+        God1 --> z1["z_1 (1024D)"]
+        God2 --> z2["z_2 (1024D)"]
+        God3 --> z3["z_3 (1024D)"]
+        God4 --> z4["z_4 (1024D)"]
+
+        z1 --> Fusion{"动态权重\n轮换融合\n(Core-Weighted)"}
+        z2 --> Fusion
+        z3 --> Fusion
+        z4 --> Fusion
+
+        Fusion --> z_target["全视角的绝对确定性上帝锚点\n(z_target)"]
     end
 
     %% ----------------------------------------------------
@@ -31,7 +41,7 @@ graph TD
     %% ----------------------------------------------------
     subgraph Dynamics_Camp ["左路：动力学预测域 (The Probabilistic)"]
         h_prev["过去的动量累积\n(Mamba 隐层栈 h_{t-1})"] --> Mamba
-        F_t --> Mamba["Mamba 动力机\n(时序推进 & 状态转移)"]
+        z_target --> Mamba["Mamba 动力机\n(根据 z_target 推进时间步)"]
         Mamba --> h_t["当前动力学隐状态 (h_t)"]
         
         h_t --> NetLayer["独立撒网层\n(Probability Mapping)"]
@@ -51,9 +61,9 @@ graph TD
     Output_Tokens -. "(3) 翻译打分" .-> ReconLoss(("L_recon"))
 
     %% 全局梯度反馈信号 (所有模块在同一个空间里被揉碎)
-    ReconLoss -.-> |强制上帝和 Decoder 在空间立规矩| GodEncoder
-    CoverageLoss -.-> |强制 Mamba 的网覆盖上帝打的点| NetLayer
-    MomLoss -.-> |倒逼上帝改变空间分布，变得平滑| GodEncoder
+    ReconLoss -.-> |强制 Encoder 和 Decoder 统一法度| Fusion
+    CoverageLoss -.-> |强制 Mamba 的网覆盖融合点| NetLayer
+    MomLoss -.-> |倒逼 Encoder 改变空间分布变得平滑| Fusion
 ```
 
 ---

@@ -31,13 +31,12 @@ wheels/
 # designs
 # designs/
 
-# datas
-data
-
 # Agent Metadata
 .agent/
 
 # Datasets & Weights
+data
+checkpoints/
 *.npz
 *.safetensors
 *.bin

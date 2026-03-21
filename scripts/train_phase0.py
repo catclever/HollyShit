@@ -1,0 +1,125 @@
+import os
+import argparse
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+from transformers import AutoTokenizer
+
+from model.config import ModelConfig
+from model.adapter import MultiSenseAdapter, GodEncoder
+from model.decoder import WeakDecoder
+from training.dataloader import MultiEmbDataLoader
+from training.loss import decoder_reconstruction_loss
+from training.checkpoint import Checkpointer
+from training.args import get_training_parser
+
+def main():
+    parser = get_training_parser(description="Phase 0: GodEncoders + WeakDecoder Alignment Training")
+    args = parser.parse_args()
+
+    # 1. Config & Tokenizer
+    config = ModelConfig()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
+        tokenizer.pad_token = tokenizer.eos_token
+    except Exception as e:
+        print(f"Warning: Could not load Qwen tokenizer ({e}). Make sure you have HuggingFace Hub access.")
+        return
+
+    config.vocab_size = tokenizer.vocab_size
+
+    # 2. Models Setup
+    d_model = config.decoder_heads * 64
+    sense_adapter = MultiSenseAdapter(config.emb_dims, d_model)
+    god_encoder = GodEncoder(d_model, config.z_dim)
+    decoder = WeakDecoder(config.z_dim, config.vocab_size, d_model=d_model, n_layers=config.decoder_layers)
+    
+    class Phase0Composite(nn.Module):
+        def __init__(self, sense_adp, god_enc, dec):
+            super().__init__()
+            self.sense_adapter = sense_adp
+            self.god_encoder = god_enc
+            self.decoder = dec
+            
+        def __call__(self, embs, tokens):
+            f_t = self.sense_adapter(embs, training=True)
+            z_target = self.god_encoder(f_t)
+            logits = self.decoder(z_target, tokens)
+            return logits
+            
+    model_composite = Phase0Composite(sense_adapter, god_encoder, decoder)
+    mx.eval(model_composite.parameters())
+    print("Model composite initialized.")
+
+    # 3. Dataloader
+    emb_files = [
+        "data/Basic_ZH/embs/hy-tmp/roberta_embeddings.npy",
+        "data/Basic_ZH/embs/hy-tmp/gte_embeddings.npy",
+        "data/Basic_ZH/embs/hy-tmp/bge_embeddings.npy",
+        "data/Basic_ZH/embs/hy-tmp/text2vec_embeddings.npy"
+    ]
+    
+    dataloader = MultiEmbDataLoader(
+        parquet_path="data/Basic_ZH/chunked_mixed_wiki.parquet",
+        emb_paths=emb_files,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        max_seq_len=config.max_seq_len,
+        shuffle=True
+    )
+
+    # 4. Checkpointer Abstraction (Replaces manual saving and handles Interrupts)
+    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
+    checkpointer.register_model("sense_adapter", sense_adapter)
+    checkpointer.register_model("god_encoder", god_encoder)
+    checkpointer.register_model("decoder", decoder)
+    checkpointer.register_dataloader("dataloader", dataloader)
+    checkpointer.register_args(args)
+    
+    start_step = 0
+    if args.resume_from:
+        start_step = checkpointer.load(args.resume_from)
+    elif args.auto_resume:
+        start_step = checkpointer.load_latest()
+
+    # 5. Optimizer
+    optimizer = optim.AdamW(learning_rate=args.lr)
+
+    # 6. Loss Function closure
+    def loss_fn(model, embs, input_ids, target_ids, target_mask):
+        logits = model(embs, input_ids)
+        loss = decoder_reconstruction_loss(logits, target_ids, mask=target_mask)
+        return loss
+
+    step_fn = nn.value_and_grad(model_composite, loss_fn)
+
+    # 7. Training Loop 
+    print(f"Starting Phase 0 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}")
+    global_step = start_step
+
+    try:
+        for epoch in range(dataloader.current_epoch, args.epochs):
+            for token_inputs, batch_embs, attention_mask in dataloader:
+                input_ids = token_inputs[:, :-1]
+                target_ids = token_inputs[:, 1:]
+                target_mask = attention_mask[:, 1:]
+
+                loss, grads = step_fn(model_composite, batch_embs, input_ids, target_ids, target_mask)
+                
+                optimizer.update(model_composite, grads)
+                mx.eval(model_composite.parameters(), optimizer.state)
+                
+                global_step += 1
+                
+                if global_step % 10 == 0:
+                    print(f"Epoch {epoch+1} | Step {global_step} | L_recon: {loss.item():.4f}")
+                    
+                if global_step % args.save_steps == 0:
+                    checkpointer.save(global_step)
+                    
+    except KeyboardInterrupt:
+        # The Checkpointer's universal signal trap raised KeyboardInterrupt
+        checkpointer.save(global_step, is_emergency=True)
+
+if __name__ == "__main__":
+    main()
