@@ -10,8 +10,10 @@ def coverage_loss(mu_net: mx.array, logvar_net: mx.array, z_target: mx.array) ->
     L_coverage = (z_target - mu_net)^2 / (2 * sigma_net^2) + log(sigma_net)
                = 0.5 * ( (z - mu)^2 / exp(logvar) ) + 0.5 * logvar
     """
-    # Numerically stabilize logvar
-    logvar_net = mx.clip(logvar_net, -20.0, 20.0)
+    # Numerically stabilize logvar to prevent VAE gradient explosion
+    # Mamba might predict highly confident (very negative logvar) initial steps,
+    # causing var to approach 0, blowing up the gradient of mu. Limit min logvar to -5.0.
+    logvar_net = mx.clip(logvar_net, -5.0, 20.0)
     
     sq_err = mx.square(z_target - mu_net)
     var = mx.exp(logvar_net)

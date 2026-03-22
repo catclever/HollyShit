@@ -6,7 +6,8 @@ import mlx.optimizers as optim
 from transformers import AutoTokenizer
 
 from model.config import ModelConfig
-from model.adapter import MultiSenseAdapter, GodEncoder
+from model.adapter import SensoryFuser
+from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
 from training.dataloader import MultiEmbDataLoader
 from training.loss import decoder_reconstruction_loss
@@ -19,6 +20,8 @@ def main():
 
     # 1. Config & Tokenizer
     config = ModelConfig()
+    config.z_dim = args.z_dim
+    
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
         tokenizer.pad_token = tokenizer.eos_token
@@ -30,24 +33,38 @@ def main():
 
     # 2. Models Setup
     d_model = config.decoder_heads * 64
-    sense_adapter = MultiSenseAdapter(config.emb_dims, d_model)
+    fuser = SensoryFuser(config.emb_dims, d_model)
     god_encoder = GodEncoder(d_model, config.z_dim)
     decoder = WeakDecoder(config.z_dim, config.vocab_size, d_model=d_model, n_layers=config.decoder_layers)
     
     class Phase0Composite(nn.Module):
-        def __init__(self, sense_adp, god_enc, dec):
+        def __init__(self, fuser, god_enc, dec):
             super().__init__()
-            self.sense_adapter = sense_adp
+            self.fuser = fuser
             self.god_encoder = god_enc
             self.decoder = dec
             
         def __call__(self, embs, tokens):
-            f_t = self.sense_adapter(embs, training=True)
+            # Phase 0 Specific Training Strategy: Stochastic Weighted Routing (0.7, 0.1...)
+            # We enforce the specific weighting logic HERE in the training script
+            if self.training:
+                import random
+                N = len(embs)
+                alpha = args.fusion_alpha
+                rem_weight = (1.0 - alpha) / (N - 1) if N > 1 else 0.0
+                
+                weights = [rem_weight] * N
+                main_idx = random.randint(0, N - 1)
+                weights[main_idx] = alpha
+                f_t = self.fuser(embs, weights=weights)
+            else:
+                f_t = self.fuser(embs, weights=None)
+                
             z_target = self.god_encoder(f_t)
             logits = self.decoder(z_target, tokens)
             return logits
             
-    model_composite = Phase0Composite(sense_adapter, god_encoder, decoder)
+    model_composite = Phase0Composite(fuser, god_encoder, decoder)
     mx.eval(model_composite.parameters())
     print("Model composite initialized.")
 
@@ -70,7 +87,8 @@ def main():
 
     # 4. Checkpointer Abstraction (Replaces manual saving and handles Interrupts)
     checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
-    checkpointer.register_model("sense_adapter", sense_adapter)
+    
+    checkpointer.register_model("sense_fuser", fuser)
     checkpointer.register_model("god_encoder", god_encoder)
     checkpointer.register_model("decoder", decoder)
     checkpointer.register_dataloader("dataloader", dataloader)

@@ -131,7 +131,15 @@ class Checkpointer:
         
         for name, model in self._models.items():
             try:
-                model.load_weights(f"{load_path}/{name}.safetensors")
+                target_file = f"{load_path}/{name}.safetensors"
+                # Compatibility specific for the adapter to fuser rename
+                if name == "sense_fuser" and not os.path.exists(target_file):
+                    fallback_file = f"{load_path}/sense_adapter.safetensors"
+                    if os.path.exists(fallback_file):
+                        target_file = fallback_file
+                        print(f"Info: Loaded legacy '{fallback_file}' for model '{name}'.")
+                
+                model.load_weights(target_file)
             except Exception as e:
                 print(f"Warning: Could not load weights for {name}: {e}")
                 

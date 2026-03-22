@@ -118,3 +118,57 @@ class MultiEmbDataLoader:
         self.batch_idx = state["batch_idx"]
         self.indices = np.array(state["indices"])
         print(f"Resumed Dataloader from Epoch {self.current_epoch}, Batch {self.batch_idx}/{self.num_batches}")
+
+class Phase1DataLoader:
+    """
+    Dataloader specifically for Phase 1 (Mamba Spatiotemporal Dynamics).
+    Unlike Phase 0 which pulls isolated sentences, this pulls *contiguous episodes*
+    (L consecutive sentences) to form a dynamic trajectory for Mamba to learn momentum.
+    """
+    def __init__(self, 
+                 emb_paths: List[str],
+                 batch_size: int = 16,
+                 episode_len: int = 10,
+                 total_samples: int = 7619244,
+                 seed: int = 42):
+        
+        self.batch_size = batch_size
+        self.episode_len = episode_len
+        self.total_samples = total_samples
+        
+        print("Mmapping embedding arrays for Phase 1...")
+        self.embs = []
+        for path in emb_paths:
+            arr = np.load(path, mmap_mode='r')
+            self.embs.append(arr)
+            
+        self.rng = np.random.default_rng(seed)
+        self.current_epoch = 0
+        self.step = 0
+        
+    def __iter__(self):
+        return self
+        
+    def __next__(self) -> List[mx.array]:
+        # To get a trajectory, we randomly select a starting index for each item in the batch
+        # ensuring we have enough room to grab `episode_len` contiguous chunks.
+        max_start = self.total_samples - self.episode_len
+        start_indices = self.rng.integers(0, max_start, size=(self.batch_size,))
+        
+        # Build the exact ranges for each episode
+        # Shape: (B, episode_len)
+        episode_indices = start_indices[:, None] + np.arange(self.episode_len)
+        
+        # Fetch contiguous embeddings
+        # Resulting batch_embs will be a list of mx.arrays of shape (B, L, d_emb)
+        batch_embs = [mx.array(arr[episode_indices]) for arr in self.embs]
+        
+        self.step += 1
+        return batch_embs
+        
+    def state_dict(self) -> Dict[str, Any]:
+        return {"step": self.step, "current_epoch": self.current_epoch}
+        
+    def load_state_dict(self, state: Dict[str, Any]):
+        self.step = state["step"]
+        self.current_epoch = state["current_epoch"]

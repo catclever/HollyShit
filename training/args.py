@@ -10,6 +10,8 @@ def get_training_parser(description: str = "Training Script"):
     parser.add_argument("--epochs", type=int, default=3, help="Total number of epochs to train")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--save_steps", type=int, default=1000, help="Save a checkpoint every X steps")
+    parser.add_argument("--z_dim", type=int, default=1024, help="Dimension of the absolute truth anchor space (z_target)")
+    parser.add_argument("--fusion_alpha", type=float, default=0.7, help="Weight of the randomly selected primary embedding logic (rest divided equally)")
     parser.add_argument("--out_dir", type=str, default="checkpoints/run", help="Output directory for checkpoints")
     parser.add_argument("--ckpt_prefix", type=str, nargs="?", const="TIMESTAMP", default=None, help="Prefix for checkpoint folders. If passed empty, uses timestamp.")
     parser.add_argument("--tokenizer_id", type=str, default="Qwen/Qwen2.5-7B", help="HuggingFace Tokenizer ID")
