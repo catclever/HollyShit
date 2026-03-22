@@ -85,23 +85,44 @@ class Checkpointer:
             print(f"[Checkpoint] Saved at step {step} to {save_path}")
             
     def load_latest(self) -> int:
-        """Automatically finds the absolute latest checkpoint in out_dir, adopts its prefix, and loads it."""
+        """Automatically finds the checkpoint with the highest global_step."""
         if not os.path.exists(self.out_dir):
             print(f"No existing checkpoints found in {self.out_dir}. Starting fresh.")
             return 0
             
         latest_dir = None
-        max_mtime = -1
+        max_step = -1
         
         for d in os.listdir(self.out_dir):
             d_path = os.path.join(self.out_dir, d)
             if not os.path.isdir(d_path):
                 continue
                 
+            # Filter strictly by prefix if provided
+            if self.prefix and self.prefix != "TIMESTAMP":
+                if not d.startswith(self.prefix + "_"):
+                    continue
+                    
             if d.endswith("latest_emergency") or "_step_" in d or d.startswith("step_"):
-                mtime = os.path.getmtime(d_path)
-                if mtime > max_mtime:
-                    max_mtime = mtime
+                # Always attempt to extract exact step from dataloader state first
+                step = -1
+                for file in os.listdir(d_path):
+                    if file.endswith(".json") and "dataloader" in file:
+                        try:
+                            with open(os.path.join(d_path, file), "r") as f:
+                                state = json.load(f)
+                                step = state.get("global_step", -1)
+                        except:
+                            pass
+                            
+                # Fallback to folder name parsing if JSON parsing failed
+                if step == -1 and "_step_" in d:
+                    parts = d.split("_step_")
+                    if len(parts) == 2 and parts[1].isdigit():
+                        step = int(parts[1])
+                        
+                if step > max_step:
+                    max_step = step
                     latest_dir = d
                     
         if not latest_dir:

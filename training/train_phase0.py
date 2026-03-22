@@ -9,10 +9,10 @@ from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
-from training.dataloader import MultiEmbDataLoader
-from training.loss import decoder_reconstruction_loss
-from training.checkpoint import Checkpointer
-from training.args import get_training_parser
+from training.core.dataloader import MultiEmbDataLoader
+from training.core.loss import decoder_reconstruction_loss
+from training.core.checkpoint import Checkpointer
+from training.core.args import get_training_parser
 
 def main():
     parser = get_training_parser(description="Phase 0: GodEncoders + WeakDecoder Alignment Training")

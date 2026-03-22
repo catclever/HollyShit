@@ -8,10 +8,10 @@ from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.mamba_planner import MambaPlanner
 from model.mamba_mlx.mamba_mlx import MambaConfig
-from training.dataloader import Phase1DataLoader
-from training.checkpoint import Checkpointer
-from training.loss import coverage_loss, momentum_continuity_loss
-from training.args import get_training_parser
+from training.core.dataloader import Phase1DataLoader
+from training.core.checkpoint import Checkpointer
+from training.core.loss import coverage_loss, momentum_continuity_loss
+from training.core.args import get_training_parser
 
 def main():
     # 1. Parse Args (Re-use the same arguments as Phase 0, add Phase 1 specifics)

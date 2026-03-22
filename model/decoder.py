@@ -58,3 +58,43 @@ class WeakDecoder(nn.Module):
         # Project to vocabulary
         logits = self.out_proj(x)
         return logits
+
+    def generate(self, z_target: mx.array, start_token: int, max_tokens: int = 50, temperature: float = 0.7):
+        """
+        Auto-regressive generation for inference from a purely spatial coordinate.
+        z_target: (1, z_dim)
+        """
+        z_projected = self.z_proj(z_target) # (1, d_model)
+        
+        # We hold the sequence of generated tokens (Batch=1)
+        tokens = mx.array([[start_token]]) 
+        result_tokens = [start_token]
+        
+        for i in range(max_tokens):
+            x = self.embedding(tokens) # (1, seq_len, d_model)
+            
+            # Inject spatial macro point as static bias
+            x = x + z_projected[:, None, :]
+            
+            # Causal mask for autoregressive step
+            seq_len = x.shape[1]
+            mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+            
+            # Shallow forward pass
+            x = self.transformer(x, mask)
+            
+            # Get logits of the newly predicted LAST token
+            logits = self.out_proj(x[:, -1, :]) # (1, vocab_size)
+            
+            if temperature == 0:
+                next_token = mx.argmax(logits, axis=-1).item()
+            else:
+                # Stochastic sampling based on temperature
+                next_token = mx.random.categorical(logits * (1.0 / temperature)).item()
+                
+            result_tokens.append(next_token)
+            
+            # Append to the sequence
+            tokens = mx.array([result_tokens])
+            
+        return result_tokens
