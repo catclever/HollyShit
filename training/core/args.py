@@ -19,8 +19,7 @@ def get_training_parser(description: str = "Training Script"):
     # Dual Resume Mechanism
     parser.add_argument("--continue", dest="auto_resume", action="store_true", help="Automatically find and resume from the latest checkpoint or emergency save")
     parser.add_argument("--resume_from", type=str, default=None, help="Explicitly specify the path to a checkpoint directory to resume from")
-
-    parser.add_argument("--bow_weight", type=float, default=0.5, help="Weight for the Soft N-Gram BoW Reward (0.0 to disable)")
-    parser.add_argument("--bow_max_n", type=int, default=5, help="Maximum length for N-Gram continuous reward matches")
+    
+    parser.add_argument("--warmup_steps", type=int, default=2000, help="Learning rate linear warmup steps")
     
     return parser

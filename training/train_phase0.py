@@ -16,6 +16,12 @@ from training.core.args import get_training_parser
 
 def main():
     parser = get_training_parser(description="Phase 0: GodEncoders + WeakDecoder Alignment Training")
+    
+    # Phase-0 Specific Arguments
+    parser.add_argument("--bow_weight", type=float, default=0.5, help="Weight for the Soft N-Gram BoW Reward (0.0 to disable)")
+    parser.add_argument("--bow_max_n", type=int, default=5, help="Maximum length for N-Gram continuous reward matches")
+    parser.add_argument("--bow_warmup_steps", type=int, default=10000, help="Linearly scale BoW weight from 0 over X steps")
+    
     args = parser.parse_args()
 
     # 1. Config & Tokenizer
@@ -93,17 +99,22 @@ def main():
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
 
-    # 5. Optimizer
-    optimizer = optim.AdamW(learning_rate=args.lr)
+    # 5. Optimizer & Learning Rate Schedule
+    if args.warmup_steps > 0:
+        lr_schedule = optim.linear_schedule(init=0.0, end=args.lr, steps=args.warmup_steps)
+        optimizer = optim.AdamW(learning_rate=lr_schedule)
+        print(f"Enabled LR Warmup: 0.0 -> {args.lr} over {args.warmup_steps} steps.")
+    else:
+        optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 6. Loss Function closure
-    def loss_fn(model, embs, input_ids, target_ids, target_mask):
+    def loss_fn(model, embs, input_ids, target_ids, target_mask, active_bow_weight):
         logits = model(embs, input_ids)
         loss = decoder_reconstruction_loss(
             logits, 
             target_ids, 
             mask=target_mask, 
-            bow_weight=args.bow_weight,
+            bow_weight=active_bow_weight,
             bow_max_n=args.bow_max_n
         )
         return loss
@@ -117,11 +128,18 @@ def main():
     try:
         for epoch in range(dataloader.current_epoch, args.epochs):
             for token_inputs, batch_embs, attention_mask in dataloader:
+                
+                # Dynamic BoW Warmup
+                if args.bow_warmup_steps > 0 and global_step < args.bow_warmup_steps:
+                    current_bow_weight = args.bow_weight * (global_step / args.bow_warmup_steps)
+                else:
+                    current_bow_weight = args.bow_weight
+                    
                 input_ids = token_inputs[:, :-1]
                 target_ids = token_inputs[:, 1:]
                 target_mask = attention_mask[:, 1:]
 
-                loss, grads = step_fn(model_composite, batch_embs, input_ids, target_ids, target_mask)
+                loss, grads = step_fn(model_composite, batch_embs, input_ids, target_ids, target_mask, current_bow_weight)
                 
                 optimizer.update(model_composite, grads)
                 mx.eval(model_composite.parameters(), optimizer.state)
