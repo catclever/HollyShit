@@ -99,7 +99,13 @@ def main():
     # 6. Loss Function closure
     def loss_fn(model, embs, input_ids, target_ids, target_mask):
         logits = model(embs, input_ids)
-        loss = decoder_reconstruction_loss(logits, target_ids, mask=target_mask)
+        loss = decoder_reconstruction_loss(
+            logits, 
+            target_ids, 
+            mask=target_mask, 
+            bow_weight=args.bow_weight,
+            bow_max_n=args.bow_max_n
+        )
         return loss
 
     step_fn = nn.value_and_grad(model_composite, loss_fn)

@@ -50,15 +50,80 @@ def momentum_continuity_loss(mu_trajectory: mx.array) -> mx.array:
 
 
 
-def decoder_reconstruction_loss(logits: mx.array, target_tokens: mx.array, mask: mx.array = None) -> mx.array:
+def decoder_reconstruction_loss(logits: mx.array, target_tokens: mx.array, mask: mx.array = None, bow_weight: float = 0.0, bow_max_n: int = 5) -> mx.array:
     """
-    L_recon = Cross Entropy Loss with optional padding mask.
+    L_recon = Cross Entropy Loss + Optional Position-Invariant Soft N-Gram BoW Reward 
     """
-    loss = nn.losses.cross_entropy(logits, target_tokens, reduction='none')
+    ce_loss = nn.losses.cross_entropy(logits, target_tokens, reduction='none')
     
     if mask is not None:
-        loss = loss * mask
+        ce_loss = ce_loss * mask
         num_valid = mx.maximum(mask.sum(), 1)
-        return loss.sum() / num_valid
+        ce_loss = ce_loss.sum() / num_valid
+    else:
+        ce_loss = ce_loss.mean()
+
+    if bow_weight > 0.0:
+        reward = ngram_bow_reward(logits, target_tokens, mask, max_n=bow_max_n)
+        return ce_loss - bow_weight * reward
         
-    return loss.mean()
+    return ce_loss
+
+def ngram_bow_reward(logits: mx.array, target_ids: mx.array, mask: mx.array = None, max_n: int = 5) -> mx.array:
+    """
+    Diff-Soft N-Gram Bag-of-Words Reward with Exclusive Longest-Match Subsumption.
+    """
+    probs = mx.softmax(logits, axis=-1)
+    B, L_pred, V = probs.shape
+    L_target = target_ids.shape[1]
+    
+    if L_target < max_n:
+        max_n = L_target
+
+    b_idx = mx.arange(B).reshape(B, 1, 1)
+    i_idx = mx.arange(L_pred).reshape(1, L_pred, 1)
+    t_idx = target_ids.reshape(B, 1, L_target)
+    
+    M = probs[b_idx, i_idx, t_idx]
+    
+    M_list = [None, M]
+    
+    # 1. Compute Continuous Probabilities
+    for n in range(2, max_n + 1):
+        # M_n[b, i, t] = M_n-1[b, i, t] * M_1[b, i+n-1, t+n-1]
+        M_curr = M_list[-1][:, :-1, :-1] * M[:, n-1:, n-1:]
+        M_list.append(M_curr)
+        
+    # 2. Find Max Position-Invariant Matches
+    H_list = [None]
+    for n in range(1, max_n + 1):
+        H_list.append(mx.max(M_list[n], axis=1)) # Shape: (B, L_t - n + 1)
+        
+    # 3. Deduct subsets (Exclusive Longest Match Logic)
+    Exclusive_H = [None]
+    for n in range(1, max_n):
+        H_n = H_list[n]
+        H_next = H_list[n+1]
+        
+        # H_next has length (L_t - n). We pad left or right to align with H_n (L_t - n + 1)
+        pad_right = mx.pad(H_next, [(0,0), (0,1)])
+        pad_left = mx.pad(H_next, [(0,0), (1,0)])
+        
+        subsumed = mx.maximum(pad_right, pad_left)
+        exclusive = mx.maximum(0.0, H_n - subsumed)
+        Exclusive_H.append(exclusive)
+        
+    Exclusive_H.append(H_list[max_n]) # Largest N-Gram cannot be subsumed
+    
+    total_reward = 0.0
+    for n in range(2, max_n + 1):
+        best_hits = Exclusive_H[n]
+        if mask is not None:
+            valid_mask = mask[:, n-1:]
+            reward_n = (best_hits * valid_mask).sum() / mx.maximum(valid_mask.sum(), 1)
+        else:
+            reward_n = best_hits.mean()
+            
+        total_reward = total_reward + reward_n * (1.5 ** float(n))
+            
+    return total_reward
