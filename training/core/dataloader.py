@@ -80,19 +80,19 @@ class MultiEmbDataLoader:
         # 1. Fetch Texts
         batch_texts = [self.text_chunks[i] for i in batch_indices]
         
-        # 2. Tokenize and Pad dynamically
-        # Ensure your tokenizer is set up correctly (e.g. padding=True, truncation=True)
-        # Some tokenizers return PyTorch tensors if return_tensors='pt'. We use numpy/lists.
-        encoded = self.tokenizer(
-            batch_texts, 
-            padding=True, 
-            truncation=True, 
-            max_length=self.max_seq_len,
-            return_tensors='np'
-        )
-        # encoded['input_ids'] is shape (batch, padded_seq_len)
-        token_inputs = mx.array(encoded['input_ids'])
-        attention_mask = mx.array(encoded['attention_mask'])
+        # 2. Tokenize and Pad dynamically using Custom CharTokenizer
+        encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in batch_texts]
+        max_len = max(len(seq) for seq in encoded_list)
+        
+        padded_ids = []
+        masks = []
+        for seq in encoded_list:
+            pad_len = max_len - len(seq)
+            padded_ids.append(seq + [self.tokenizer.pad_token_id] * pad_len)
+            masks.append([1] * len(seq) + [0] * pad_len)
+            
+        token_inputs = mx.array(padded_ids)
+        attention_mask = mx.array(masks)
         
         # 3. Fetch Embeddings via Mmap
         # This triggers Disk I/O precisely for these specific indices

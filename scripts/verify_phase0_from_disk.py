@@ -1,9 +1,9 @@
 import mlx.core as mx
 import numpy as np
 import pandas as pd
-from transformers import AutoTokenizer
 import os
 
+from training.char_tokenizer import CharTokenizer
 from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
@@ -20,10 +20,9 @@ def verify():
     args = parser.parse_args()
 
     print("1. Loading physical architecture...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
+    tokenizer = CharTokenizer()
     
     config = ModelConfig()
-    config.vocab_size = 151643 # Hardcoded to match the exact saved checkpoint parameter shape
     d_model = config.decoder_heads * 64
     
     fuser = SensoryFuser(config.emb_dims, d_model)

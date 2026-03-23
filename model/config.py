@@ -21,7 +21,7 @@ class ModelConfig:
     
     # --- Weak Decoder Configuration ---
     # Needs to be a shallow decoder to force Mamba to learn the geometry
-    vocab_size: int = 65000  # Default large vocab size, replace with actual tokenizer size
+    vocab_size: int = 8000
     decoder_layers: int = 2
     decoder_heads: int = 8
     

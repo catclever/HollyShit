@@ -3,8 +3,8 @@ import argparse
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from transformers import AutoTokenizer
 
+from training.char_tokenizer import CharTokenizer
 from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
@@ -19,16 +19,9 @@ def main():
     args = parser.parse_args()
 
     # 1. Config & Tokenizer
+    tokenizer = CharTokenizer()
     config = ModelConfig()
     config.z_dim = args.z_dim
-    
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
-        tokenizer.pad_token = tokenizer.eos_token
-    except Exception as e:
-        print(f"Warning: Could not load Qwen tokenizer ({e}). Make sure you have HuggingFace Hub access.")
-        return
-
     config.vocab_size = tokenizer.vocab_size
 
     # 2. Models Setup
