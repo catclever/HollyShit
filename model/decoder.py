@@ -59,7 +59,7 @@ class WeakDecoder(nn.Module):
         logits = self.out_proj(x)
         return logits
 
-    def generate(self, z_target: mx.array, start_token: int, max_tokens: int = 50, temperature: float = 0.7):
+    def generate(self, z_target: mx.array, start_token: int, eos_token: int = None, max_tokens: int = 50, temperature: float = 0.7):
         """
         Auto-regressive generation for inference from a purely spatial coordinate.
         z_target: (1, z_dim)
@@ -94,7 +94,11 @@ class WeakDecoder(nn.Module):
                 
             result_tokens.append(next_token)
             
-            # Append to the sequence
+            # If the model explicitly signals end of text, cleanly stop predicting garbage
+            if eos_token is not None and next_token == eos_token:
+                break
+            
+            # Append to the sequence for the next timestep
             tokens = mx.array([result_tokens])
             
         return result_tokens
