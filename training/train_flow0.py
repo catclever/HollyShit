@@ -8,20 +8,14 @@ from training.char_tokenizer import CharTokenizer
 from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
-from model.decoder import WeakDecoder
+from model.flow_decoder import FlowDecoder
 from training.core.dataloader import MultiEmbDataLoader
-from training.core.loss import decoder_reconstruction_loss
+from training.core.flow_loss import ot_cfm_loss
 from training.core.checkpoint import Checkpointer
 from training.core.args import get_training_parser
 
 def main():
-    parser = get_training_parser(description="Phase 0: GodEncoders + WeakDecoder Alignment Training")
-    
-    # Phase-0 Specific Arguments
-    parser.add_argument("--bow_weight", type=float, default=0.5, help="Weight for the Soft N-Gram BoW Reward (0.0 to disable)")
-    parser.add_argument("--bow_max_n", type=int, default=5, help="Maximum length for N-Gram continuous reward matches")
-    parser.add_argument("--bow_warmup_steps", type=int, default=10000, help="Linearly scale BoW weight from 0 over X steps")
-    
+    parser = get_training_parser(description="Phase 0 Flow Matching: GodEncoders + Continuous ODE FlowDecoder")
     args = parser.parse_args()
 
     # 1. Config & Tokenizer
@@ -34,18 +28,17 @@ def main():
     d_model = config.decoder_heads * 64
     fuser = SensoryFuser(config.emb_dims, d_model)
     god_encoder = GodEncoder(d_model, config.z_dim)
-    decoder = WeakDecoder(config.z_dim, config.vocab_size, d_model=d_model, n_layers=config.decoder_layers)
+    decoder = FlowDecoder(config.z_dim, d_model, config.vocab_size, n_layers=config.decoder_layers)
     
-    class Phase0Composite(nn.Module):
+    class FlowPhase0Composite(nn.Module):
         def __init__(self, fuser, god_enc, dec):
             super().__init__()
             self.fuser = fuser
             self.god_encoder = god_enc
             self.decoder = dec
             
-        def __call__(self, embs, tokens):
-            # Phase 0 Specific Training Strategy: Stochastic Weighted Routing (0.7, 0.1...)
-            # We enforce the specific weighting logic HERE in the training script
+        def __call__(self, embs, tokens, mask):
+            # Stochastic Fusion: Simulate the gravitational pull of different vector spaces
             if self.training:
                 import random
                 N = len(embs)
@@ -60,12 +53,14 @@ def main():
                 f_t = self.fuser(embs, weights=None)
                 
             z_target = self.god_encoder(f_t)
-            logits = self.decoder(z_target, tokens)
-            return logits
             
-    model_composite = Phase0Composite(fuser, god_encoder, decoder)
+            # We return z_target directly. 
+            # In Continuous Flow, the decoder evaluation (ODE dynamics) happens strictly inside the loss function.
+            return z_target
+            
+    model_composite = FlowPhase0Composite(fuser, god_encoder, decoder)
     mx.eval(model_composite.parameters())
-    print("Model composite initialized.")
+    print("Flow Model composite initialized.")
 
     # 3. Dataloader
     emb_files = [
@@ -84,12 +79,12 @@ def main():
         shuffle=True
     )
 
-    # 4. Checkpointer Abstraction (Replaces manual saving and handles Interrupts)
+    # 4. Checkpointer
     checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
     
     checkpointer.register_model("sense_fuser", fuser)
     checkpointer.register_model("god_encoder", god_encoder)
-    checkpointer.register_model("decoder", decoder)
+    checkpointer.register_model("flow_decoder", decoder)
     checkpointer.register_dataloader("dataloader", dataloader)
     checkpointer.register_args(args)
     
@@ -111,39 +106,25 @@ def main():
     else:
         optimizer = optim.AdamW(learning_rate=args.lr)
 
-    # 6. Loss Function closure
-    def loss_fn(model, embs, input_ids, target_ids, target_mask, active_bow_weight):
-        logits = model(embs, input_ids)
-        loss = decoder_reconstruction_loss(
-            logits, 
-            target_ids, 
-            mask=target_mask, 
-            bow_weight=active_bow_weight,
-            bow_max_n=args.bow_max_n
-        )
+    # 6. Optimal Transport Flow Match Objective
+    def loss_fn(model, embs, tokens, target_mask):
+        z_target = model(embs, tokens, target_mask)
+        # We pass the full unbroken sequence. Flow Matching is completely non-causal.
+        loss = ot_cfm_loss(model.decoder, tokens, z_target, mask=target_mask)
         return loss
 
     step_fn = nn.value_and_grad(model_composite, loss_fn)
 
     # 7. Training Loop 
-    print(f"Starting Phase 0 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}")
+    print(f"Starting Flow Phase 0 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}")
     global_step = start_step
 
     try:
         for epoch in range(dataloader.current_epoch, args.epochs):
             for token_inputs, batch_embs, attention_mask in dataloader:
                 
-                # Dynamic BoW Warmup
-                if args.bow_warmup_steps > 0 and global_step < args.bow_warmup_steps:
-                    current_bow_weight = args.bow_weight * (global_step / args.bow_warmup_steps)
-                else:
-                    current_bow_weight = args.bow_weight
-                    
-                input_ids = token_inputs[:, :-1]
-                target_ids = token_inputs[:, 1:]
-                target_mask = attention_mask[:, 1:]
-
-                loss, grads = step_fn(model_composite, batch_embs, input_ids, target_ids, target_mask, current_bow_weight)
+                # Notice: No shifting [:-1] and [1:] needed here! Sequence is treated as a continuous physical block.
+                loss, grads = step_fn(model_composite, batch_embs, token_inputs, attention_mask)
                 
                 optimizer.update(model_composite, grads)
                 mx.eval(model_composite.parameters(), optimizer.state)
@@ -151,13 +132,12 @@ def main():
                 global_step += 1
                 
                 if global_step % 10 == 0:
-                    print(f"Epoch {epoch+1} | Step {global_step} | L_recon: {loss.item():.4f}")
+                    print(f"Epoch {epoch+1} | Step {global_step} | L_ot_cfm: {loss.item():.4f}")
                     
                 if global_step % args.save_steps == 0:
                     checkpointer.save(global_step)
                     
     except KeyboardInterrupt:
-        # The Checkpointer's universal signal trap raised KeyboardInterrupt
         checkpointer.save(global_step, is_emergency=True)
 
 if __name__ == "__main__":
