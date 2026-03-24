@@ -15,7 +15,7 @@ import random
 def verify():
     parser = argparse.ArgumentParser(description="Phase 0 Auto-regressive Dream Verifier")
     parser.add_argument("--num_samples", type=int, default=1, help="Number of random sentences to pull and dream-reconstruct")
-    parser.add_argument("--emb_idx", type=int, default=-1, help="-1: fully fused. 0:roberta, 1:gte, 2:bge, 3:text2vec")
+    parser.add_argument("--emb_indices", type=int, nargs="+", default=[-1], help="-1: fully fused. Else, a space-separated list of indices 0-3 (e.g., 0 2)")
     parser.add_argument("--ckpt", type=str, default="checkpoints/run/p0_v1_step_150000", help="Path to checkpoint directory")
     args = parser.parse_args()
 
@@ -68,23 +68,24 @@ def verify():
             
         print("5. Forwarding through SensoryFuser and GodEncoder -> z_target...")
         
-        weights = None
-        if args.emb_idx != -1:
-            weights = [0.0] * 4
-            weights[args.emb_idx] = 1.0
-            print(f"   (Using EXCLUSIVE external embedding: {emb_files[args.emb_idx].split('/')[-1]})")
-        else:
+        if -1 in args.emb_indices:
+            weights = None
             print("   (Using pure Centroid Fusion of all 4 inputs)")
+        else:
+            weights = [0.0] * 4
+            for e_idx in args.emb_indices:
+                weights[e_idx] = 1.0 / len(args.emb_indices)
+            print(f"   (Using EXCLUSIVE external embeddings: {[emb_files[i].split('/')[-1] for i in args.emb_indices]})")
             
         f_t = fuser(embs, weights=weights)
         z_target = god_encoder(f_t)
         
         print("6. Autoregressive Decoding from z_target (The Topological Dream)...")
-        bos_token = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
+        start_token = tokenizer.bos_token_id
         eos_token = tokenizer.eos_token_id
         
         # We call the newly implemented generate method on Decoder
-        generated_ids = decoder.generate(z_target, start_token=bos_token, eos_token=eos_token, max_tokens=100, temperature=0.7)
+        generated_ids = decoder.generate(z_target, start_token=start_token, eos_token=eos_token, max_tokens=100, temperature=0.2)
         decoded_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         
         print(f"\n=================【终极拓扑解码对比】=================")
