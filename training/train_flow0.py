@@ -12,6 +12,7 @@ from model.flow_decoder import FlowDecoder
 from training.core.dataloader import MultiEmbDataLoader
 from training.losses.flow_loss import ot_cfm_loss
 from training.core.checkpoint import Checkpointer
+from training.core.schedule import linear_warmup_schedule
 from training.core.args import get_training_parser
 
 def main():
@@ -94,17 +95,8 @@ def main():
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
 
-    # 5. Optimizer & Learning Rate Schedule
-    if args.warmup_steps > 0:
-        def custom_lr_schedule(step):
-            actual_step = step + start_step
-            warmup_factor = mx.minimum(1.0, actual_step / args.warmup_steps)
-            return args.lr * warmup_factor
-            
-        optimizer = optim.AdamW(learning_rate=custom_lr_schedule)
-        print(f"Enabled Absolute LR Warmup: 0.0 -> {args.lr} over {args.warmup_steps} steps (Starting at step {start_step}).")
-    else:
-        optimizer = optim.AdamW(learning_rate=args.lr)
+    # 5. Optimizer
+    optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 6. Optimal Transport Flow Match Objective
     def loss_fn(model, embs, tokens, target_mask):
@@ -122,6 +114,9 @@ def main():
     try:
         for epoch in range(dataloader.current_epoch, args.epochs):
             for token_inputs, batch_embs, attention_mask in dataloader:
+                
+                # Sync LR natively
+                optimizer.learning_rate = linear_warmup_schedule(global_step, args.lr, args.warmup_steps)
                 
                 # Notice: No shifting [:-1] and [1:] needed here! Sequence is treated as a continuous physical block.
                 loss, grads = step_fn(model_composite, batch_embs, token_inputs, attention_mask)

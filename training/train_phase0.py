@@ -12,6 +12,7 @@ from model.decoder import WeakDecoder
 from training.core.dataloader import MultiEmbDataLoader
 from training.losses.loss import decoder_reconstruction_loss
 from training.core.checkpoint import Checkpointer
+from training.core.schedule import linear_warmup_schedule
 from training.core.args import get_training_parser
 
 def main():
@@ -99,17 +100,8 @@ def main():
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
 
-    # 5. Optimizer & Learning Rate Schedule
-    if args.warmup_steps > 0:
-        def custom_lr_schedule(step):
-            actual_step = step + start_step
-            warmup_factor = mx.minimum(1.0, actual_step / args.warmup_steps)
-            return args.lr * warmup_factor
-            
-        optimizer = optim.AdamW(learning_rate=custom_lr_schedule)
-        print(f"Enabled Absolute LR Warmup: 0.0 -> {args.lr} over {args.warmup_steps} steps (Starting at step {start_step}).")
-    else:
-        optimizer = optim.AdamW(learning_rate=args.lr)
+    # 5. Optimizer
+    optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 6. Loss Function closure
     def loss_fn(model, embs, input_ids, target_ids, target_mask, active_bow_weight):
@@ -142,6 +134,9 @@ def main():
                 input_ids = token_inputs[:, :-1]
                 target_ids = token_inputs[:, 1:]
                 target_mask = attention_mask[:, 1:]
+                
+                # Sync LR natively with global step
+                optimizer.learning_rate = linear_warmup_schedule(global_step, args.lr, args.warmup_steps)
 
                 loss, grads = step_fn(model_composite, batch_embs, input_ids, target_ids, target_mask, current_bow_weight)
                 
