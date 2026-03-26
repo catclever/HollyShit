@@ -124,10 +124,20 @@ def main():
                 
                 # 8a. Generate frozen targets using Phase 0 (OUTSIDE the compiled gradient tape)
                 f_t = fuser(batch_embs, weights=None) # Centroid Mean for static truth
+                
+                # Autoregressive check: we need at least 2 chunks to predict the next step!
+                if f_t.shape[1] < 2:
+                    continue
+                    
                 z_target = god_encoder(f_t) # Shape: (B, L, z_dim)
                 
+                # Autoregressive Tensor Shift (Past -> Future)
+                f_t_input = f_t[:, :-1, :]
+                z_target_truth = z_target[:, 1:, :]
+                masks_shifted = masks[:, 1:]
+                
                 # JIT executes instantly on Apple Silicon GPU
-                total_loss, aux_losses, grads, global_norm = train_step(f_t, z_target, masks)
+                total_loss, aux_losses, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted)
                 
                 # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes/explosions)
                 # MLX evaluates to a single scalar, so .item() resolves it securely
