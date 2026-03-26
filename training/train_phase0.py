@@ -10,7 +10,7 @@ from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
 from training.core.dataloader import MultiEmbDataLoader
-from training.core.loss import decoder_reconstruction_loss
+from training.losses.loss import decoder_reconstruction_loss
 from training.core.checkpoint import Checkpointer
 from training.core.args import get_training_parser
 

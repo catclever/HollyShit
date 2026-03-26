@@ -10,7 +10,7 @@ from model.mamba_planner import MambaPlanner
 from model.mamba_mlx.mamba_mlx import MambaConfig
 from training.core.dataloader import Phase1DataLoader
 from training.core.checkpoint import Checkpointer
-from training.core.loss import coverage_loss, momentum_continuity_loss
+from training.losses.loss import coverage_loss, momentum_continuity_loss
 from training.core.args import get_training_parser
 
 def main():

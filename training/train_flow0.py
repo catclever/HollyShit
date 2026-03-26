@@ -10,7 +10,7 @@ from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.flow_decoder import FlowDecoder
 from training.core.dataloader import MultiEmbDataLoader
-from training.core.flow_loss import ot_cfm_loss
+from training.losses.flow_loss import ot_cfm_loss
 from training.core.checkpoint import Checkpointer
 from training.core.args import get_training_parser
 

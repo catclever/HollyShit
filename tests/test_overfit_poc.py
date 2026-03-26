@@ -11,7 +11,7 @@ from model.mamba_planner import MambaPlanner
 from model.probability_mapping import ProbabilityMappingLayer
 from model.decoder import WeakDecoder
 from model.mamba_mlx.mamba_mlx import MambaConfig
-from distilled_emb.losses.loss import coverage_loss, momentum_continuity_loss, decoder_reconstruction_loss
+from training.losses.loss import coverage_loss, momentum_continuity_loss, decoder_reconstruction_loss
 
 class EndogenousSystem(nn.Module):
     """
