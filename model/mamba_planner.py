@@ -14,6 +14,9 @@ class MambaPlanner(nn.Module):
         self.mamba = Mamba(config)
         self.d_model = config.d_model
         
+        # Final State Bounds (Crucial to prevent RNN exponential explosion)
+        self.out_norm = nn.RMSNorm(config.d_model)
+        
         # Dual Probability Heads
         self.mu_head = nn.Linear(config.d_model, z_dim)
         self.logvar_head = nn.Linear(config.d_model, z_dim)
@@ -32,6 +35,9 @@ class MambaPlanner(nn.Module):
         """
         # 1. State Space Sequence processing
         h_t = self.mamba(x)
+        
+        # Strictly normalize the recurrent accumulation to prevent gradient/scale overflow
+        h_t = self.out_norm(h_t)
         
         # 2. Probability Mapping
         mu = self.mu_head(h_t)
