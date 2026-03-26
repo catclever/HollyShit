@@ -1,4 +1,8 @@
 import argparse
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
@@ -95,6 +99,14 @@ def main():
         return total_loss, (l_cov, l_mom)
 
     step_fn = nn.value_and_grad(mamba_planner, loss_fn)
+    
+    @mx.compile
+    def train_step(f_t_static, z_target_static, masks_static):
+        # The compiled tape executes strictly on the trainable subsets
+        (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static)
+        # Protect RNN against gradient explosion
+        clipped_grads, _ = optim.clip_grad_norm(grads, 1.0)
+        return loss, aux, clipped_grads
 
     # 9. Training Loop
     print(f"Starting Phase 1 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}, Dynamic Document Lengths (Mamba Masked)")
@@ -105,13 +117,14 @@ def main():
             for batch_embs, masks in dataloader:
                 global_step += 1
                 
-                # 8a. Generate frozen targets using Phase 0 (OUTSIDE the gradient tape)
+                # 8a. Generate frozen targets using Phase 0 (OUTSIDE the compiled gradient tape)
                 f_t = fuser(batch_embs, weights=None) # Centroid Mean for static truth
                 z_target = god_encoder(f_t) # Shape: (B, L, z_dim)
                 
-                (total_loss, aux_losses), grads = step_fn(mamba_planner, f_t, z_target, masks)
+                # JIT executes instantly on Apple Silicon GPU
+                total_loss, aux_losses, grads = train_step(f_t, z_target, masks)
                 optimizer.update(mamba_planner, grads)
-                mx.eval(mamba_planner.parameters(), optimizer.state)
+                mx.eval(mamba_planner.parameters(), optimizer.state, total_loss)
                 
                 l_cov, l_mom = aux_losses
                 
