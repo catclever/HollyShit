@@ -60,7 +60,7 @@ class Mamba(nn.Module):
         self.config = config
 
         self.layers = [ResidualBlock(config) for _ in range(config.n_layers)]
-        #self.norm_f = RMSNorm(config.d_model)
+        self.norm_f = nn.RMSNorm(config.d_model)
 
     def __call__(self, x):
         # x : (B, L, D)
@@ -70,7 +70,7 @@ class Mamba(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        #x = self.norm_f(x)
+        x = self.norm_f(x)
 
         return x
 
@@ -84,6 +84,7 @@ class Mamba(nn.Module):
         for i, layer in enumerate(self.layers):
             x, caches[i] = layer.step(x, caches[i])
 
+        x = self.norm_f(x)
         return x, caches
 
 class ResidualBlock(nn.Module):
