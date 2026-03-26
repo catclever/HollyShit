@@ -68,10 +68,14 @@ def main():
         max_episode_len=args.max_episode_len
     )
 
-    # 6. Checkpointer
+    # 6. Optimizer with Dynamic LR
+    optimizer = optim.AdamW(learning_rate=args.lr)
+
+    # 7. Checkpointer
     checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
     checkpointer.register_model("mamba_planner", mamba_planner)
     checkpointer.register_dataloader("dataloader_p1", dataloader)
+    checkpointer.register_optimizer("optimizer", optimizer)
     checkpointer.register_args(args)
     
     start_step = 0
@@ -79,9 +83,6 @@ def main():
         start_step = checkpointer.load(args.resume_from)
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
-
-    # 7. Optimizer with Dynamic LR
-    optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 8. Loss Closure
     def loss_fn(model, f_t_input, z_target_truth, mask):
