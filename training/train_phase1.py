@@ -106,8 +106,8 @@ def main():
         # The compiled tape executes strictly on the trainable subsets
         (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static)
         # Protect RNN against gradient explosion
-        clipped_grads, _ = optim.clip_grad_norm(grads, 1.0)
-        return loss, aux, clipped_grads
+        clipped_grads, global_norm = optim.clip_grad_norm(grads, 1.0)
+        return loss, aux, clipped_grads, global_norm
 
     # 9. Training Loop
     print(f"Starting Phase 1 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}, Dynamic Document Lengths (Mamba Masked)")
@@ -126,12 +126,12 @@ def main():
                 z_target = god_encoder(f_t) # Shape: (B, L, z_dim)
                 
                 # JIT executes instantly on Apple Silicon GPU
-                total_loss, aux_losses, grads = train_step(f_t, z_target, masks)
+                total_loss, aux_losses, grads, global_norm = train_step(f_t, z_target, masks)
                 
-                # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes)
+                # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes/explosions)
                 # MLX evaluates to a single scalar, so .item() resolves it securely
-                if mx.isnan(total_loss).item() or mx.isinf(total_loss).item():
-                    print(f"[Anomaly Interceptor] NaN/Inf detected at Step {global_step}! Skipping gradient update to protect Mamba state.")
+                if mx.isnan(total_loss).item() or mx.isinf(total_loss).item() or mx.isnan(global_norm).item() or mx.isinf(global_norm).item():
+                    print(f"[Anomaly] NaN/Inf Loss/Gradient detected! (Loss: {total_loss.item():.2f}, Grad Norm: {global_norm.item():.2f}) at Step {global_step}! Skipping update.")
                     continue
                     
                 optimizer.update(mamba_planner, grads)
