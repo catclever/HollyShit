@@ -21,10 +21,16 @@ def main():
     # 1. Parse Args (Re-use the same arguments as Phase 0, add Phase 1 specifics)
     parser = get_training_parser("Phase 1 Mamba Training")
     parser.add_argument("--max_episode_len", type=int, default=None, help="If set, strictly bounds and pads sequences to this fixed length (without breaching documents).")
+    parser.add_argument("--warmup_steps", type=int, default=1000, help="Linear warmup steps for the learning rate")
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Path to the frozen Phase 0 checkpoint directory (e.g. checkpoints/run/p0_v1_step_160000)")
     parser.add_argument("--residual_mode", action="store_true", help="If True, Mamba predicts delta velocity instead of absolute coordinates")
     
     args = parser.parse_args()
+
+    def custom_lr_schedule(step: int):
+        if step < args.warmup_steps:
+            return args.lr * (step / args.warmup_steps)
+        return args.lr
 
     # 2. Config & Setup
     config = ModelConfig()
@@ -79,8 +85,8 @@ def main():
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
 
-    # 7. Optimizer
-    optimizer = optim.AdamW(learning_rate=args.lr)
+    # 7. Optimizer with Linear Warmup
+    optimizer = optim.AdamW(learning_rate=custom_lr_schedule)
 
     # 8. Loss Closure
     def loss_fn(model, f_t_input, z_target_truth, mask):
