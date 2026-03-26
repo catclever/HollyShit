@@ -127,6 +127,13 @@ def main():
                 
                 # JIT executes instantly on Apple Silicon GPU
                 total_loss, aux_losses, grads = train_step(f_t, z_target, masks)
+                
+                # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes)
+                # MLX evaluates to a single scalar, so .item() resolves it securely
+                if mx.isnan(total_loss).item() or mx.isinf(total_loss).item():
+                    print(f"[Anomaly Interceptor] NaN/Inf detected at Step {global_step}! Skipping gradient update to protect Mamba state.")
+                    continue
+                    
                 optimizer.update(mamba_planner, grads)
                 mx.eval(mamba_planner.parameters(), optimizer.state, total_loss)
                 
