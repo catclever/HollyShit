@@ -1,0 +1,3 @@
+[submodule "training/core"]
+	path = training/core
+	url = ./training/core
