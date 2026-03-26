@@ -14,6 +14,7 @@ from model.mamba_planner import MambaPlanner
 from model.mamba_mlx.mamba_mlx import MambaConfig
 from training.core.dataloader import Phase1DataLoader
 from training.core.checkpoint import Checkpointer
+from training.core.schedule import linear_warmup_schedule
 from training.losses.loss import coverage_loss, momentum_continuity_loss
 from training.core.args import get_training_parser
 
@@ -26,11 +27,6 @@ def main():
     parser.add_argument("--residual_mode", action="store_true", help="If True, Mamba predicts delta velocity instead of absolute coordinates")
     
     args = parser.parse_args()
-
-    def custom_lr_schedule(step: int):
-        if step < args.warmup_steps:
-            return args.lr * (step / args.warmup_steps)
-        return args.lr
 
     # 2. Config & Setup
     config = ModelConfig()
@@ -124,7 +120,7 @@ def main():
                 global_step += 1
                 
                 # Synchronize LR directly with absolute global step (Amnesia-proof)
-                optimizer.learning_rate = custom_lr_schedule(global_step)
+                optimizer.learning_rate = linear_warmup_schedule(global_step, args.lr, args.warmup_steps)
                 
                 # 8a. Generate frozen targets using Phase 0 (OUTSIDE the compiled gradient tape)
                 f_t = fuser(batch_embs, weights=None) # Centroid Mean for static truth
