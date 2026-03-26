@@ -85,8 +85,8 @@ def main():
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
 
-    # 7. Optimizer with Linear Warmup
-    optimizer = optim.AdamW(learning_rate=custom_lr_schedule)
+    # 7. Optimizer with Dynamic LR
+    optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 8. Loss Closure
     def loss_fn(model, f_t_input, z_target_truth, mask):
@@ -122,6 +122,9 @@ def main():
         for epoch in range(dataloader.current_epoch, args.epochs):
             for batch_embs, masks in dataloader:
                 global_step += 1
+                
+                # Synchronize LR directly with absolute global step (Amnesia-proof)
+                optimizer.learning_rate = custom_lr_schedule(global_step)
                 
                 # 8a. Generate frozen targets using Phase 0 (OUTSIDE the compiled gradient tape)
                 f_t = fuser(batch_embs, weights=None) # Centroid Mean for static truth
