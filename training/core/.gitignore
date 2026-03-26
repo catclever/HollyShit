@@ -1,6 +1,0 @@
-# AI Agent Workspace
-.agent/
-
-# Python
-__pycache__/
-*.pyc
