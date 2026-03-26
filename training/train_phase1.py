@@ -22,7 +22,6 @@ def main():
     # 1. Parse Args (Re-use the same arguments as Phase 0, add Phase 1 specifics)
     parser = get_training_parser("Phase 1 Mamba Training")
     parser.add_argument("--max_episode_len", type=int, default=None, help="If set, strictly bounds and pads sequences to this fixed length (without breaching documents).")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Linear warmup steps for the learning rate")
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Path to the frozen Phase 0 checkpoint directory (e.g. checkpoints/run/p0_v1_step_160000)")
     parser.add_argument("--residual_mode", action="store_true", help="If True, Mamba predicts delta velocity instead of absolute coordinates")
     
