@@ -62,7 +62,17 @@ class Checkpointer:
         
         # Save models
         for name, model in self._models.items():
-            model.save_weights(f"{save_path}/{name}.safetensors")
+            if hasattr(model, "save_weights"):
+                model.save_weights(f"{save_path}/{name}.safetensors")
+            else:
+                try:
+                    import torch
+                    if isinstance(model, torch.nn.Module):
+                        torch.save(model.state_dict(), f"{save_path}/{name}.pt")
+                    else:
+                        print(f"Warning: Unrecognized model type for {name}")
+                except ImportError:
+                    print(f"Warning: Model {name} looks like PyTorch but torch is not installed.")
             
         # Save dataloaders
         for name, loader in self._dataloaders.items():
@@ -152,15 +162,20 @@ class Checkpointer:
         
         for name, model in self._models.items():
             try:
-                target_file = f"{load_path}/{name}.safetensors"
-                # Compatibility specific for the adapter to fuser rename
-                if name == "sense_fuser" and not os.path.exists(target_file):
-                    fallback_file = f"{load_path}/sense_adapter.safetensors"
-                    if os.path.exists(fallback_file):
-                        target_file = fallback_file
-                        print(f"Info: Loaded legacy '{fallback_file}' for model '{name}'.")
-                
-                model.load_weights(target_file)
+                if hasattr(model, "load_weights"):
+                    target_file = f"{load_path}/{name}.safetensors"
+                    # Compatibility specific for the adapter to fuser rename
+                    if name == "sense_fuser" and not os.path.exists(target_file):
+                        fallback_file = f"{load_path}/sense_adapter.safetensors"
+                        if os.path.exists(fallback_file):
+                            target_file = fallback_file
+                            print(f"Info: Loaded legacy '{fallback_file}' for model '{name}'.")
+                    model.load_weights(target_file)
+                else:
+                    import torch
+                    if isinstance(model, torch.nn.Module):
+                        target_file = f"{load_path}/{name}.pt"
+                        model.load_state_dict(torch.load(target_file, weights_only=True))
             except Exception as e:
                 print(f"Warning: Could not load weights for {name}: {e}")
                 

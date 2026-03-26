@@ -16,7 +16,7 @@ from training.core.args import get_training_parser
 def main():
     # 1. Parse Args (Re-use the same arguments as Phase 0, add Phase 1 specifics)
     parser = get_training_parser("Phase 1 Mamba Training")
-    parser.add_argument("--episode_len", type=int, default=10, help="Number of contiguous sentences per episode (trajectory length)")
+    parser.add_argument("--max_episode_len", type=int, default=None, help="If set, strictly bounds and pads sequences to this fixed length (without breaching documents).")
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Path to the frozen Phase 0 checkpoint directory (e.g. checkpoints/run/p0_v1_step_160000)")
     parser.add_argument("--residual_mode", action="store_true", help="If True, Mamba predicts delta velocity instead of absolute coordinates")
     
@@ -57,9 +57,10 @@ def main():
     ]
     
     dataloader = Phase1DataLoader(
+        parquet_path="data/Basic_ZH/chunked_mixed_wiki.parquet",
         emb_paths=emb_files,
         batch_size=args.batch_size,
-        episode_len=args.episode_len
+        max_episode_len=args.max_episode_len
     )
 
     # 6. Checkpointer
@@ -78,14 +79,14 @@ def main():
     optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 8. Loss Closure
-    def loss_fn(model, f_t_input, z_target_truth):
+    def loss_fn(model, f_t_input, z_target_truth, mask):
         # 8b. Mamba predicts the trajectory
         # Input to Mamba is the sensory stream f_t_input
         mu, logvar, _ = model(f_t_input) # mu, logvar shape: (B, L, z_dim)
         
-        # 8c. Calculate Losses
-        l_cov = coverage_loss(mu, logvar, z_target_truth)
-        l_mom = momentum_continuity_loss(mu)
+        # 8c. Calculate Losses with dynamically padded sequence masks
+        l_cov = coverage_loss(mu, logvar, z_target_truth, mask=mask)
+        l_mom = momentum_continuity_loss(mu, mask=mask)
         
         # 8d. Total Loss Fusion
         # You can tune the momentum alpha later
@@ -96,19 +97,19 @@ def main():
     step_fn = nn.value_and_grad(mamba_planner, loss_fn)
 
     # 9. Training Loop
-    print(f"Starting Phase 1 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}, Episode Len: {args.episode_len}")
+    print(f"Starting Phase 1 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}, Dynamic Document Lengths (Mamba Masked)")
     global_step = start_step
 
     try:
         for epoch in range(dataloader.current_epoch, args.epochs):
-            for batch_embs in dataloader:
+            for batch_embs, masks in dataloader:
                 global_step += 1
                 
                 # 8a. Generate frozen targets using Phase 0 (OUTSIDE the gradient tape)
                 f_t = fuser(batch_embs, weights=None) # Centroid Mean for static truth
                 z_target = god_encoder(f_t) # Shape: (B, L, z_dim)
                 
-                (total_loss, aux_losses), grads = step_fn(mamba_planner, f_t, z_target)
+                (total_loss, aux_losses), grads = step_fn(mamba_planner, f_t, z_target, masks)
                 optimizer.update(mamba_planner, grads)
                 mx.eval(mamba_planner.parameters(), optimizer.state)
                 

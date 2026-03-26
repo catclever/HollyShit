@@ -20,7 +20,10 @@ class MultiEmbDataLoader:
                  batch_size: int = 256,
                  max_seq_len: int = 512,
                  shuffle: bool = True,
-                 seed: int = 42):
+                 seed: int = 42,
+                 backend: str = 'mlx'):
+        
+        self.backend = backend
         
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
@@ -91,12 +94,17 @@ class MultiEmbDataLoader:
             padded_ids.append(seq + [self.tokenizer.pad_token_id] * pad_len)
             masks.append([1] * len(seq) + [0] * pad_len)
             
-        token_inputs = mx.array(padded_ids)
-        attention_mask = mx.array(masks)
-        
         # 3. Fetch Embeddings via Mmap
         # This triggers Disk I/O precisely for these specific indices
-        batch_embs = [mx.array(arr[batch_indices]) for arr in self.embs]
+        if self.backend == 'torch':
+            import torch
+            token_inputs = torch.tensor(padded_ids, dtype=torch.long)
+            attention_mask = torch.tensor(masks, dtype=torch.float32)
+            batch_embs = [torch.from_numpy(np.array(arr[batch_indices])).float() for arr in self.embs]
+        else:
+            token_inputs = mx.array(padded_ids)
+            attention_mask = mx.array(masks)
+            batch_embs = [mx.array(arr[batch_indices]) for arr in self.embs]
         
         self.batch_idx += 1
         
@@ -122,19 +130,33 @@ class MultiEmbDataLoader:
 class Phase1DataLoader:
     """
     Dataloader specifically for Phase 1 (Mamba Spatiotemporal Dynamics).
-    Unlike Phase 0 which pulls isolated sentences, this pulls *contiguous episodes*
-    (L consecutive sentences) to form a dynamic trajectory for Mamba to learn momentum.
+    It pulls *contiguous entire documents* dynamically instead of fixed arbitrary slices,
+    to ensure Mamba learns the true, uncorrupted semantic arc of an article.
     """
     def __init__(self, 
+                 parquet_path: str,
                  emb_paths: List[str],
                  batch_size: int = 16,
-                 episode_len: int = 10,
-                 total_samples: int = 7619244,
-                 seed: int = 42):
+                 max_episode_len: int = None,
+                 seed: int = 42,
+                 backend: str = 'mlx'):
+        
+        self.backend = backend
         
         self.batch_size = batch_size
-        self.episode_len = episode_len
-        self.total_samples = total_samples
+        self.max_episode_len = max_episode_len
+        
+        # 1. Load exact document boundaries to avoid crossing them!
+        print("Reading Document Chunk Counts...")
+        df = pd.read_parquet(parquet_path, columns=['chunk_count'])
+        self.chunk_counts = df['chunk_count'].values
+        
+        # 2. Cumulative sum gives us the exact starting index for each document in the giant mmapped arrays
+        self.doc_start_indices = np.concatenate(([0], np.cumsum(self.chunk_counts)[:-1]))
+        self.total_docs = len(self.chunk_counts)
+        print(f"Loaded strictly bounded {self.total_docs} semantic documents.")
+        
+        del df
         
         print("Mmapping embedding arrays for Phase 1...")
         self.embs = []
@@ -144,31 +166,84 @@ class Phase1DataLoader:
             
         self.rng = np.random.default_rng(seed)
         self.current_epoch = 0
-        self.step = 0
+        self.batch_idx = 0
+        
+        self.indices = np.arange(self.total_docs)
+        self.rng.shuffle(self.indices)
+        self.num_batches = int(np.ceil(self.total_docs / self.batch_size))
         
     def __iter__(self):
         return self
         
-    def __next__(self) -> List[mx.array]:
-        # To get a trajectory, we randomly select a starting index for each item in the batch
-        # ensuring we have enough room to grab `episode_len` contiguous chunks.
-        max_start = self.total_samples - self.episode_len
-        start_indices = self.rng.integers(0, max_start, size=(self.batch_size,))
+    def __next__(self) -> Tuple[List[mx.array], mx.array]:
+        if self.batch_idx >= self.num_batches:
+            self.current_epoch += 1
+            self.batch_idx = 0
+            self.rng.shuffle(self.indices)
+            raise StopIteration
+            
+        start_idx = self.batch_idx * self.batch_size
+        end_idx = min(start_idx + self.batch_size, self.total_docs)
         
-        # Build the exact ranges for each episode
-        # Shape: (B, episode_len)
-        episode_indices = start_indices[:, None] + np.arange(self.episode_len)
+        batch_doc_indices = self.indices[start_idx:end_idx]
         
-        # Fetch contiguous embeddings
-        # Resulting batch_embs will be a list of mx.arrays of shape (B, L, d_emb)
-        batch_embs = [mx.array(arr[episode_indices]) for arr in self.embs]
+        # 1. Fetch exactly the bounded chunks for each document
+        raw_embs_list = [[] for _ in range(len(self.embs))]
+        lengths = []
         
-        self.step += 1
-        return batch_embs
+        for doc_idx in batch_doc_indices:
+            start_pos = self.doc_start_indices[doc_idx]
+            count = self.chunk_counts[doc_idx]
+            
+            if self.max_episode_len is not None:
+                eff_len = min(count, self.max_episode_len)
+            else:
+                eff_len = min(count, 256) # Safety cap
+                
+            lengths.append(eff_len)
+            
+            for i in range(len(self.embs)):
+                # Just copy the slice into memory
+                raw_embs_list[i].append(np.array(self.embs[i][start_pos : start_pos+eff_len]))
+                
+        # 2. Pad to the exact max_episode_len if provided; otherwise pad dynamically to batch's max
+        max_len = self.max_episode_len if self.max_episode_len is not None else max(lengths)
+        
+        # 2. Pad to the maximum document length in THIS specific batch
+        padded_embs = [[] for _ in range(len(self.embs))]
+        masks = []
+        z_dim = raw_embs_list[0][0].shape[-1]
+        
+        for b in range(len(batch_doc_indices)):
+            l = lengths[b]
+            pad_len = max_len - l
+            
+            for i in range(len(self.embs)):
+                arr = raw_embs_list[i][b]
+                if pad_len > 0:
+                    pad_array = np.zeros((pad_len, z_dim), dtype=arr.dtype)
+                    arr = np.concatenate([arr, pad_array], axis=0)
+                padded_embs[i].append(arr)
+                
+            masks.append([1] * l + [0] * pad_len)
+            
+        # Convert to arrays matching backend
+        if self.backend == 'torch':
+            import torch
+            batch_embs_tensor = [torch.from_numpy(np.stack(padded_embs[i])).float() for i in range(len(self.embs))]
+            masks_tensor = torch.tensor(masks, dtype=torch.float32)
+            self.batch_idx += 1
+            return batch_embs_tensor, masks_tensor
+        else:
+            batch_embs_mx = [mx.array(np.stack(padded_embs[i])) for i in range(len(self.embs))]
+            masks_mx = mx.array(masks)
+            self.batch_idx += 1
+            return batch_embs_mx, masks_mx
         
     def state_dict(self) -> Dict[str, Any]:
-        return {"step": self.step, "current_epoch": self.current_epoch}
+        return {"batch_idx": self.batch_idx, "current_epoch": self.current_epoch, "indices": self.indices.tolist()}
         
     def load_state_dict(self, state: Dict[str, Any]):
-        self.step = state["step"]
+        self.batch_idx = state["batch_idx"]
         self.current_epoch = state["current_epoch"]
+        self.indices = np.array(state["indices"])
