@@ -11,7 +11,7 @@ from model.mamba_planner import MambaPlanner
 from model.probability_mapping import ProbabilityMappingLayer
 from model.decoder import WeakDecoder
 from model.mamba_mlx.mamba_mlx import MambaConfig
-from training.loss import coverage_loss, momentum_continuity_loss, decoder_reconstruction_loss
+from distilled_emb.losses.loss import coverage_loss, momentum_continuity_loss, decoder_reconstruction_loss
 
 class EndogenousSystem(nn.Module):
     """
@@ -22,23 +22,23 @@ class EndogenousSystem(nn.Module):
     """
     def __init__(self, ext_dim: int, d_model: int, z_dim: int, vocab_size: int):
         super().__init__()
+        self.z_dim = z_dim
         # 0. The Adapter
         self.adapter = nn.Linear(ext_dim, d_model)
         
         # 1. Right Path: The God Encoder (takes standard f_t features)
-        self.god_encoder = GodEncoder(input_dim=d_model, hidden_dim=d_model, z_dim=z_dim)
+        self.god_encoder = GodEncoder(d_model=d_model, z_dim=z_dim)
         
         # 2. Left Path: The Dynamic Engine
         config = MambaConfig(d_model=d_model, n_layers=1)
         self.mamba = MambaPlanner(config, z_dim=z_dim)
-        self.prob_mapping = ProbabilityMappingLayer(d_model=d_model, z_dim=z_dim)
         
         # 3. The Ultimate Judge
         self.decoder = WeakDecoder(z_dim=z_dim, vocab_size=vocab_size, d_model=d_model, n_layers=1)
         
     def __call__(self, ext_emb: mx.array, tgt_toks: mx.array):
         B, L, _ = ext_emb.shape
-        Z_Dim = self.god_encoder.z_dim
+        Z_Dim = self.z_dim
         
         # Digest sensory input
         f_t = self.adapter(ext_emb)
@@ -51,8 +51,7 @@ class EndogenousSystem(nn.Module):
         start_emb = mx.zeros((B, 1, f_t.shape[-1]))
         x_shifted = mx.concatenate([start_emb, f_t[:, :-1, :]], axis=1)
         
-        h_t = self.mamba(x_shifted)
-        mu_net, logvar_net = self.prob_mapping(h_t)
+        mu_net, logvar_net, _ = self.mamba(x_shifted)
         
         # 3. Micro Decoder (The Judge of the z_target)
         z_flat = z_target.reshape(B * L, Z_Dim)
