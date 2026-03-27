@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--max_episode_len", type=int, default=None, help="If set, strictly bounds and pads sequences to this fixed length (without breaching documents).")
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Path to the frozen Phase 0 checkpoint directory (e.g. checkpoints/run/p0_v1_step_160000)")
     parser.add_argument("--residual_mode", action="store_true", help="If True, Mamba predicts delta velocity instead of absolute coordinates")
+    parser.add_argument("--var_warmup_steps", type=int, default=20000, help="Number of steps to force logvar to 0.0, reducing NLL to pure MSE for deterministic pre-training.")
     
     args = parser.parse_args()
 
@@ -50,7 +51,7 @@ def main():
     
     # 4. Instantiate Phase 1 Mamba Planner (TRAINABLE)
     mamba_cfg = MambaConfig(d_model=d_model, n_layers=2) # Default small mamba for testing
-    mamba_planner = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=True) # Force True Velocity Mode
+    mamba_planner = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=args.residual_mode)
     mx.eval(mamba_planner.parameters())
 
     # 5. Dataloader for Trajectories
@@ -85,27 +86,33 @@ def main():
         start_step = checkpointer.load_latest()
 
     # 8. Loss Closure
-    def loss_fn(model, f_t_input, z_target_truth, mask, z_current):
+    def loss_fn(model, f_t_input, z_target_truth, mask, step_scalar, var_warmup_scalar):
         # 8b. Mamba predicts the trajectory
         # Input to Mamba is the sensory stream f_t_input
-        mu, logvar, _ = model(f_t_input, z_current) # mu, logvar shape: (B, L, z_dim)
+        mu, logvar, _ = model(f_t_input) # mu, logvar shape: (B, L, z_dim)
+        
+        # Deterministic Warmup (Variance Annealing)
+        # If step < warmup, beta = 0.0 (freeze variance to 1.0, loss becomes MSE)
+        # If step >= warmup, beta = 1.0 (probabilistic NLL)
+        beta = mx.where(step_scalar >= var_warmup_scalar, 1.0, 0.0)
+        effective_logvar = logvar * beta
         
         # 8c. Calculate Losses with dynamically padded sequence masks
-        l_cov = coverage_loss(mu, logvar, z_target_truth, mask=mask)
+        l_cov = coverage_loss(mu, effective_logvar, z_target_truth, mask=mask)
         l_mom = momentum_continuity_loss(mu, mask=mask)
         
         # 8d. Total Loss Fusion
-        # Momentum loss is disabled to allow unconstrained semantic zig-zags (Brownian motion)
-        total_loss = l_cov
+        # You can tune the momentum alpha later
+        total_loss = l_cov + 0.1 * l_mom
         
         return total_loss, (l_cov, l_mom)
 
     step_fn = nn.value_and_grad(mamba_planner, loss_fn)
     
     @mx.compile
-    def train_step(f_t_static, z_target_static, masks_static, z_current_static):
+    def train_step(f_t_static, z_target_static, masks_static, step_static, warmup_static):
         # The compiled tape executes strictly on the trainable subsets
-        (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static, z_current_static)
+        (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static, step_static, warmup_static)
         # Protect RNN against gradient explosion
         clipped_grads, global_norm = optim.clip_grad_norm(grads, 1.0)
         return loss, aux, clipped_grads, global_norm
@@ -134,11 +141,13 @@ def main():
                 # Autoregressive Tensor Shift (Past -> Future)
                 f_t_input = f_t[:, :-1, :]
                 z_target_truth = z_target[:, 1:, :]
-                z_current = z_target[:, :-1, :] # True Velocity baseline reference
                 masks_shifted = masks[:, 1:]
                 
+                step_scalar = mx.array(global_step, dtype=mx.int32)
+                warmup_scalar = mx.array(args.var_warmup_steps, dtype=mx.int32)
+                
                 # JIT executes instantly on Apple Silicon GPU
-                total_loss, aux_losses, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted, z_current)
+                total_loss, aux_losses, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted, step_scalar, warmup_scalar)
                 
                 # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes/explosions)
                 # MLX evaluates to a single scalar, so .item() resolves it securely
