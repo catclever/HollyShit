@@ -50,7 +50,7 @@ def main():
     
     # 4. Instantiate Phase 1 Mamba Planner (TRAINABLE)
     mamba_cfg = MambaConfig(d_model=d_model, n_layers=2) # Default small mamba for testing
-    mamba_planner = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=args.residual_mode)
+    mamba_planner = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=True) # Force True Velocity Mode
     mx.eval(mamba_planner.parameters())
 
     # 5. Dataloader for Trajectories
@@ -85,27 +85,27 @@ def main():
         start_step = checkpointer.load_latest()
 
     # 8. Loss Closure
-    def loss_fn(model, f_t_input, z_target_truth, mask):
+    def loss_fn(model, f_t_input, z_target_truth, mask, z_current):
         # 8b. Mamba predicts the trajectory
         # Input to Mamba is the sensory stream f_t_input
-        mu, logvar, _ = model(f_t_input) # mu, logvar shape: (B, L, z_dim)
+        mu, logvar, _ = model(f_t_input, z_current) # mu, logvar shape: (B, L, z_dim)
         
         # 8c. Calculate Losses with dynamically padded sequence masks
         l_cov = coverage_loss(mu, logvar, z_target_truth, mask=mask)
         l_mom = momentum_continuity_loss(mu, mask=mask)
         
         # 8d. Total Loss Fusion
-        # You can tune the momentum alpha later
-        total_loss = l_cov + 0.1 * l_mom
+        # Momentum loss is disabled to allow unconstrained semantic zig-zags (Brownian motion)
+        total_loss = l_cov
         
         return total_loss, (l_cov, l_mom)
 
     step_fn = nn.value_and_grad(mamba_planner, loss_fn)
     
     @mx.compile
-    def train_step(f_t_static, z_target_static, masks_static):
+    def train_step(f_t_static, z_target_static, masks_static, z_current_static):
         # The compiled tape executes strictly on the trainable subsets
-        (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static)
+        (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static, z_current_static)
         # Protect RNN against gradient explosion
         clipped_grads, global_norm = optim.clip_grad_norm(grads, 1.0)
         return loss, aux, clipped_grads, global_norm
@@ -134,10 +134,11 @@ def main():
                 # Autoregressive Tensor Shift (Past -> Future)
                 f_t_input = f_t[:, :-1, :]
                 z_target_truth = z_target[:, 1:, :]
+                z_current = z_target[:, :-1, :] # True Velocity baseline reference
                 masks_shifted = masks[:, 1:]
                 
                 # JIT executes instantly on Apple Silicon GPU
-                total_loss, aux_losses, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted)
+                total_loss, aux_losses, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted, z_current)
                 
                 # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes/explosions)
                 # MLX evaluates to a single scalar, so .item() resolves it securely

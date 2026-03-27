@@ -14,19 +14,17 @@ class MambaPlanner(nn.Module):
         self.mamba = Mamba(config)
         self.d_model = config.d_model
         
-        # Final State Bounds (Crucial to prevent RNN exponential explosion)
-        self.out_norm = nn.RMSNorm(config.d_model)
-        
         # Dual Probability Heads
         self.mu_head = nn.Linear(config.d_model, z_dim)
         self.logvar_head = nn.Linear(config.d_model, z_dim)
         
         self.residual_mode = residual_mode
         
-    def __call__(self, x: mx.array):
+    def __call__(self, x: mx.array, z_current: mx.array = None):
         """
         Forward pass for time-shifted training/trajectory planning.
         x: (B, L, d_model) - History trajectory up to t-1
+        z_current: (B, L, z_dim) - The true semantic coordinates at step t-1 (Used for Velocity Mode)
         
         Returns:
             mu_net: (B, L, z_dim) - Predicted spatial coordinate centers
@@ -36,17 +34,16 @@ class MambaPlanner(nn.Module):
         # 1. State Space Sequence processing
         h_t = self.mamba(x)
         
-        # Strictly normalize the recurrent accumulation to prevent gradient/scale overflow
-        h_t = self.out_norm(h_t)
-        
         # 2. Probability Mapping
         mu = self.mu_head(h_t)
         logvar = self.logvar_head(h_t)
         
         # 3. Residual Vector Field Integration (if enabled)
         if self.residual_mode:
-            # The network output is treated as Delta Mu (velocity)
-            # We integrate over time using cumsum to get the absolute coordinates
-            mu = mx.cumsum(mu, axis=1)
+            # TRUE VELOCITY MODE: z_{t+1} = z_t + Δz_t
+            if z_current is not None:
+                mu = z_current + mu
+            else:
+                mu = mx.cumsum(mu, axis=1) # Fallback for absolute blind extrapolation
             
         return mu, logvar, h_t

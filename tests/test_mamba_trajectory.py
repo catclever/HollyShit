@@ -36,7 +36,7 @@ def load_models(p0_ckpt, p1_ckpt):
     # 2. Load Trajectory Planner (From Phase 1)
     print(f"Loading Mamba Planner strictly from Phase 1: {p1_ckpt}...")
     mamba_cfg = MambaConfig(d_model=d_model, n_layers=2)
-    mamba = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=False) 
+    mamba = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=True) 
     mamba.load_weights(f"{p1_ckpt}/mamba_planner.safetensors")
     
     fuser.eval()
@@ -97,7 +97,7 @@ def run_trajectory_test():
     
     # 2. Forward pass thru Mamba to map the physical trajectory
     # Because Mamba is now autoregressive, mu[:, t, :] predicts the coordinate of step t+1!
-    mu, logvar, _ = mamba(f_t) # mu: (1, L, z_dim)
+    mu, logvar, _ = mamba(f_t, z_current=z_target) # mu: (1, L, z_dim)
     
     valid_len = int(masks[0].sum().item())
     
@@ -134,12 +134,21 @@ def run_trajectory_test():
     blind_input = mx.zeros((1, 1, f_t.shape[-1]))
     extrapolated_f_t = mx.concatenate([f_t_cutoff, blind_input], axis=1) # Length 6
     
-    mu_extrapolated, _, _ = mamba(extrapolated_f_t)
+    # [Closed-Loop Simulation] 
+    # Mamba needs the "current" semantic coordinate to calculate the velocity delta.
+    # We know the true coordinates for steps 1 to 5. 
+    # For step 6, we use Mamba's PREVIOUS prediction (which was targeting step 6)!
+    z_known = z_target[:, :5, :]
+    predicted_z_6 = mu[:, 4:5, :] 
+    z_extrapolated = mx.concatenate([z_known, predicted_z_6], axis=1)
+    
+    mu_extrapolated, _, _ = mamba(extrapolated_f_t, z_current=z_extrapolated)
     
     # The output space for step 6 is at index 5. Because it's autoregressive, index 5 predicts Chunk 7.
     predicted_coord = mu_extrapolated[:, 5, :]
     
     print(f"\n [Blind Extrapolation] Decoding Mamba's hallucinated Chunk 7 ->")
+    hallucinated_text = decode_coordinate(decoder, predicted_coord, tokenizer)
     print(f"[Blind Step 6] Mamba blindly extrapolated trajectory decoded as: {hallucinated_text}")
 
 if __name__ == "__main__":
