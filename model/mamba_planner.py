@@ -20,11 +20,10 @@ class MambaPlanner(nn.Module):
         
         self.residual_mode = residual_mode
         
-    def __call__(self, x: mx.array, z_current: mx.array = None):
+    def __call__(self, x: mx.array):
         """
         Forward pass for time-shifted training/trajectory planning.
         x: (B, L, d_model) - History trajectory up to t-1
-        z_current: (B, L, z_dim) - The true semantic coordinates at step t-1 (Used for Velocity Mode)
         
         Returns:
             mu_net: (B, L, z_dim) - Predicted spatial coordinate centers
@@ -40,10 +39,8 @@ class MambaPlanner(nn.Module):
         
         # 3. Residual Vector Field Integration (if enabled)
         if self.residual_mode:
-            # TRUE VELOCITY MODE: z_{t+1} = z_t + Δz_t
-            if z_current is not None:
-                mu = z_current + mu
-            else:
-                mu = mx.cumsum(mu, axis=1) # Fallback for absolute blind extrapolation
+            # The network output is treated as Delta Mu (velocity)
+            # We integrate over time using cumsum to get the absolute coordinates
+            mu = mx.cumsum(mu, axis=1)
             
         return mu, logvar, h_t
