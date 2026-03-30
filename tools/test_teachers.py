@@ -1,3 +1,8 @@
+"""
+【脚本功能】：开源顶级 Embedding 模型测试场 (Teacher MTEB Evaluator)
+【使用场景】：Phase 0 教师选择期。使用 MTEB 框架自动下载各个预选的开源大模型 (例如 GTE, BGE, RoBERTa)，并在三大经典中文短文本任务上对它们的语义提取能力进行摸底硬考，最终将战报落盘在 `distilled_emb/` 目录下。
+【用法示例】：`python tools/test_teachers.py`
+"""
 import mteb
 from sentence_transformers import SentenceTransformer
 import warnings
@@ -10,7 +15,7 @@ models_to_test = [
     "BAAI/bge-large-zh-v1.5"
 ]
 
-tasks = ["LCQMC", "BQCorpus", "AFQMC"]
+tasks = ["LCQMC", "BQ", "AFQMC"]
 
 for model_name in models_to_test:
     print(f"\n================ Eval {model_name} ================")

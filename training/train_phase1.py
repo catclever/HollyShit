@@ -31,10 +31,21 @@ def main():
     # 2. Config & Setup
     config = ModelConfig()
     config.z_dim = args.z_dim
-    d_model = config.decoder_heads * 64
+    d_model = config.d_model
 
-    # 3. Instantiate Phase 0 Models (FROZEN)
-    fuser = SensoryFuser(config.emb_dims, d_model)
+    # 3. Dynamic Dimensionality Sniffing (Self-Adaptive Architecture)
+    emb_files = [
+        "data/Basic_ZH/embs/bge_embeddings.npy",
+        "data/Basic_ZH/embs/gte_qwen2_embeddings.npy"
+    ]
+    
+    import numpy as np
+    print("Sniffing dynamic dimensionalities from physical feature maps...")
+    inferred_emb_dims = [np.load(f, mmap_mode='r').shape[-1] for f in emb_files]
+    print(f"Auto-Detected Input Dimensions: {inferred_emb_dims}")
+
+    # 4. Instantiate Phase 0 Models (FROZEN)
+    fuser = SensoryFuser(inferred_emb_dims, d_model)
     god_encoder = GodEncoder(d_model, config.z_dim)
     
     print(f"Loading Frozen Phase 0 weights from {args.p0_ckpt}...")
@@ -49,19 +60,12 @@ def main():
     fuser.freeze()
     god_encoder.freeze()
     
-    # 4. Instantiate Phase 1 Mamba Planner (TRAINABLE)
+    # 5. Instantiate Phase 1 Mamba Planner (TRAINABLE)
     mamba_cfg = MambaConfig(d_model=d_model, n_layers=2) # Default small mamba for testing
     mamba_planner = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=args.residual_mode)
     mx.eval(mamba_planner.parameters())
 
-    # 5. Dataloader for Trajectories
-    emb_files = [
-        "data/Basic_ZH/embs/hy-tmp/roberta_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/gte_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/bge_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/text2vec_embeddings.npy"
-    ]
-    
+    # 6. Dataloader for Trajectories
     dataloader = Phase1DataLoader(
         parquet_path="data/Basic_ZH/chunked_mixed_wiki.parquet",
         emb_paths=emb_files,

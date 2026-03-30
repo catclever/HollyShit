@@ -1,3 +1,8 @@
+"""
+【脚本功能】：微缩单条语句 100% 死记硬背过拟合证明 (Overfit Proof-of-Concept)
+【使用场景】：Phase 0 算法验证。这是整个大架构（Fuser + GodEncoder + Decoder）的最基础沙盘。如果我们整个模型能够通过 50 步的强行投喂，把一段废话 100% 毫无损耗地死记硬背原样吐出，就证明物理管道没漏水，可以正式大规模训练。
+【用法示例】：`python tests/test_overfit_poc.py`
+"""
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim

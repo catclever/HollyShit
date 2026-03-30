@@ -1,3 +1,8 @@
+"""
+【脚本功能】：针对遗留脏数据的靶向清洗器
+【使用场景】：Phase 0 数据准备阶段。专门用于洗掉旧维基数据中带有“答案：分段：”这一类被大模型生成的结构污染的部分，将它们复原为干净的连续自然段。
+【用法示例】：`python scripts/clean_parquet.py`
+"""
 import pandas as pd
 import re
 import os

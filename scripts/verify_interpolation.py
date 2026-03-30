@@ -1,3 +1,8 @@
+"""
+【脚本功能】：高维空间球面平滑线性插值 (SLERP) 的概念漫游器
+【使用场景】：Phase 0 验证阶段。探究大语言模型的离散文字空间在被降维锚定后，是否形成了连续的拓扑结构。从 A 概念到 B 概念的每半步迁移，所解码出的句子是否过渡依然物理丝滑且合理。
+【用法示例】：`python scripts/verify_interpolation.py --ckpt checkpoints/run/p0_v1_step_150000 --idx_a 1000 --idx_b 2000000 --steps 5`
+"""
 import mlx.core as mx
 import numpy as np
 import pandas as pd

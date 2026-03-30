@@ -1,3 +1,10 @@
+"""
+【脚本功能】：多态降维闭环自动审判庭 (Semantic Assessor)
+【使用场景】：Phase 0 验证阶段。这是最严格的“黑箱语义保鲜”自动化测试。系统会将生成的杂牌“幻觉”文本与原意在独立的高精度 Encoder（独立评委）里过一遍余弦相似度（Cosine Similarity）。一旦余弦断崖，代表系统发生语义坍缩。
+【用法示例】：
+    - 随机抽测：`python scripts/verify_semantics.py --ckpt checkpoints/run/p0_v1_step_150000 --mode random`
+    - 实时对话冷测：`python scripts/verify_semantics.py --ckpt ... --mode interactive`
+"""
 import mlx.core as mx
 import numpy as np
 import pandas as pd

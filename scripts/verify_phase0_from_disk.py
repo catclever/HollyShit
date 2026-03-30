@@ -1,3 +1,8 @@
+"""
+【脚本功能】：基于传统自回归 (Auto-Regressive) 分类器的原始端到端重建器
+【使用场景】：Phase 0 验证阶段。它是流匹配解题器出场之前的早期版本，使用传统的 Softmax 离散交叉熵来倒推 GodEncoder 压缩出的高维坐标。是观察大模型是否产生局部幻觉的关键抓样工具。
+【用法示例】：`python scripts/verify_phase0_from_disk.py --ckpt checkpoints/run/p0_v1_step_150000 --num_samples 3`
+"""
 import mlx.core as mx
 import numpy as np
 import pandas as pd

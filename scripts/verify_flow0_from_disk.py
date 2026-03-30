@@ -1,3 +1,8 @@
+"""
+【脚本功能】：基于 Flow Matching (流匹配) 拓扑解码的端到端梦境重建器
+【使用场景】：Phase 0 连续空间验证阶段。模拟验证大语言模型的文字序列被 GodEncoder 深度降维压榨后，能否通过 ODE 解码器（Continuous Flow）顺滑地解析出它应有的自然语言形态。
+【用法示例】：`python scripts/verify_flow0_from_disk.py --ckpt checkpoints/run/p0_flow_v1_step_50000 --num_samples 3`
+"""
 import mlx.core as mx
 import numpy as np
 import pandas as pd

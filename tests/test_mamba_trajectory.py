@@ -1,3 +1,8 @@
+"""
+【脚本功能】：Mamba 核心推演拓扑连贯性单元测试 (Trajectory Verification)
+【使用场景】：核心组件测试。用于测试 `MambaPlanner` 的时序预测结构是否能够跑通 100 步的极限顺滑外推，并验证其坐标预测的物理方差属性。
+【用法示例】：`python tests/test_mamba_trajectory.py`
+"""
 import os
 import sys
 import argparse

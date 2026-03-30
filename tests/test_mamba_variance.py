@@ -1,3 +1,8 @@
+"""
+【脚本功能】：Mamba 预测方差 (LogVar) 物理塌缩侦测器
+【使用场景】：核心组件测试。我们设计 Mamba 不仅要预测坐标 `mu`，还要预测方差 `logvar`。本脚本测试在网络训练初期，方差是否能保持稳定，而不至于引发负无穷或 NaN 的算力塌缩（Posterior Collapse）。
+【用法示例】：`python tests/test_mamba_variance.py`
+"""
 import os
 import sys
 import argparse

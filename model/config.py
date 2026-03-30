@@ -7,11 +7,14 @@ class ModelConfig:
     Central Configuration for the Endogenous Architecture (Phase 2).
     """
     
-    # --- Multi-View Embedding Configuration ---
-    # We use 4 external embeddings: RoBERTa(768), GTE(1024), BGE(1024), Text2Vec(768)
-    emb_dims: List[int] = field(default_factory=lambda: [768, 1024, 1024, 768])
+    # --- Multi-View Embedding Configuration (Phase 0.2) ---
+    # The emb_dims list is now DEPRECATED.
+    # The model dynamically sniffs the input .npy shapes at runtime!
     
-    # The absolute dimensions of the Mamba spatial manifold
+    # The unified projection dimension output by the SensoryFuser
+    d_model: int = 1024
+    
+    # The absolute dimensions of the Mamba spatial manifold (GodEncoder output)
     z_dim: int = 1024
     
     # --- Mamba Planner Configuration ---

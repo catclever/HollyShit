@@ -1,3 +1,8 @@
+"""
+【脚本功能】：基于中文标点和换行符的智能切片引擎与动态 EOS 注入器
+【使用场景】：Phase 0 数据准备阶段。负责将长篇连续维基/领域数据按语义切段，并在真实的段落末尾注入 <EOS> 因果断点。
+【用法示例】：`python scripts/chunk_and_eos.py` （参数暂在内部硬编码）
+"""
 import pandas as pd
 import re
 

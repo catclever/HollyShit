@@ -1,3 +1,8 @@
+"""
+【脚本功能】：混合字级/字节级神圣词表构建器 (Hybrid Char-Byte Vocab Builder)
+【使用场景】：初始化阶段。扫描所有训练素材，统计出频率最高的 TopN 个非 ASCII 中文字符（由于英文字符被退化为 0-255 的基础字节处理），并与特殊标志符合并，生成极其紧凑的 8000 维中文词库。
+【用法示例】：`python tools/build_char_vocab.py`
+"""
 import os
 import json
 import collections
