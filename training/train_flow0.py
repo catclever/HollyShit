@@ -9,7 +9,7 @@ from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.flow_decoder import FlowDecoder
-from training.core.dataloader import MultiEmbDataLoader
+from training.core.dataloader import MultiEmbDataLoader, ChunkedNpzDataLoader
 from training.losses.flow_loss import ot_cfm_loss
 from training.core.checkpoint import Checkpointer
 from training.core.schedule import linear_warmup_schedule
@@ -63,21 +63,20 @@ def main():
     mx.eval(model_composite.parameters())
     print("Flow Model composite initialized.")
 
-    # 3. Dataloader
-    emb_files = [
-        "data/Basic_ZH/embs/hy-tmp/roberta_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/gte_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/bge_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/text2vec_embeddings.npy"
-    ]
+    # 3. Dataloader (ModelScope Remote Streaming)
+    # 替换为你实际上传的模型格式特征前缀
+    base_models = ["bge", "qwen", "xiaobu", "youtu", "conan_v1"]
     
-    dataloader = MultiEmbDataLoader(
+    # 彻底弃用本地巨大 emb_files，使用 ChunkedNpzDataLoader
+    dataloader = ChunkedNpzDataLoader(
         parquet_path="data/Basic_ZH/chunked_mixed_wiki.parquet",
-        emb_paths=emb_files,
+        models=base_models,
         tokenizer=tokenizer,
+        ms_repo_id="catclever/emb_npy",
         batch_size=args.batch_size,
         max_seq_len=config.max_seq_len,
-        shuffle=True
+        shuffle=True,
+        backend='mlx'
     )
 
     # 4. Checkpointer

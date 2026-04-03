@@ -30,12 +30,53 @@ def get_safe_name(model_path):
     # "BAAI/bge-large-zh-v1.5" -> "bge-large-zh-v1.5"
     return os.path.basename(os.path.normpath(model_path))
 
-def run_evaluation(models_to_test, output_root, device, batch_size):
+def flatten_model_output(model_output_dir):
+    if not os.path.isdir(model_output_dir):
+        return
+    json_files = glob.glob(os.path.join(model_output_dir, "**", "*.json"), recursive=True)
+    for src in json_files:
+        if ".ipynb_checkpoints" in src:
+            continue
+        filename = os.path.basename(src)
+        dst = os.path.join(model_output_dir, filename)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        if os.path.exists(dst):
+            if os.path.getmtime(src) <= os.path.getmtime(dst):
+                continue
+            os.replace(src, dst)
+        else:
+            os.replace(src, dst)
+
+    for root, dirs, files in os.walk(model_output_dir, topdown=False):
+        for d in dirs:
+            full = os.path.join(root, d)
+            if full == model_output_dir:
+                continue
+            try:
+                if not os.listdir(full):
+                    os.rmdir(full)
+            except OSError:
+                pass
+
+def run_evaluation(models_to_test, output_root, device, batch_size, torch_dtype, trust_remote_code):
     print(f"🔥 [STAGE 1] 启动 MTEB 终极考场！共有 {len(models_to_test)} 名开源选手参赛。")
     for model_name in models_to_test:
         print(f"\n================ 正在考核选手: {model_name} ================")
         try:
-            model = SentenceTransformer(model_name, device=device)
+            model_kwargs = {}
+            if str(device).startswith("cuda"):
+                model_kwargs["torch_dtype"] = "float16"
+            if torch_dtype != "auto":
+                model_kwargs["torch_dtype"] = torch_dtype
+            
+            # CRITICAL FIX: trust_remote_code is MANDATORY for custom causal embedding models (like Qwen2)
+            model = SentenceTransformer(
+                model_name, 
+                device=device, 
+                model_kwargs=model_kwargs,
+                trust_remote_code=trust_remote_code
+            )
             active_tasks = mteb.get_tasks(tasks=TASKS)
             eval_engine = mteb.MTEB(tasks=active_tasks)
             # Smart isolation of the model's base identity
@@ -44,6 +85,7 @@ def run_evaluation(models_to_test, output_root, device, batch_size):
             
             # The engine will automatically skip what has already been evaluated, saving massive time!
             eval_engine.run(model, output_folder=output_folder, encode_kwargs={"batch_size": batch_size})
+            flatten_model_output(output_folder)
         except Exception as e:
             print(f"[!] 选手 {model_name} 崩溃或因网络退赛: {e}")
 
@@ -55,7 +97,9 @@ def parse_and_report(models_to_test, output_root):
         print(f"【参赛兵器】: {safe_name}")
         
         for task in TASKS:
-            files = glob.glob(os.path.join(output_root, safe_name, "**", f"{task}*.json"), recursive=True)
+            files = glob.glob(os.path.join(output_root, safe_name, f"{task}*.json"))
+            if not files:
+                files = glob.glob(os.path.join(output_root, safe_name, "**", f"{task}*.json"), recursive=True)
             if not files: 
                 print(f"   ├─ 任务 {task}: [缺考/漏考]")
                 continue
@@ -94,13 +138,15 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./mteb_results", help="挂载存放测试结果集的根目录（例如 ./mteb_results 或者 ../distilled_embs）")
     parser.add_argument("--device", type=str, default="cpu", help="推理设备架构 (cpu, cuda, mps 等)")
     parser.add_argument("--batch_size", type=int, default=8, help="MTEB 提取的 Batch 大小。防 OOM 请设小。")
+    parser.add_argument("--torch_dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16", "float32"], help="模型加载精度，CUDA 下默认按 float16 兜底")
+    parser.add_argument("--trust_remote_code", action="store_true", help="允许执行模型仓库自定义 Python 代码（默认关闭）")
     args = parser.parse_args()
 
     # Create root directory if needed
     os.makedirs(args.output_dir, exist_ok=True)
 
     if not args.skip_eval:
-        run_evaluation(args.models, args.output_dir, args.device, args.batch_size)
+        run_evaluation(args.models, args.output_dir, args.device, args.batch_size, args.torch_dtype, args.trust_remote_code)
     else:
         print(">> 检测到 --skip_eval 指令，绕过现场考核跑分环节。 <<")
         
