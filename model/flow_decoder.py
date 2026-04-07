@@ -73,6 +73,65 @@ class CharPositionalEncoding(nn.Module):
         return x + pe[None, :, :]
 
 
+class DiTBlock(nn.Module):
+    """
+    Diffusion Transformer Block with Adaptive Layer Normalization (AdaLN).
+    Injects Time and Z conditioning directly into every block's normalization layer.
+    """
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Standard Multi-Head Attention and MLP
+        self.attn = nn.MultiHeadAttention(d_model, n_heads)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+        # Layer Norms (parameters are dynamically scaled/shifted by AdaLN, so we use standard LayerNorm first)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # AdaLN modulation mapping
+        # Maps the pooled condition (t + z) to 6 scale/shift parameters:
+        # gamma1, beta1, alpha1 (for attention) and gamma2, beta2, alpha2 (for MLP)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model)
+        )
+        
+        # Initialize modulation layer to zero so it acts as identity at the start
+        mx.eval(self.adaLN_modulation.layers[-1].weight)
+        self.adaLN_modulation.layers[-1].weight = mx.zeros_like(self.adaLN_modulation.layers[-1].weight)
+        self.adaLN_modulation.layers[-1].bias = mx.zeros_like(self.adaLN_modulation.layers[-1].bias)
+
+    def __call__(self, x: mx.array, c: mx.array, mask: mx.array = None):
+        # c is the condition embeddings (B, d_model)
+        # Get modulation parameters
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mx.split(
+            self.adaLN_modulation(c), 6, axis=-1
+        )
+        
+        # Reshape to broadcast over sequence length L
+        # (B, L, d_model)
+        shift_msa, scale_msa, gate_msa = shift_msa[:, None, :], scale_msa[:, None, :], gate_msa[:, None, :]
+        shift_mlp, scale_mlp, gate_mlp = shift_mlp[:, None, :], scale_mlp[:, None, :], gate_mlp[:, None, :]
+        
+        # 1. Attention Block with AdaLN
+        norm_x1 = self.norm1(x) * (1.0 + scale_msa) + shift_msa
+        attn_out = self.attn(norm_x1, norm_x1, norm_x1, mask=mask)
+        x = x + gate_msa * attn_out
+        
+        # 2. MLP Block with AdaLN
+        norm_x2 = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
+        mlp_out = self.mlp(norm_x2)
+        x = x + gate_mlp * mlp_out
+        
+        return x
+
+
 class FlowDecoder(nn.Module):
     """
     Continuous Vector Field Network for Optimal Transport Flow Matching.
@@ -101,22 +160,18 @@ class FlowDecoder(nn.Module):
         # Absolute Positional Encoding for the flow field
         self.pos_embed = CharPositionalEncoding(d_model)
         
-        # 3. The Core Wind Tunnel (Bidirectional Non-Causal Transformer)
-        # Because Flow Matching sees all noise at once, it doesn't need to be causal!
-        self.transformer = nn.TransformerEncoder(
-            num_layers=n_layers,
-            dims=d_model,
-            num_heads=n_heads,
-            mlp_dims=d_model * 4
-        )
+        # 3. The Core Wind Tunnel (DiT Architecture with AdaLN)
+        # Replaces raw TransformerEncoder to inject Z and time into every single block.
+        self.blocks = [DiTBlock(d_model, n_heads) for _ in range(n_layers)]
         
         # 4. Out-Projection to Velocity
         # The output is NOT logits over 8000 chars! It's a continuous velocity vector [d_model]!
+        self.final_layer_norm = nn.LayerNorm(d_model)
         self.velocity_head = nn.Linear(d_model, d_model)
 
     def __call__(self, x_t: mx.array, t: mx.array, z_target: mx.array, mask: mx.array = None):
         """
-        Calculates the velocity field v_pred for the ODE flow.
+        Calculates the velocity field v_pred for the ODE flow using AdaLN.
         """
         B, L, _ = x_t.shape
         
@@ -127,18 +182,16 @@ class FlowDecoder(nn.Module):
         # z_target is (B, z_dim), z_emb becomes (B, d_model)
         z_emb = self.z_proj(z_target)
         
-        # 2. Condition the input flow
-        # We broadcast add the Time and Z context globally to every position in the sequence
-        # (B, 1, d_model) broadcasted over length L
-        condition = mx.expand_dims(t_emb + z_emb, 1) 
+        # 2. Condition the input flow (AdaLN conditioning signal)
+        # Instead of broadcasting to all sequence elements, we keep it as a global vector (B, d_model)
+        condition = t_emb + z_emb
         
-        x_conditioned = x_t + condition
-        
+        # 3. Initialize Flow Input
         # Add absolute positional encodings to give the noise a spatial direction
-        x_conditioned = self.pos_embed(x_conditioned)
+        x_positioned = self.pos_embed(x_t)
         
-        # 3. Transformer Processing (Fully bidirectional, letting particles "see" each other's noise)
-        # Convert (B, L) padding mask → additive attention mask for MLX TransformerEncoder
+        # 4. Transformer Processing (Fully bidirectional, letting particles "see" each other's noise)
+        # Convert (B, L) padding mask → additive attention mask for MLX MultiHeadAttention
         # MLX expects additive mask where 0 = attend, -inf = ignore
         attn_mask = None
         if mask is not None:
@@ -149,11 +202,15 @@ class FlowDecoder(nn.Module):
                 mx.zeros_like(mask[:, None, None, :]),
                 mx.full(mask[:, None, None, :].shape, float('-inf'))
             )
-        memory = self.transformer(x_conditioned, mask=attn_mask)
         
-        # 4. Extract continuous velocity
+        # Pass through all DiT blocks
+        for block in self.blocks:
+            x_positioned = block(x_positioned, condition, mask=attn_mask)
+        
+        # 5. Extract continuous velocity
         # Shape: (B, L, d_model)
-        v_pred = self.velocity_head(memory)
+        x_final = self.final_layer_norm(x_positioned)
+        v_pred = self.velocity_head(x_final)
         
         return v_pred
 
@@ -161,9 +218,12 @@ class FlowDecoder(nn.Module):
         """
         Converts text tokens to their continuous Euclidean coordinates.
         This provides x_1 (the physical destination) for Flow Matching.
-        Removed standard sqrt(d_model) scaling to avoid flow scale mismatch.
+        [Hypersphere Constraint] We enforce all vectors to lie on a sphere of radius sqrt(d_model).
         """
-        return self.char_embedding(token_ids)
+        raw_emb = self.char_embedding(token_ids)
+        # 归一化后拉长到 \sqrt{d_model}（保持方差为 1，确保矩阵规模健康）
+        normed = raw_emb / mx.maximum(mx.linalg.norm(raw_emb, axis=-1, keepdims=True), 1e-6)
+        return normed * math.sqrt(self.d_model)
         
     def generate_euler(self, z_target: mx.array, target_length: int, steps: int = 20):
         """

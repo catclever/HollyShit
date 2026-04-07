@@ -21,6 +21,9 @@ from training.core.args import get_training_parser
 
 def main():
     parser = get_training_parser(description="Phase 0 Flow Matching: GodEncoders + Continuous ODE FlowDecoder")
+    parser.add_argument("--init_universe_path", type=str, default=None, help="Provide a .npy file of pre-sphericized character embeddings from Qwen (Scheme A)")
+    parser.add_argument("--freeze_semantic_steps", type=int, default=50000, help="Steps to strictly freeze the pretrained semantic character space (idx >= 256).")
+    parser.add_argument("--unfreeze_transition_steps", type=int, default=10000, help="Steps to linearly transition the semantic gradient multiplier from 0.0 to 1.0 after freezing.")
     args = parser.parse_args()
 
     # 1. Config & Tokenizer
@@ -50,9 +53,11 @@ def main():
         batch_size=args.batch_size,
         max_seq_len=config.max_seq_len,
         shuffle=True,
+        seed=args.seed,
         backend='mlx',
         lazy_start=will_resume,  # 恢复时延迟启动，避免白下载一个块
-        cache_dir=args.data_dir
+        cache_dir=args.data_dir,
+        auto_cleanup=not args.keep_npz_cache
     )
 
     # 3. Models Setup
@@ -89,6 +94,17 @@ def main():
             z_target = self.god_encoder(f_t)
             return z_target
             
+    if args.init_universe_path and os.path.exists(args.init_universe_path):
+        import numpy as np
+        print(f"[PhaseA] Loading Qwen sub-universe from {args.init_universe_path}")
+        pretrained_embs = mx.array(np.load(args.init_universe_path))
+        # Ensure it exactly matches the shape needed, if not, wait till resize
+        if pretrained_embs.shape == decoder.char_embedding.weight.shape:
+            # 强制覆盖当前模型刚初始化的随机权重
+            decoder.char_embedding.weight = pretrained_embs
+        else:
+            print(f"[Warning] Universe shape mismatch: {pretrained_embs.shape} vs {decoder.char_embedding.weight.shape}")
+
     model_composite = FlowPhase0Composite(fuser, god_encoder, decoder)
     mx.eval(model_composite.parameters())
     print("Flow Model composite initialized.")
@@ -136,6 +152,26 @@ def main():
                 
                 # Notice: No shifting [:-1] and [1:] needed here! Sequence is treated as a continuous physical block.
                 loss, grads = step_fn(model_composite, batch_embs, token_inputs, attention_mask)
+                
+                # [Progressive Freezing Strategy] 
+                # To prevent the newly inserted Byte foundation (0-255) from tearing apart the
+                # delicate semantic topology of the pretrained Qwen chars (256-8191), 
+                # we selectively freeze/warm-up the semantic space.
+                freeze_steps = args.freeze_semantic_steps
+                transition_steps = args.unfreeze_transition_steps
+                
+                if global_step < freeze_steps + transition_steps:
+                    if 'decoder' in grads and 'char_embedding' in grads['decoder']:
+                        if global_step < freeze_steps:
+                            semantic_mult = 0.0
+                        else:
+                            semantic_mult = (global_step - freeze_steps) / max(1, transition_steps)
+                        
+                        mask = mx.concatenate([
+                            mx.ones((256, 1)),
+                            mx.full((config.vocab_size - 256, 1), semantic_mult)
+                        ], axis=0)
+                        grads['decoder']['char_embedding']['weight'] = grads['decoder']['char_embedding']['weight'] * mask
                 
                 optimizer.update(model_composite, grads)
                 mx.eval(model_composite.parameters(), optimizer.state)

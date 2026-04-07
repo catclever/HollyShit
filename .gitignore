@@ -36,7 +36,7 @@ wheels/
 
 # Datasets & Weights
 data
-datas/
+embs/
 dataset_config.json
 checkpoints/
 *.npz
