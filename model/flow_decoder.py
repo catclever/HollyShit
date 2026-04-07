@@ -40,6 +40,39 @@ class FlowTimeEmbedding(nn.Module):
         return self.mlp(embedding)
 
 
+class CharPositionalEncoding(nn.Module):
+    """
+    Absolute Positional Encoding for the Sequence.
+    Gives the continuous noises a spatial coordinate system.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def __call__(self, x: mx.array):
+        # x shape: (B, L, d_model)
+        L = x.shape[1]
+        half_dim = self.dim // 2
+        
+        # position indices: (L,)
+        pos = mx.arange(L, dtype=mx.float32)
+        
+        # frequencies
+        freqs = mx.exp(-math.log(10000.0) * mx.arange(half_dim, dtype=mx.float32) / half_dim)
+        
+        # (L, half_dim)
+        args = pos[:, None] * freqs[None, :]
+        
+        # concatenate sin and cos -> (L, dim)
+        pe = mx.concatenate([mx.sin(args), mx.cos(args)], axis=-1)
+        
+        if self.dim % 2 != 0:
+            pe = mx.pad(pe, [(0, 0), (0, 1)])
+            
+        # Broadcast add to x: (B, L, d_model) + (1, L, d_model)
+        return x + pe[None, :, :]
+
+
 class FlowDecoder(nn.Module):
     """
     Continuous Vector Field Network for Optimal Transport Flow Matching.
@@ -64,6 +97,9 @@ class FlowDecoder(nn.Module):
         # 2. Time & Semantic Conditioning Projections
         self.time_embed = FlowTimeEmbedding(d_model)
         self.z_proj = nn.Linear(z_dim, d_model)
+        
+        # Absolute Positional Encoding for the flow field
+        self.pos_embed = CharPositionalEncoding(d_model)
         
         # 3. The Core Wind Tunnel (Bidirectional Non-Causal Transformer)
         # Because Flow Matching sees all noise at once, it doesn't need to be causal!
@@ -98,9 +134,22 @@ class FlowDecoder(nn.Module):
         
         x_conditioned = x_t + condition
         
+        # Add absolute positional encodings to give the noise a spatial direction
+        x_conditioned = self.pos_embed(x_conditioned)
+        
         # 3. Transformer Processing (Fully bidirectional, letting particles "see" each other's noise)
-        # Mask here is NOT causal. It's just a padding mask if sequences are varying length.
-        memory = self.transformer(x_conditioned, mask=mask)
+        # Convert (B, L) padding mask → additive attention mask for MLX TransformerEncoder
+        # MLX expects additive mask where 0 = attend, -inf = ignore
+        attn_mask = None
+        if mask is not None:
+            # mask shape: (B, L), values 1=valid 0=pad
+            # → (B, 1, 1, L) so it broadcasts against (B, heads, L, L)
+            attn_mask = mx.where(
+                mask[:, None, None, :] > 0,
+                mx.zeros_like(mask[:, None, None, :]),
+                mx.full(mask[:, None, None, :].shape, float('-inf'))
+            )
+        memory = self.transformer(x_conditioned, mask=attn_mask)
         
         # 4. Extract continuous velocity
         # Shape: (B, L, d_model)
@@ -112,9 +161,9 @@ class FlowDecoder(nn.Module):
         """
         Converts text tokens to their continuous Euclidean coordinates.
         This provides x_1 (the physical destination) for Flow Matching.
+        Removed standard sqrt(d_model) scaling to avoid flow scale mismatch.
         """
-        # We scale embedding by sqrt(d_model) as standard for Transformers
-        return self.char_embedding(token_ids) * math.sqrt(self.d_model)
+        return self.char_embedding(token_ids)
         
     def generate_euler(self, z_target: mx.array, target_length: int, steps: int = 20):
         """
@@ -144,8 +193,7 @@ class FlowDecoder(nn.Module):
         # Final trick: Snap to the nearest discrete token in the dictionary
         # Compute L2 distance or Cosine Similarity to self.char_embedding.weight
         
-        # Normalize the generated x_1 and the embedding dictionary
-        emb_bank = self.char_embedding.weight * math.sqrt(self.d_model)
+        emb_bank = self.char_embedding.weight
         
         # Simple Euclidean Distance Argmin (Broadcasting)
         # Distance^2 = (A-B)^2 = A^2 + B^2 - 2AB

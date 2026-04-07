@@ -1,14 +1,18 @@
 """
 【脚本功能】：基于 Flow Matching (流匹配) 拓扑解码的端到端梦境重建器
-【使用场景】：Phase 0 连续空间验证阶段。模拟验证大语言模型的文字序列被 GodEncoder 深度降维压榨后，能否通过 ODE 解码器（Continuous Flow）顺滑地解析出它应有的自然语言形态。
-【用法示例】：`python scripts/verify_flow0_from_disk.py --ckpt checkpoints/run/p0_flow_v1_step_50000 --num_samples 3`
+【使用场景】：Phase 0 连续空间验证阶段。从 ModelScope 拉取真实 embedding 数据，
+             通过 SensoryFuser → GodEncoder → FlowDecoder ODE 解码验证重建质量。
+【用法示例】：
+  python scripts/verify_flow0_from_disk_mlx.py --ckpt checkpoints/run/p0_flow_v0_step_160000 --num_samples 3
 """
 import mlx.core as mx
 import numpy as np
 import pandas as pd
-import os
+import os, sys, json, re
 
-from training.char_tokenizer import CharTokenizer
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from training.core.char_tokenizer import CharTokenizer
 from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
@@ -17,93 +21,147 @@ from model.flow_decoder import FlowDecoder
 import argparse
 import random
 
+def sniff_emb_dims_from_weights(ckpt_path: str):
+    """从 checkpoint 权重反推每个 adapter 的输入维度"""
+    weights = mx.load(f"{ckpt_path}/sense_fuser.safetensors")
+    dims = {}
+    for k, v in weights.items():
+        # adapters.0.net.layers.0.weight -> shape (d_model, input_dim)
+        match = re.match(r'adapters\.(\d+)\.net\.layers\.0\.weight', k)
+        if match:
+            adapter_idx = int(match.group(1))
+            dims[adapter_idx] = v.shape[1]  # input_dim is second dim
+    return [dims[i] for i in range(len(dims))]
+
 def verify_flow():
     parser = argparse.ArgumentParser(description="Phase 0 Continuous Flow Matching Dream Verifier")
-    parser.add_argument("--num_samples", type=int, default=1, help="Number of random sentences to pull and dream-reconstruct")
-    parser.add_argument("--emb_idx", type=int, default=-1, help="-1: fully fused. 0:roberta, 1:gte, 2:bge, 3:text2vec")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint directory (e.g. checkpoints/run/p0_flow_v1_step_50000)")
+    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--ode_steps", type=int, default=20, help="ODE Euler solver steps")
+    parser.add_argument("--config_file", type=str, default="dataset_config.json")
+    parser.add_argument("--data_dir", type=str, default="./datas", help="Local cache directory for ModelScope downloads")
     args = parser.parse_args()
 
-    print("1. Loading physical architecture...")
-    tokenizer = CharTokenizer()
+    # 0. 加载数据集配置
+    with open(args.config_file, "r") as f:
+        ds_config = json.load(f)
+    base_models = ds_config.get("base_models", [])
+    chunk_patterns = ds_config.get("chunk_name_patterns", {})
+    ms_repo_id = ds_config.get("modelscope_repo_id", "catclever/emb_npy")
+    parquet_path = ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_omni.parquet")
+
+    # 1. 从 checkpoint 权重反推模型架构
+    print("1. Sniffing architecture from checkpoint weights...")
+    emb_dims = sniff_emb_dims_from_weights(args.ckpt)
+    print(f"   Detected emb_dims: {emb_dims} ({len(emb_dims)} models: {base_models})")
     
     config = ModelConfig()
     d_model = config.decoder_heads * 64
     
-    fuser = SensoryFuser(config.emb_dims, d_model)
+    fuser = SensoryFuser(emb_dims, d_model)
     god_encoder = GodEncoder(d_model, config.z_dim)
-    # Using the new FlowDecoder
     decoder = FlowDecoder(config.z_dim, d_model, config.vocab_size, n_layers=config.decoder_layers)
     
-    ckpt_path = args.ckpt
-    print(f"2. Loading weights from {ckpt_path}...")
-    
-    fuser_path = f"{ckpt_path}/sense_fuser.safetensors"
+    print(f"2. Loading weights from {args.ckpt}...")
+    fuser_path = f"{args.ckpt}/sense_fuser.safetensors"
     if not os.path.exists(fuser_path):
-        fuser_path = f"{ckpt_path}/sense_adapter.safetensors"
+        fuser_path = f"{args.ckpt}/sense_adapter.safetensors"
     fuser.load_weights(fuser_path)
-    god_encoder.load_weights(f"{ckpt_path}/god_encoder.safetensors")
-    decoder.load_weights(f"{ckpt_path}/flow_decoder.safetensors")
+    god_encoder.load_weights(f"{args.ckpt}/god_encoder.safetensors")
+    decoder.load_weights(f"{args.ckpt}/flow_decoder.safetensors")
+    mx.eval(fuser.parameters(), god_encoder.parameters(), decoder.parameters())
     
-    print(f"3. Pulling {args.num_samples} random sentence(s) from Parquet (Source of truth)...")
-    df = pd.read_parquet("data/Basic_ZH/chunked_mixed_wiki.parquet")
+    # 3. 加载文本
+    print(f"3. Loading text pool from {parquet_path}...")
+    df = pd.read_parquet(parquet_path)
     text_chunks = df['chunks'].explode().dropna().tolist()
     total_chunks = len(text_chunks)
+    del df
+    print(f"   Total text chunks: {total_chunks}")
     
-    del df # Free memory
-    sampled_indices = random.sample(range(total_chunks), args.num_samples)
+    # 4. 从 ModelScope 探测可用分块并拉取一个
+    print("4. Probing ModelScope for a valid chunk...")
+    from modelscope.hub.api import HubApi
+    from modelscope.hub.file_download import dataset_file_download
     
-    print("4. Mmapping all .npy disk arrays...")
-    emb_files = [
-        "data/Basic_ZH/embs/hy-tmp/roberta_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/gte_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/bge_embeddings.npy",
-        "data/Basic_ZH/embs/hy-tmp/text2vec_embeddings.npy"
-    ]
-    embs_mmap = [np.load(path, mmap_mode='r') for path in emb_files]
+    api = HubApi()
+    res = api.get_dataset_files(ms_repo_id, recursive=True)
+    chunk_files = [f.get("Path", f.get("Name", "")) for f in res]
     
-    for i, idx in enumerate(sampled_indices):
-        target_text = text_chunks[idx]
-        print(f"\n======================================")
-        print(f"       >>> SAMPLE {i+1} (Row #{idx}) <<<")
-        print(f"======================================")
+    # 按模型归类 start → end
+    per_model_bounds = {}
+    for model_name in base_models:
+        pattern = chunk_patterns.get(model_name, "")
+        prefix = pattern.split("/")[0] if "/" in pattern else model_name
+        start_to_end = {}
+        for f in chunk_files:
+            if f.endswith(".npz") and f.startswith(prefix + "/"):
+                match = re.search(r'chunk_(\d+)_(\d+)\.npz', os.path.basename(f))
+                if match:
+                    start_to_end[int(match.group(1))] = int(match.group(2))
+        per_model_bounds[model_name] = start_to_end
+    
+    common_starts = sorted(set.intersection(*[set(d.keys()) for d in per_model_bounds.values()]))
+    print(f"   Found {len(common_starts)} common chunks")
+    
+    # 随机选一个块
+    chosen_start = random.choice(common_starts)
+    min_end = min(per_model_bounds[m][chosen_start] for m in base_models)
+    chunk_size = min_end - chosen_start
+    print(f"   Using chunk [{chosen_start}:{min_end}] (size: {chunk_size})")
+    
+    # 下载该块所有模型的数据
+    chunk_embs = []
+    for model_name in base_models:
+        pattern = chunk_patterns.get(model_name, "")
+        model_end = per_model_bounds[model_name][chosen_start]
+        cand_name = pattern.format(start=chosen_start, end=model_end)
+        print(f"   Downloading {cand_name}...")
+        path = dataset_file_download(ms_repo_id, cand_name, cache_dir=args.data_dir)
+        arr = np.load(path)['features']
+        chunk_embs.append(arr)
+    
+    # 5. 随机采样验证
+    tokenizer = CharTokenizer()
+    sampled_offsets = random.sample(range(chunk_size), min(args.num_samples, chunk_size))
+    
+    for i, offset in enumerate(sampled_offsets):
+        global_idx = chosen_start + offset
+        target_text = text_chunks[global_idx]
         
-        # We slice exactly one row to simulate a batch size of 1
-        embs = [mx.array(arr[idx:idx+1]) for arr in embs_mmap]
-            
-        print("5. Forwarding through SensoryFuser and GodEncoder -> z_target...")
+        print(f"\n{'='*60}")
+        print(f"       >>> SAMPLE {i+1} (Global Row #{global_idx}) <<<")
+        print(f"{'='*60}")
         
-        weights = None
-        if args.emb_idx != -1:
-            weights = [0.0] * 4
-            weights[args.emb_idx] = 1.0
-            print(f"   (Using EXCLUSIVE external embedding: {emb_files[args.emb_idx].split('/')[-1]})")
-        else:
-            print("   (Using pure Centroid Fusion of all 4 inputs)")
-            
-        f_t = fuser(embs, weights=weights)
+        # 取出该行的 embedding (1, dim)
+        embs = [mx.array(arr[offset:offset+1]) for arr in chunk_embs]
+        
+        print("5. SensoryFuser → GodEncoder → z_target...")
+        f_t = fuser(embs, weights=None)  # Centroid fusion
         z_target = god_encoder(f_t)
+        mx.eval(z_target)
         
-        print("6. Continuous ODE Decoding from z_target (The Topological Dream)...")
-        # --- THE CHEAT ---
-        # We extract the actual token sequence length to bypass padding and dynamic length prediction.
-        tokenized_ids = tokenizer.encode(target_text)
+        print("6. Continuous ODE Decoding (Euler solver)...")
+        tokenized_ids = tokenizer.encode(target_text, add_special_tokens=True)
         cheat_length = len(tokenized_ids)
-        print(f"   [Cheat Mode: Feeding exact sentence length ({cheat_length}) to ODE Solver]")
+        print(f"   [Cheat Mode: target length = {cheat_length}]")
         
-        # Call the continuous Euler solver!
-        generated_ids = decoder.generate_euler(z_target, target_length=cheat_length, steps=20)
+        generated_ids = decoder.generate_euler(z_target, target_length=cheat_length, steps=args.ode_steps)
+        mx.eval(generated_ids)
         
-        # Convert generated_ids to python list and decode
         generated_list = generated_ids[0].tolist()
         decoded_text = tokenizer.decode(generated_list, skip_special_tokens=True)
         
-        print(f"\n=================【终极连续流体力学解码对比】=================")
-        print(f"[真实世界原句 (Original)]:")
-        print(f" > {target_text}\n")
-        print(f"[高斯爆震生成梦境 (Euler Dream Reconstruction)]:")
-        print(f" > {decoded_text}")
-        print(f"==============================================================\n")
+        # 计算字符级准确率
+        min_len = min(len(target_text), len(decoded_text))
+        correct = sum(1 for a, b in zip(target_text[:min_len], decoded_text[:min_len]) if a == b)
+        accuracy = correct / max(len(target_text), 1) * 100
+        
+        print(f"\n{'='*20}【连续流体力学解码对比】{'='*20}")
+        print(f"[原句 Original]:  {target_text[:200]}{'...' if len(target_text) > 200 else ''}")
+        print(f"[ODE 重建 Dream]: {decoded_text[:200]}{'...' if len(decoded_text) > 200 else ''}")
+        print(f"[字符准确率]:      {accuracy:.1f}%")
+        print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     verify_flow()

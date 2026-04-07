@@ -36,6 +36,8 @@ wheels/
 
 # Datasets & Weights
 data
+datas/
+dataset_config.json
 checkpoints/
 *.npz
 *.safetensors
