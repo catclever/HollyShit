@@ -94,11 +94,16 @@ def ot_cfm_loss(model, token_ids: mx.array, z_target: mx.array, mask: mx.array =
     align_weights = mx.softmax(ngram_sim, axis=-1)  # (B, L, L)
     
     # 动态重构物理靶点
-    # 每个噪声点的终点，不再是死板的 x_1[i]，而是所有可能相似子句的软几何中心
-    dynamic_x1 = mx.matmul(align_weights, x_1)  # (B, L, d_model)
+    raw_dynamic_x1 = mx.matmul(align_weights, x_1)  # (B, L, d_model)
+    
+    # 🚨 物理奇点修复机制 (Singularity Fade-out) 🚨
+    # 在最后降落阶段 (t -> 1)，任何非真实的 raw_dynamic_x1 都会导致物理上需要“瞬间光速折返”的奇异点
+    # 这里通过极其平滑的倒数引力，让动态重组逐渐向真实的单体 x_1 妥协。
+    # 这样，在 t=0.99 时，靶中心必然无限折回 x_1，分子分母同阶消失，彻底避免 Loss 在终点处除零爆炸并达到完美吻合！
+    dynamic_x1 = raw_dynamic_x1 * (1.0 - t_expand) + x_1 * t_expand
     
     # 6. Optimal Transport Velocity (由静态的终点，变为被动态锚点吸过去的引力线)
-    # 传统公式: v = x1 - x0 = (x1 - xt) / (1 - t). 我们把固定的 x1 换成了 dynamic_x1
+    # 计算当前从 x_t 抵达妥协后的 dynamic_x1 所需要的瞬时速度：
     v_true_dynamic = (dynamic_x1 - x_t) / mx.maximum(1.0 - t_expand, 1e-5)
     
     # ====== Loss 1: Dynamic Velocity MSE ======

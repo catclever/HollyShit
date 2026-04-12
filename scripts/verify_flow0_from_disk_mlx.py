@@ -39,7 +39,9 @@ def verify_flow():
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--ode_steps", type=int, default=20, help="ODE Euler solver steps")
     parser.add_argument("--config_file", type=str, default="dataset_config.json")
-    parser.add_argument("--data_dir", type=str, default="./datas", help="Local cache directory for ModelScope downloads")
+    parser.add_argument("--data_dir", type=str, default="./embs", help="Local cache directory for ModelScope downloads")
+    parser.add_argument("--chunk_start", type=int, default=None, help="Explicitly use a specific chunk_start instead of randomly picking")
+    parser.add_argument("--offsets", type=str, default=None, help="Comma separated list of chunk offsets (e.g. '125570,240913')")
     args = parser.parse_args()
 
     # 0. 加载数据集配置
@@ -104,10 +106,15 @@ def verify_flow():
     common_starts = sorted(set.intersection(*[set(d.keys()) for d in per_model_bounds.values()]))
     print(f"   Found {len(common_starts)} common chunks")
     
-    # 随机选一个块
-    chosen_start = random.choice(common_starts)
-    min_end = min(per_model_bounds[m][chosen_start] for m in base_models)
-    chunk_size = min_end - chosen_start
+    # 随机或指定选一个块
+    if args.chunk_start is not None:
+        chosen_start = args.chunk_start
+        min_end = min(per_model_bounds[m][chosen_start] for m in base_models)
+        chunk_size = min_end - chosen_start
+    else:
+        chosen_start = random.choice(common_starts)
+        min_end = min(per_model_bounds[m][chosen_start] for m in base_models)
+        chunk_size = min_end - chosen_start
     print(f"   Using chunk [{chosen_start}:{min_end}] (size: {chunk_size})")
     
     # 下载该块所有模型的数据
@@ -121,9 +128,12 @@ def verify_flow():
         arr = np.load(path)['features']
         chunk_embs.append(arr)
     
-    # 5. 随机采样验证
+    # 5. 随机采样验证或指定 offsets
     tokenizer = CharTokenizer()
-    sampled_offsets = random.sample(range(chunk_size), min(args.num_samples, chunk_size))
+    if args.offsets is not None:
+        sampled_offsets = [int(o) for o in args.offsets.split(",")]
+    else:
+        sampled_offsets = random.sample(range(chunk_size), min(args.num_samples, chunk_size))
     
     for i, offset in enumerate(sampled_offsets):
         global_idx = chosen_start + offset

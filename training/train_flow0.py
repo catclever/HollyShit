@@ -109,13 +109,17 @@ def main():
     mx.eval(model_composite.parameters())
     print("Flow Model composite initialized.")
 
-    # 4. Checkpointer
+    # 4. Optimizer Needs to be Registered BEFORE Checkpointer Loads
+    optimizer = optim.AdamW(learning_rate=args.lr)
+
+    # 5. Checkpointer
     checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
     
     checkpointer.register_model("sense_fuser", fuser)
     checkpointer.register_model("god_encoder", god_encoder)
     checkpointer.register_model("flow_decoder", decoder)
     checkpointer.register_dataloader("dataloader", dataloader)
+    checkpointer.register_optimizer("optimizer", optimizer)
     checkpointer.register_args(args)
     
     start_step = 0
@@ -123,9 +127,6 @@ def main():
         start_step = checkpointer.load(args.resume_from)
     elif args.auto_resume:
         start_step = checkpointer.load_latest()
-
-    # 5. Optimizer
-    optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 6. Optimal Transport Flow Match Objective + Auxiliary Losses
     def loss_fn(model, embs, tokens, target_mask):
@@ -185,7 +186,18 @@ def main():
                     checkpointer.save(global_step)
                     
     except KeyboardInterrupt:
+        print("\n[User Interrupted] Saving emergency checkpoint...")
         checkpointer.save(global_step, is_emergency=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"\n[Crash Detected] {type(e).__name__}: {e}")
+        try:
+            print("Saving emergency checkpoint before crashing...")
+            checkpointer.save(global_step, is_emergency=True)
+        except Exception as save_e:
+            print(f"Failed to save emergency checkpoint: {save_e}")
+        raise e
 
 if __name__ == "__main__":
     main()

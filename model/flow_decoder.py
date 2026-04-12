@@ -251,9 +251,9 @@ class FlowDecoder(nn.Module):
             
         # At t=1.0, x should perfectly approximate the char_embedding of the target sentence!
         # Final trick: Snap to the nearest discrete token in the dictionary
-        # Compute L2 distance or Cosine Similarity to self.char_embedding.weight
-        
-        emb_bank = self.char_embedding.weight
+        # IMPORTANT: Must snap to the NORMALIZED hypersphere projection exactly as embed_text() does!
+        raw_bank = self.char_embedding.weight
+        emb_bank = (raw_bank / mx.maximum(mx.linalg.norm(raw_bank, axis=-1, keepdims=True), 1e-6)) * math.sqrt(self.d_model)
         
         # Simple Euclidean Distance Argmin (Broadcasting)
         # Distance^2 = (A-B)^2 = A^2 + B^2 - 2AB
