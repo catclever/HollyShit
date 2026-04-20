@@ -79,11 +79,10 @@ def decoder_reconstruction_loss(logits: mx.array, target_tokens: mx.array, mask:
     else:
         ce_loss = ce_loss.mean()
 
-    if bow_weight > 0.0:
-        reward = ngram_bow_reward(logits, target_tokens, mask, max_n=bow_max_n)
-        return ce_loss - bow_weight * reward
+    # Calculate reward unconditionally, then multiply by bow_weight, to avoid python 'if' control flow on mx.arrays during tracing.
+    reward = ngram_bow_reward(logits, target_tokens, mask, max_n=bow_max_n)
+    return ce_loss, bow_weight * reward
         
-    return ce_loss
 
 def ngram_bow_reward(logits: mx.array, target_ids: mx.array, mask: mx.array = None, max_n: int = 5) -> mx.array:
     """

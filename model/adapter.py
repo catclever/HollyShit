@@ -9,13 +9,20 @@ class SenseAdapter(nn.Module):
     """
     def __init__(self, input_dim: int, d_model: int):
         super().__init__()
+        # NEW: Adding LayerNorm for absolute dimension suppression to prevent dominating features
+        self.norm = nn.LayerNorm(input_dim)
+        
         self.net = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.SiLU(),
             nn.Linear(d_model, d_model)
         )
         
+        self.scale = 1.0 / (input_dim ** 0.5)
+        
     def __call__(self, x: mx.array) -> mx.array:
+        # Normalize and scale
+        x = self.norm(x) * self.scale
         return self.net(x)
 
 class SensoryFuser(nn.Module):
@@ -38,7 +45,6 @@ class SensoryFuser(nn.Module):
         Returns:
             f_fused: Universal representation (batch_size, [seq_len], d_model)
         """
-        # 1. Gather all individual f_t's from each SenseAdapter
         f_list = [adp(e) for adp, e in zip(self.adapters, embs)]
         f_stack = mx.stack(f_list, axis=-2)
         N = len(embs)
