@@ -1,0 +1,15 @@
+# macOS/MLX runtime dependencies
+numpy
+pandas
+mlx
+torch
+safetensors
+transformers
+sentence-transformers
+huggingface_hub
+tqdm
+pyarrow
+modelscope
+scikit-learn
+scipy
+datasets

@@ -1,0 +1,14 @@
+# Linux/CUDA runtime dependencies
+numpy
+pandas
+torch
+safetensors
+transformers
+sentence-transformers
+huggingface_hub
+tqdm
+pyarrow
+modelscope
+scikit-learn
+scipy
+datasets

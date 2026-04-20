@@ -1,0 +1,2 @@
+# Default to Linux/CUDA stack
+-r requirements.cuda.txt
