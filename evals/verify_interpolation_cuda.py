@@ -1,7 +1,7 @@
 """
 【脚本功能】：高维空间球面平滑线性插值 (SLERP) 的概念漫游器 (PyTorch/CUDA Version)
 【使用场景】：Phase 0 验证阶段。探究大语言模型的离散文字空间在被降维锚定后，是否形成了连续的拓扑结构。
-【用法示例】：`python scripts/verify_interpolation_cuda.py --ckpt checkpoints/run/p0_v1_step_150000 --idx_a 1000 --idx_b 2000000 --steps 5`
+【用法示例】：`python evals/verify_interpolation_cuda.py --ckpt checkpoints/run/p0_v1_step_150000 --idx_a 1000 --idx_b 2000000 --steps 5`
 """
 import torch
 import numpy as np

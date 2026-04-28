@@ -18,7 +18,7 @@ from model.config import ModelConfig
 from model.adapter_cuda import SensoryFuserCUDA
 from model.god_encoder_cuda import GodEncoderCUDA
 from model.decoder_cuda import WeakDecoderCUDA
-from model.mlx_to_cuda_mapper import load_mlx_safetensors_into_cuda_module
+from tools.mlx_to_cuda_mapper import load_mlx_safetensors_into_cuda_module
 
 
 def ensure_losskwargs_compat() -> None:

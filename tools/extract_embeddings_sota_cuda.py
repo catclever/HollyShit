@@ -2,8 +2,8 @@
 【脚本功能】：高维连续特征 (GodEncoder Anchor) 的零拷贝实体化榨汁机
 【使用场景】：Phase 0.1 云端高算力压榨阶段。运行于云端带有至少 24GB 显存的显卡上。负责动用 BFloat16/FlashAttention2 加速模型，将百万级自然语言文本提炼成极致浓缩的纯数学高维特征，并以 `.npy` memmap 直接刷入硬盘防止 OOM。
 【用法示例】：
-    - 榨取 BGE 对比特征：`python scripts/extract_embeddings_sota_cuda.py --model bge --batch_size 256`
-    - 榨取 Qwen 因果特征：`python scripts/extract_embeddings_sota_cuda.py --model qwen --batch_size 16`
+    - 榨取 BGE 对比特征：`python tools/extract_embeddings_sota_cuda.py --model bge --batch_size 256`
+    - 榨取 Qwen 因果特征：`python tools/extract_embeddings_sota_cuda.py --model qwen --batch_size 16`
 """
 
 import sys
