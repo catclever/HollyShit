@@ -1,3 +1,6 @@
 [submodule "training/core"]
 	path = training/core
 	url = https://github.com/catclever/Huntun
+[submodule "gemma_prosthesis"]
+	path = gemma_prosthesis
+	url = ./gemma_prosthesis
