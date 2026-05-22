@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from training.char_tokenizer import CharTokenizer
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
@@ -46,7 +46,7 @@ def verify_semantics():
 
     print("1. Loading physical architecture...")
     tokenizer = CharTokenizer()
-    config = ModelConfig()
+    config = WeakDecoderConfig()
     d_model = config.decoder_heads * 64
     
     fuser = SensoryFuser(config.emb_dims, d_model)

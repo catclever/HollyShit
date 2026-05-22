@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from training.core.dataloader import ChunkedNpzDataLoader
 from training.core.char_tokenizer import CharTokenizer
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
@@ -162,7 +162,7 @@ def verify():
         fuser_weights[target_model_idx] = 1.0
         target_models = [target_model]
 
-    config = ModelConfig()
+    config = WeakDecoderConfig()
     d_model = config.d_model
     vocab_size = tokenizer.vocab_size
     

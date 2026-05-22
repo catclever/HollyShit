@@ -15,7 +15,7 @@ from training.core.dataloader import ChunkedNpzDataLoader
 from training.core.char_tokenizer import CharTokenizer
 from training.core.checkpoint import Checkpointer
 from training.core.schedule import linear_warmup_schedule
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
@@ -77,7 +77,7 @@ def main():
     )
 
     # 2. Model Initialization
-    m_config = ModelConfig()
+    m_config = WeakDecoderConfig()
     d_model = m_config.d_model
     vocab_size = tokenizer.vocab_size
     
@@ -122,8 +122,7 @@ def main():
     optimizer = optim.AdamW(learning_rate=args.lr)
 
     # 3. Checkpointer Setup
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    checkpointer = Checkpointer(out_dir=args.ckpt_dir, prefix=args.ckpt_prefix)
+    checkpointer = Checkpointer(out_dir=args.ckpt_dir, prefix=args.ckpt_prefix, keep_last_k=args.keep_last_k)
     checkpointer.register_model("sense_fuser", fuser)
     checkpointer.register_model("god_encoder", god_encoder)
     checkpointer.register_model("weak_decoder", weak_decoder)

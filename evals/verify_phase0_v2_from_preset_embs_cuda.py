@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from training.core.char_tokenizer import CharTokenizer
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from model.adapter_cuda import SensoryFuserCUDA
 from model.god_encoder_cuda import GodEncoderCUDA
 from model.decoder_cuda import WeakDecoderCUDA
@@ -87,7 +87,7 @@ def main():
         print(f"[Emb] {model_key} -> {arr.shape}")
 
     tokenizer = CharTokenizer("training/core/char_vocab.json")
-    cfg = ModelConfig()
+    cfg = WeakDecoderConfig()
     fuser = SensoryFuserCUDA(emb_dims, cfg.d_model).to(device)
     god_encoder = GodEncoderCUDA(cfg.d_model, cfg.z_dim).to(device)
     decoder = WeakDecoderCUDA(cfg.z_dim, tokenizer.vocab_size, d_model=256, n_layers=4).to(device)

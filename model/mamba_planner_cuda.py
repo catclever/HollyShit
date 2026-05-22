@@ -1,6 +1,15 @@
-import mlx.core as mx
-import mlx.nn as nn
-from .mamba_mlx.mamba_mlx import Mamba, MambaConfig
+import torch
+import torch.nn as nn
+
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    print("[Warning] 'mamba_ssm' not installed. Please run: pip install mamba-ssm causal-conv1d")
+    # Provide a dummy or error throwing class if not available during init
+    class Mamba(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            raise ImportError("mamba_ssm must be installed to use MambaPlanner_CUDA.")
 
 class OrthogonalFieldSuperposition(nn.Module):
     """
@@ -10,11 +19,9 @@ class OrthogonalFieldSuperposition(nn.Module):
     """
     def __init__(self, d_model: int):
         super().__init__()
-        # 移除了 RMSNorm。我们把控制能量 (模长) 的权力完全交还给网络本身。
-        # 确信度高的背景场，网络自然会放大其模长；无关紧要的场，网络会坍缩其模长。
         pass
         
-    def __call__(self, main_stream: mx.array, aux_streams: list[mx.array]):
+    def forward(self, main_stream: torch.Tensor, aux_streams: list[torch.Tensor]):
         if not aux_streams:
             return main_stream
             
@@ -38,17 +45,22 @@ class MambaPlanner(nn.Module):
     不再负责直接的微观轨迹预测 (移交给了 Phase 2 的 Flow Matching)。
     唯一职责：接收主序列和多条认知流，将其淬炼压缩为一个极度纯粹、稳定的当前状态势能 h_context。
     """
-    def __init__(self, config: MambaConfig):
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        self.d_model = config.d_model
+        self.d_model = d_model
         
         # 1. 纯物理叠加的融合场
         self.stream_fuser = OrthogonalFieldSuperposition(self.d_model)
         
-        # 2. 纯粹的状态机引擎
-        self.mamba = Mamba(config)
+        # 2. 纯粹的状态机引擎 (使用官方的 mamba_ssm 库，底层自带 Triton 加速)
+        self.mamba = Mamba(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
         
-    def __call__(self, main_stream: mx.array, aux_streams: list[mx.array] = None):
+    def forward(self, main_stream: torch.Tensor, aux_streams: list[torch.Tensor] = None):
         """
         Forward pass for Contextual Brain.
         
@@ -69,4 +81,3 @@ class MambaPlanner(nn.Module):
         h_context = self.mamba(fused_input)
         
         return h_context
-

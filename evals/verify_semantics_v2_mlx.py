@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from training.core.dataloader import ChunkedNpzDataLoader
 from training.core.char_tokenizer import CharTokenizer
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
@@ -180,16 +180,35 @@ def verify():
         # Single model scores itself, unless explicitly overridden
         judge_model_key = args.judge_model if args.judge_model else target_model
 
-    config = ModelConfig()
-    d_model = config.d_model
+    config = WeakDecoderConfig()
     vocab_size = tokenizer.vocab_size
     
-    fuser = SensoryFuser(emb_dims, d_model)
-    god_encoder = GodEncoder(d_model, config.z_dim)
-    decoder = WeakDecoder(config.z_dim, vocab_size, d_model=256, n_layers=4)
+    fuser = SensoryFuser(emb_dims, config.d_model)
+    god_encoder = GodEncoder(config.d_model, config.z_dim)
     
     ckpt_path = args.ckpt
     print(f"2. Loading weights from {ckpt_path}...")
+    
+    decoder_path = f"{ckpt_path}/weak_decoder.safetensors"
+    if not os.path.exists(decoder_path):
+        decoder_path = f"{ckpt_path}/decoder.safetensors"
+        
+    # Auto-sniff WeakDecoder architecture
+    dec_weights = mx.load(decoder_path)
+    try:
+        sniffed_d_model = dec_weights['z_proj.weight'].shape[0]
+        layer_indices = set()
+        for k in dec_weights.keys():
+            if k.startswith("transformer.layers."):
+                parts = k.split(".")
+                if len(parts) > 2 and parts[2].isdigit():
+                    layer_indices.add(int(parts[2]))
+        sniffed_n_layers = max(layer_indices) + 1 if layer_indices else 4
+    except Exception:
+        sniffed_d_model = 256
+        sniffed_n_layers = 4
+        
+    decoder = WeakDecoder(config.z_dim, vocab_size, d_model=sniffed_d_model, n_layers=sniffed_n_layers)
     
     fuser_path = f"{ckpt_path}/sense_fuser.safetensors"
     if not os.path.exists(fuser_path):
@@ -197,10 +216,7 @@ def verify():
     fuser.load_weights(fuser_path)
     god_encoder.load_weights(f"{ckpt_path}/god_encoder.safetensors")
     
-    decoder_path = f"{ckpt_path}/weak_decoder.safetensors"
-    if not os.path.exists(decoder_path):
-        decoder_path = f"{ckpt_path}/decoder.safetensors"
-    decoder.load_weights(decoder_path)
+    decoder.load_weights(list(dec_weights.items()))
     
     print("\n======================================")
     print(f"Loading Semantic Judge ({judge_model_key})...")

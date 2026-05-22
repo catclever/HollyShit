@@ -6,172 +6,174 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import numpy as np
 
-from model.config import ModelConfig
-from model.adapter import SensoryFuser
-from model.god_encoder import GodEncoder
+
 from model.mamba_planner import MambaPlanner
 from model.mamba_mlx.mamba_mlx import MambaConfig
-from training.core.dataloader import Phase1DataLoader
+from model.flow_matcher import FlowMatcher
+from training.core.dataloader import TextDocumentDataLoader
+from training.core.char_tokenizer import CharTokenizer
 from training.core.checkpoint import Checkpointer
 from training.core.schedule import linear_warmup_schedule
-from training.losses.loss import coverage_loss, momentum_continuity_loss
+from training.losses.flow_loss import compute_flow_matching_loss
 from training.core.args import get_training_parser
 
+# Dynamic Import of the Phase 0.5 Distilled Model
+from distilled_emb.model import TinyCharEncoder
+
+class E2EModel(nn.Module):
+    """
+    联合训练容器：将 Mamba (大脑) 和 FlowMatcher (喷嘴) 缝合，
+    方便 MLX 对这两者一并进行梯度反向传播。
+    """
+    def __init__(self, mamba, flow):
+        super().__init__()
+        self.mamba = mamba
+        self.flow = flow
+        
+    def __call__(self, main_stream, z_target, mask):
+        # 1. 大脑思考：Mamba 吸收历史算子，积分出当前的纯净势能 h_context
+        h_context = self.mamba(main_stream, aux_streams=[])
+        
+        # 2. 嘴巴吹风：FlowMatcher 在 h_context 的势能场下，尝试吹出微观轨迹
+        loss = compute_flow_matching_loss(self.flow, z_target, h_context, mask=mask)
+        return loss
+
 def main():
-    # 1. Parse Args (Re-use the same arguments as Phase 0, add Phase 1 specifics)
-    parser = get_training_parser("Phase 1 Mamba Training")
-    parser.add_argument("--max_episode_len", type=int, default=None, help="If set, strictly bounds and pads sequences to this fixed length (without breaching documents).")
-    parser.add_argument("--p0_ckpt", type=str, required=True, help="Path to the frozen Phase 0 checkpoint directory (e.g. checkpoints/run/p0_v1_step_160000)")
-    parser.add_argument("--residual_mode", action="store_true", help="If True, Mamba predicts delta velocity instead of absolute coordinates")
-    parser.add_argument("--var_warmup_steps", type=int, default=20000, help="Number of steps to force logvar to 0.0, reducing NLL to pure MSE for deterministic pre-training.")
-    
+    parser = get_training_parser("Phase 1: Mamba & Flow Matching Training (On-the-fly TinyBERT)")
+    parser.add_argument("--max_episode_len", type=int, default=None, help="Sequence chunking limit.")
+    parser.add_argument("--data_path", type=str, default="data/Basic_ZH/chunked_mixed_omni.parquet", help="Path to the parquet training data.")
+    parser.add_argument("--tinybert_ckpt", type=str, default="checkpoints/distilled/tinybert_pt_v1_step_100000", help="Path to frozen Phase 0.5 distilled TinyBERT.")
+    parser.add_argument("--d_model", type=int, default=1024, help="Dimension of the Mamba and FlowMatcher physical backbone.")
+    parser.add_argument("--mamba_d_state", type=int, default=16, help="Mamba internal state dimension.")
+    parser.add_argument("--mamba_d_conv", type=int, default=4, help="Mamba internal conv dimension.")
+    parser.add_argument("--mamba_expand", type=int, default=2, help="Mamba internal expansion factor.")
+    parser.add_argument("--flow_hidden_dim", type=int, default=2048, help="Hidden expansion dimension for the Flow Matcher nozzle.")
     args = parser.parse_args()
 
-    # 2. Config & Setup
-    config = ModelConfig()
-    config.z_dim = args.z_dim
-    d_model = config.d_model
+    # d_model 现在是一个可以被命令行控制的参数
+    d_model = args.d_model
 
-    # 3. Dynamic Dimensionality Sniffing (Self-Adaptive Architecture)
-    emb_files = [
-        "data/Basic_ZH/embs/bge_embeddings.npy",
-        "data/Basic_ZH/embs/gte_qwen2_embeddings.npy"
-    ]
-    
-    import numpy as np
-    print("Sniffing dynamic dimensionalities from physical feature maps...")
-    inferred_emb_dims = [np.load(f, mmap_mode='r').shape[-1] for f in emb_files]
-    print(f"Auto-Detected Input Dimensions: {inferred_emb_dims}")
-
-    # 4. Instantiate Phase 0 Models (FROZEN)
-    fuser = SensoryFuser(inferred_emb_dims, d_model)
-    god_encoder = GodEncoder(d_model, config.z_dim)
-    
-    print(f"Loading Frozen Phase 0 weights from {args.p0_ckpt}...")
-    import os
-    fuser_path = f"{args.p0_ckpt}/sense_fuser.safetensors"
-    if not os.path.exists(fuser_path):
-        fuser_path = f"{args.p0_ckpt}/sense_adapter.safetensors"
-    fuser.load_weights(fuser_path)
-    god_encoder.load_weights(f"{args.p0_ckpt}/god_encoder.safetensors")
-    
-    # Freeze them
-    fuser.freeze()
-    god_encoder.freeze()
-    
-    # 5. Instantiate Phase 1 Mamba Planner (TRAINABLE)
-    mamba_cfg = MambaConfig(d_model=d_model, n_layers=2) # Default small mamba for testing
-    mamba_planner = MambaPlanner(mamba_cfg, config.z_dim, residual_mode=args.residual_mode)
-    mx.eval(mamba_planner.parameters())
-
-    # 6. Dataloader for Trajectories
-    dataloader = Phase1DataLoader(
-        parquet_path="data/Basic_ZH/chunked_mixed_wiki.parquet",
-        emb_paths=emb_files,
+    # 1. 实例化真正的基础词表与 DataLoader
+    tokenizer = CharTokenizer()
+    dataloader = TextDocumentDataLoader(
+        parquet_path=args.data_path,
+        tokenizer=tokenizer,
         batch_size=args.batch_size,
         max_episode_len=args.max_episode_len
     )
 
-    # 6. Optimizer with Dynamic LR
+    # 2. 嗅探并实例化 Phase 0.5 (自动读取维度)
+    print(f"Loading Frozen Phase 0.5 TinyCharEncoder from {args.tinybert_ckpt}...")
+    
+    safetensors_path = args.tinybert_ckpt
+    if not safetensors_path.endswith(".safetensors"):
+        safetensors_path = f"{args.tinybert_ckpt}/model.safetensors"
+        if not os.path.exists(safetensors_path):
+            safetensors_path = f"{args.tinybert_ckpt}/tinybert.safetensors"
+            if not os.path.exists(safetensors_path):
+                raise FileNotFoundError(f"Could not find .safetensors in {args.tinybert_ckpt}. MLX requires .safetensors format (not PyTorch .pt)!")
+
+    # 在实例化前，先暴力嗅探 safetensors 里的输出层维度 (z_dim)
+    weights = mx.load(safetensors_path)
+    try:
+        sniffed_z_dim = weights['out_proj.weight'].shape[0]
+        print(f"[Auto-Sniff] Successfully sniffed Z_dim = {sniffed_z_dim} from checkpoint!")
+    except KeyError:
+        raise ValueError("Cannot find 'out_proj.weight' in the checkpoint. Is this a valid TinyCharEncoder?")
+
+    # 使用嗅探到的维度初始化
+    tiny_encoder = TinyCharEncoder(vocab_size=tokenizer.vocab_size, z_dim=sniffed_z_dim)
+    tiny_encoder.load_weights(list(weights.items()))
+    tiny_encoder.freeze()
+    print("Phase 0.5 TinyCharEncoder loaded and frozen. We are now self-bootstrapping!")
+    
+    # 3. 实例化真正的训练目标：Mamba大脑 + 喷嘴
+    mamba_cfg = MambaConfig(
+        d_model=d_model, 
+        n_layers=2,
+        d_state=args.mamba_d_state,
+        d_conv=args.mamba_d_conv,
+        expand_factor=args.mamba_expand
+    )
+    mamba_planner = MambaPlanner(mamba_cfg)
+    flow_matcher = FlowMatcher(d_model=d_model, hidden_dim=args.flow_hidden_dim)
+    
+    e2e_model = E2EModel(mamba_planner, flow_matcher)
+    mx.eval(e2e_model.parameters())
+
     optimizer = optim.AdamW(learning_rate=args.lr)
 
-    # 7. Checkpointer
-    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
+    # 4. Checkpointer
+    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix, keep_last_k=args.keep_last_k)
     checkpointer.register_model("mamba_planner", mamba_planner)
-    checkpointer.register_dataloader("dataloader_p1", dataloader)
+    checkpointer.register_model("flow_matcher", flow_matcher)
+    checkpointer.register_dataloader("dataloader_phase1", dataloader)
     checkpointer.register_optimizer("optimizer", optimizer)
     checkpointer.register_args(args)
     
-    start_step = 0
-    if args.resume_from:
-        start_step = checkpointer.load(args.resume_from)
-    elif args.auto_resume:
-        start_step = checkpointer.load_latest()
+    start_step = checkpointer.load(args.resume_from) if args.resume_from else (checkpointer.load_latest() if args.auto_resume else 0)
 
-    # 8. Loss Closure
-    def loss_fn(model, f_t_input, z_target_truth, mask, step_scalar, var_warmup_scalar):
-        # 8b. Mamba predicts the trajectory
-        # Input to Mamba is the sensory stream f_t_input
-        mu, logvar, _ = model(f_t_input) # mu, logvar shape: (B, L, z_dim)
+    # 5. 定义 MLX 梯度磁带
+    def loss_fn(model, main_stream, z_target, mask):
+        return model(main_stream, z_target, mask)
         
-        # Deterministic Warmup (Variance Annealing)
-        # If step < warmup, beta = 0.0 (freeze variance to 1.0, loss becomes MSE)
-        # If step >= warmup, beta = 1.0 (probabilistic NLL)
-        beta = mx.where(step_scalar >= var_warmup_scalar, 1.0, 0.0)
-        effective_logvar = logvar * beta
-        
-        # 8c. Calculate Losses with dynamically padded sequence masks
-        l_cov = coverage_loss(mu, effective_logvar, z_target_truth, mask=mask)
-        l_mom = momentum_continuity_loss(mu, mask=mask)
-        
-        # 8d. Total Loss Fusion
-        # You can tune the momentum alpha later
-        total_loss = l_cov + 0.1 * l_mom
-        
-        return total_loss, (l_cov, l_mom)
-
-    step_fn = nn.value_and_grad(mamba_planner, loss_fn)
+    step_fn = nn.value_and_grad(e2e_model, loss_fn)
     
     @mx.compile
-    def train_step(f_t_static, z_target_static, masks_static, step_static, warmup_static):
-        # The compiled tape executes strictly on the trainable subsets
-        (loss, aux), grads = step_fn(mamba_planner, f_t_static, z_target_static, masks_static, step_static, warmup_static)
-        # Protect RNN against gradient explosion
+    def train_step(main_stream, z_target, masks):
+        loss, grads = step_fn(e2e_model, main_stream, z_target, masks)
         clipped_grads, global_norm = optim.clip_grad_norm(grads, 1.0)
-        return loss, aux, clipped_grads, global_norm
+        return loss, clipped_grads, global_norm
 
-    # 9. Training Loop
-    print(f"Starting Phase 1 Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}, Dynamic Document Lengths (Mamba Masked)")
+    print(f"Starting Phase 1 E2E Physics Training. Epochs: {args.epochs}, Batch Size: {args.batch_size}")
     global_step = start_step
 
     try:
         for epoch in range(dataloader.current_epoch, args.epochs):
-            for batch_embs, masks in dataloader:
+            for ids_t, att_t, sen_t in dataloader:
                 global_step += 1
-                
-                # Synchronize LR directly with absolute global step (Amnesia-proof)
                 optimizer.learning_rate = linear_warmup_schedule(global_step, args.lr, args.warmup_steps)
                 
-                # 8a. Generate frozen targets using Phase 0 (OUTSIDE the compiled gradient tape)
-                f_t = fuser(batch_embs, weights=None) # Centroid Mean for static truth
+                B, S, T = ids_t.shape
+                if S < 2: 
+                    continue # 至少两句话才能构成“上一句预测下一句”
                 
-                # Autoregressive check: we need at least 2 chunks to predict the next step!
-                if f_t.shape[1] < 2:
+                # A. 展平批次和句子维度，一次性送入 TinyCharEncoder (秒算全部 Z)
+                flat_ids = ids_t.reshape(-1, T)
+                flat_att = att_t.reshape(-1, T)
+                
+                # B. 计算 Z_target 并重新折叠回 3D 文档结构
+                z_flat = tiny_encoder(flat_ids, attention_mask=flat_att)
+                z_truth = z_flat.reshape(B, S, -1) # 形如 (Batch, Max_Sentences, Z_dim)
+                
+                # 终极防御：完全 Padding 的句子在 TinyCharEncoder 里可能会除以 1e-8 产生极大值或 NaN，
+                # 我们这里用 sentence_mask (sen_t) 强行归零，彻底切断物理空间里的 NaN 污染源。
+                z_truth = mx.where(sen_t[:, :, None] == 0, mx.zeros_like(z_truth), z_truth)
+                
+                # C. 时空错位法 (Past -> Future)
+                f_t_input = z_truth[:, :-1, :]
+                z_target_truth = z_truth[:, 1:, :]
+                masks_shifted = sen_t[:, 1:]
+                
+                # D. 物理瞬时解算与反向传播
+                loss, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted)
+                
+                if mx.isnan(loss).item() or mx.isinf(loss).item() or mx.isnan(global_norm).item() or mx.isinf(global_norm).item():
+                    print(f"[Anomaly] NaN/Inf Loss or Gradient detected at Step {global_step}! Skipping update.")
                     continue
                     
-                z_target = god_encoder(f_t) # Shape: (B, L, z_dim)
-                
-                # Autoregressive Tensor Shift (Past -> Future)
-                f_t_input = f_t[:, :-1, :]
-                z_target_truth = z_target[:, 1:, :]
-                masks_shifted = masks[:, 1:]
-                
-                step_scalar = mx.array(global_step, dtype=mx.int32)
-                warmup_scalar = mx.array(args.var_warmup_steps, dtype=mx.int32)
-                
-                # JIT executes instantly on Apple Silicon GPU
-                total_loss, aux_losses, grads, global_norm = train_step(f_t_input, z_target_truth, masks_shifted, step_scalar, warmup_scalar)
-                
-                # Active Anomaly Interceptor (Protects weights from occasional Mamba resonance spikes/explosions)
-                # MLX evaluates to a single scalar, so .item() resolves it securely
-                if mx.isnan(total_loss).item() or mx.isinf(total_loss).item() or mx.isnan(global_norm).item() or mx.isinf(global_norm).item():
-                    print(f"[Anomaly] NaN/Inf Loss/Gradient detected! (Loss: {total_loss.item():.2f}, Grad Norm: {global_norm.item():.2f}) at Step {global_step}! Skipping update.")
-                    continue
-                    
-                optimizer.update(mamba_planner, grads)
-                mx.eval(mamba_planner.parameters(), optimizer.state, total_loss)
-                
-                l_cov, l_mom = aux_losses
+                optimizer.update(e2e_model, grads)
+                mx.eval(e2e_model.parameters(), optimizer.state, loss)
                 
                 if global_step % 10 == 0:
-                    print(f"Epoch {epoch+1} | Step {global_step} | Total: {total_loss.item():.4f} | Cov: {l_cov.item():.4f} | Mom: {l_mom.item():.4f}")
+                    print(f"Epoch {epoch+1} | Step {global_step} | Flow Match Loss (Kinetic Error): {loss.item():.4f}")
                     
                 if global_step % args.save_steps == 0:
                     checkpointer.save(global_step)
                     
     except KeyboardInterrupt:
-        # Checkpointer handles the emergency trap
         checkpointer.save(global_step, is_emergency=True)
 
 if __name__ == "__main__":

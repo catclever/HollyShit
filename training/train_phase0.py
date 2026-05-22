@@ -5,7 +5,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 
 from training.char_tokenizer import CharTokenizer
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
 from model.decoder import WeakDecoder
@@ -27,7 +27,7 @@ def main():
 
     # 1. Config & Tokenizer
     tokenizer = CharTokenizer()
-    config = ModelConfig()
+    config = WeakDecoderConfig()
     config.z_dim = args.z_dim
     config.vocab_size = tokenizer.vocab_size
 
@@ -86,7 +86,7 @@ def main():
     )
 
     # 4. Checkpointer Abstraction (Replaces manual saving and handles Interrupts)
-    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
+    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix, keep_last_k=args.keep_last_k)
     
     checkpointer.register_model("sense_fuser", fuser)
     checkpointer.register_model("god_encoder", god_encoder)

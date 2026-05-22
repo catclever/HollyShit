@@ -10,7 +10,7 @@ import os
 import argparse
 
 from training.char_tokenizer import CharTokenizer
-from model.config import ModelConfig
+from model.config import WeakDecoderConfig
 from distilled_emb.model_cuda import SensoryFuserCUDA, GodEncoderCUDA, WeakDecoderCUDA, load_mlx_safetensors_into_torch
 
 
@@ -54,7 +54,7 @@ def verify_smoothness():
     print(f"1. Loading architecture on [{device}]...")
     
     tokenizer = CharTokenizer()
-    config = ModelConfig()
+    config = WeakDecoderConfig()
     d_model = config.decoder_heads * 64
     
     fuser = SensoryFuserCUDA(config.emb_dims, d_model).to(device)
