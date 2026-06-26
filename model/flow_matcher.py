@@ -120,3 +120,21 @@ class FlowMatcher(nn.Module):
         h = self.out_norm(h, cond)
         v_pred = self.out_proj(h)
         return v_pred
+
+    def predict_with_cfg(self, x_t: mx.array, t: mx.array, h_context: mx.array, cfg_scale: float = 3.0):
+        """
+        推演时的无分类器引导 (Classifier-Free Guidance)。
+        计算带条件与无条件（全零上下文）的速度场，并按照 cfg_scale 混合。
+        """
+        # 计算带条件的预测
+        v_cond = self(x_t, t, h_context)
+        
+        if cfg_scale == 1.0:
+            return v_cond
+            
+        # 计算无条件的预测 (全零上下文)
+        h_null = mx.zeros_like(h_context)
+        v_uncond = self(x_t, t, h_null)
+        
+        # CFG 插值公式
+        return v_uncond + cfg_scale * (v_cond - v_uncond)

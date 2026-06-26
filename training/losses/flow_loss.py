@@ -1,6 +1,6 @@
 import mlx.core as mx
 
-def compute_flow_matching_loss(flow_matcher, z_target: mx.array, h_context: mx.array, mask: mx.array = None):
+def compute_flow_matching_loss(flow_matcher, z_target: mx.array, h_context: mx.array, mask: mx.array = None, cfg_drop_prob: float = 0.1):
     """
     最优传输流匹配损失 (Rectified Flow Matching Loss)。
     这是整个系统唯一且终极的因果评判标准。
@@ -10,9 +10,15 @@ def compute_flow_matching_loss(flow_matcher, z_target: mx.array, h_context: mx.a
         z_target: (B, L, d_model) 真实世界里下一句话的算子坐标 (来自 Phase 0.5)
         h_context: (B, L, d_model) Mamba 根据历史计算出的当前势能状态
         mask: (B, L) bool 类型的序列掩码，过滤掉 Padding
+        cfg_drop_prob: 训练时以一定概率将 h_context 置零，为无分类器引导(CFG)做准备
     """
     B, L, D = z_target.shape
     
+    # 模拟 CFG Context Dropout
+    if cfg_drop_prob > 0.0:
+        drop_mask = mx.random.uniform(shape=(B, 1, 1)) > cfg_drop_prob
+        h_context = mx.where(drop_mask, h_context, mx.zeros_like(h_context))
+        
     t = mx.random.uniform(shape=(B, L, 1))
     x_0 = mx.random.normal(shape=(B, L, D))
     x_t = (1.0 - t) * x_0 + t * z_target
