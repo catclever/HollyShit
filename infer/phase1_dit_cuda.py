@@ -1,11 +1,5 @@
 import os
 import sys
-import argparse
-import torch
-import torch.nn as nn
-from training.core.char_tokenizer import CharTokenizer
-from distilled_emb.model_cuda import TinyCharEncoderCUDA
-from model.phase1_dit_cuda import NARFlowMatcherCUDA
 
 # [BUG FIX]
 # (1) Specific Problem: Running this inference script on servers via python command raises 
@@ -15,6 +9,13 @@ from model.phase1_dit_cuda import NARFlowMatcherCUDA
 # (3) Caveats: Ensure any other newly created root-level script or nested script imports 
 #     local packages using absolute workspace imports by executing this path resolution first.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import argparse
+import torch
+import torch.nn as nn
+from training.core.char_tokenizer import CharTokenizer
+from distilled_emb.model_cuda import TinyCharEncoderCUDA
+from model.phase1_dit_cuda import NARFlowMatcherCUDA
 
 def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, device="cuda"):
     encoder.eval()
