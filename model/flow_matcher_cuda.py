@@ -1,158 +1,145 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
-class SinusoidalTimeEmbedding(nn.Module):
+class TimestepEmbedder(nn.Module):
     """
-    连续时间 t (0.0 ~ 1.0) 的高频位置编码。
+    Embeds scalar timesteps into vector representations.
     """
-    def __init__(self, d_model: int):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        # t: (B,)
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+        )
+        args = t.unsqueeze(1) * freqs.unsqueeze(0)
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2 == 1:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq)
+
+
+class AdaLNTransformerLayerCUDA(nn.Module):
+    """
+    Transformer layer with Adaptive Layer Normalization (AdaLN) modulation.
+    Uses PyTorch's native scaled_dot_product_attention (FlashAttention on CUDA).
+    """
+    def __init__(self, d_model, n_heads, dim_cond):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.ln2 = nn.LayerNorm(d_model, elementwise_affine=False)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+        # AdaLN parameter projection: predicts scale, shift, gate for both attention and MLP
+        self.cond_proj = nn.Linear(dim_cond, d_model * 6)
+        
+        # Initialize cond_proj to zeros so that the network starts as an identity block
+        nn.init.zeros_(self.cond_proj.weight)
+        nn.init.zeros_(self.cond_proj.bias)
+
+    def forward(self, x, cond):
+        # x: (B, L, d_model)
+        # cond: (B, dim_cond)
+        ada_params = self.cond_proj(cond) # (B, d_model * 6)
+        ada_params = ada_params.unsqueeze(1) # (B, 1, d_model * 6)
+        scale_a, shift_a, gate_a, scale_m, shift_m, gate_m = torch.chunk(ada_params, 6, dim=-1)
+        
+        # Self-Attention Block with AdaLN
+        x_norm = self.ln1(x)
+        x_mod = x_norm * (1 + scale_a) + shift_a
+        attn_out, _ = self.attn(x_mod, x_mod, x_mod)
+        x = x + gate_a * attn_out
+        
+        # MLP Block with AdaLN
+        x_norm2 = self.ln2(x)
+        x_mod2 = x_norm2 * (1 + scale_m) + shift_m
+        mlp_out = self.mlp(x_mod2)
+        x = x + gate_m * mlp_out
+        
+        return x
+
+
+class NARFlowMatcherCUDA(nn.Module):
+    """
+    Conditional Sequence Flow Matcher (PyTorch CUDA Version).
+    Predicts the vector field v_t given intermediate flow state X_t, timestep t, and macro condition Z_macro.
+    """
+    def __init__(self, z_dim: int, x_dim: int, d_model: int = 512, n_layers: int = 6, n_heads: int = 8, max_seq_len: int = 64):
+        super().__init__()
+        self.z_dim = z_dim
+        self.x_dim = x_dim # e.g. 1024, matching TinyCharEncoder's tok_emb dimension
+        self.max_seq_len = max_seq_len
         self.d_model = d_model
         
-    def forward(self, t: torch.Tensor):
-        half_dim = self.d_model // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=t.device, dtype=t.dtype) * -embeddings)
-        embeddings = t * embeddings
-        embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
-        return embeddings
-
-try:
-    from torch.nn import RMSNorm
-except ImportError:
-    class RMSNorm(nn.Module):
+        # Map input features to d_model if dimensions don't match
+        self.in_proj = nn.Linear(x_dim, d_model) if x_dim != d_model else nn.Identity()
+        self.out_proj = nn.Linear(d_model, x_dim) if x_dim != d_model else nn.Identity()
+        
+        # Condition embeddings
+        self.t_embedder = TimestepEmbedder(d_model)
+        self.z_proj = nn.Sequential(
+            nn.Linear(z_dim, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model)
+        )
+        
+        # Absolute position embeddings
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        
+        # Transformer Layer Stack
+        self.layers = nn.ModuleList([
+            AdaLNTransformerLayerCUDA(d_model, n_heads, d_model) for _ in range(n_layers)
+        ])
+        self.final_ln = nn.LayerNorm(d_model)
+        
+    def forward(self, x_t, t, z_macro):
         """
-        Fallback RMSNorm for PyTorch < 2.4
+        x_t: (B, L, x_dim) - intermediate flow state
+        t: (B,) - scalar flow timesteps
+        z_macro: (B, z_dim) - global macro condition
+        Returns: Predicted vector field v_t (B, L, x_dim)
         """
-        def __init__(self, d_model: int, eps: float = 1e-5):
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(d_model))
-
-        def forward(self, x):
-            variance = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(variance + self.eps)
-            return self.weight * x
-
-
-class AdaLN(nn.Module):
-    """
-    自适应层归一化 (Adaptive Layer Norm)。
-    根据外界注入的条件 (cond)，动态计算尺度 (Scale) 和偏移量 (Shift)。
-    强制性扭曲主干特征空间。
-    """
-    def __init__(self, d_model: int, cond_dim: int):
-        super().__init__()
-        self.norm = RMSNorm(d_model)
-        # 输出 2 倍维度，一半用于 scale，一半用于 shift
-        self.cond_proj = nn.Linear(cond_dim, d_model * 2)
+        B, L, _ = x_t.shape
         
-        # 巧妙初始化：让网络初始时表现得像普通的 RMSNorm (Scale=0, Shift=0)
-        nn.init.zeros_(self.cond_proj.weight)
-        if self.cond_proj.bias is not None:
-            nn.init.zeros_(self.cond_proj.bias)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor):
-        h = self.norm(x)
-        scale_shift = self.cond_proj(cond)
-        scale, shift = torch.chunk(scale_shift, 2, dim=-1)
-        # 注意: 真正的缩放系数是 1.0 + scale，所以 scale=0 时原样输出
-        return h * (1.0 + scale) + shift
-
-class FlowResBlock(nn.Module):
-    """
-    带有 AdaLN 调制的残差块。
-    这在 DiT (Diffusion Transformer) 中是标准设计，能有效克服特征拼接带来的坍缩问题。
-    """
-    def __init__(self, hidden_dim: int, cond_dim: int):
-        super().__init__()
-        self.adaln1 = AdaLN(hidden_dim, cond_dim)
-        self.lin1 = nn.Linear(hidden_dim, hidden_dim)
-        self.silu = nn.SiLU()
-        self.adaln2 = AdaLN(hidden_dim, cond_dim)
-        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
+        # 1. Project input sequence to hidden dimension
+        h = self.in_proj(x_t) # (B, L, d_model)
         
-    def forward(self, x: torch.Tensor, cond: torch.Tensor):
-        # 第一次物理调制与升维
-        h = self.adaln1(x, cond)
-        h = self.silu(self.lin1(h))
-        # 第二次物理调制与降维
-        h = self.adaln2(h, cond)
-        h = self.lin2(h)
-        return x + h
-
-class FlowMatcher(nn.Module):
-    """
-    微观动力学喷嘴 (The Motor Cortex)
-    
-    采用强力 AdaLN 架构，接收 Mamba 提供的绝对势能场 h_context，
-    将纯高斯噪声 x_0 沿着速度场一点点“吹”向真实的目标算子 Z_target。
-    """
-    def __init__(self, d_model: int, hidden_dim: int = 2048):
-        super().__init__()
-        self.time_embed = SinusoidalTimeEmbedding(d_model)
+        # 2. Add position embeddings
+        positions = torch.arange(L, device=x_t.device).unsqueeze(0) # (1, L)
+        h = h + self.pos_emb(positions) # (B, L, d_model)
         
-        # 物理主干流的入口（从 d_model 升维到宽体 hidden_dim）
-        self.in_proj = nn.Linear(d_model, hidden_dim)
+        # 3. Compute global condition vector
+        t_emb = self.t_embedder(t) # (B, d_model)
+        z_emb = self.z_proj(z_macro) # (B, d_model)
+        cond = t_emb + z_emb # (B, d_model)
         
-        # 控制流的维度 = 时间嵌入维度 (d_model) + Mamba背景势能维度 (d_model)
-        cond_dim = d_model * 2
-        
-        self.res_block1 = FlowResBlock(hidden_dim, cond_dim)
-        self.res_block2 = FlowResBlock(hidden_dim, cond_dim)
-        
-        self.out_norm = AdaLN(hidden_dim, cond_dim)
-        self.out_proj = nn.Linear(hidden_dim, d_model)
-        
-        # 初始化最后一层为全零，这是 Flow Matching 避免起手就梯度爆炸的标准操作！
-        nn.init.zeros_(self.out_proj.weight)
-        if self.out_proj.bias is not None:
-            nn.init.zeros_(self.out_proj.bias)
-        
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, h_context: torch.Tensor):
-        """
-        前向预测瞬时速度场。
-        
-        Args:
-            x_t: (B, L, d_model) 当前在微观相空间中的坐标 (含有噪声)
-            t: (B, L, 1) 或 (B, 1, 1) 积分时间 0.0 ~ 1.0
-            h_context: (B, L, d_model) Mamba 提供的不言的宏观背景势能
+        # 4. Process through Transformer layers
+        for layer in self.layers:
+            h = layer(h, cond)
             
-        Returns:
-            v_pred: (B, L, d_model) 喷嘴预测的瞬时速度向量
-        """
-        t_emb = self.time_embed(t)
+        h = self.final_ln(h)
         
-        # 1. 组装并合成为“控制台指令” (Control Stream)
-        cond = torch.cat([t_emb, h_context], dim=-1)
-        
-        # 2. 只有主干物质 x_t 进入骨架网络 (Material Stream)
-        h = self.in_proj(x_t)
-        
-        # 3. 控制流强制调制物质流
-        h = self.res_block1(h, cond)
-        h = self.res_block2(h, cond)
-        
-        # 4. 最终收束并输出速度场
-        h = self.out_norm(h, cond)
-        v_pred = self.out_proj(h)
+        # 5. Project back to output dimension
+        v_pred = self.out_proj(h) # (B, L, x_dim)
         return v_pred
-
-    def predict_with_cfg(self, x_t: torch.Tensor, t: torch.Tensor, h_context: torch.Tensor, cfg_scale: float = 3.0):
-        """
-        推演时的无分类器引导 (Classifier-Free Guidance)。
-        计算带条件与无条件（全零上下文）的速度场，并按照 cfg_scale 混合。
-        """
-        # 计算带条件的预测
-        v_cond = self(x_t, t, h_context)
-        
-        if cfg_scale == 1.0:
-            return v_cond
-            
-        # 计算无条件的预测 (全零上下文)
-        h_null = torch.zeros_like(h_context)
-        v_uncond = self(x_t, t, h_null)
-        
-        # CFG 插值公式
-        return v_uncond + cfg_scale * (v_cond - v_uncond)

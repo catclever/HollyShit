@@ -1,3 +1,14 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT
+#
+# [Reason for Archival]:
+# This script belongs to the old "Point-based Flow Matching" architecture. 
+# It was designed around predicting or manipulating a SINGLE macroscopic Z vector 
+# (e.g. 1024-d). Because a single pooled vector destroys exact sequence length 
+# and spatial token ordering, it was abandoned in favor of the new 
+# "Conditional Sequence Flow Matching" architecture which operates on [L, D] sequences.
+# =========================================================================
+
 import argparse
 import sys
 import os
@@ -10,12 +21,14 @@ from safetensors.torch import load_file
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.mamba_planner_cuda import MambaPlanner
-from model.flow_matcher_cuda import FlowMatcher
+# from model.flow_matcher_cuda import FlowMatcher
+from model.archive.flow_matcher_cuda import FlowMatcher
 from training.core.dataloader import TextDocumentDataLoader
 from training.core.adaptive_noise import AdaptiveNoiseScheduler
 from training.core.char_tokenizer import CharTokenizer
 from training.core.schedule import linear_warmup_schedule
-from training.losses.flow_loss_v2_cuda import compute_flow_matching_loss_v2
+# from training.losses.flow_loss_cuda import compute_flow_matching_loss
+from training.archive.losses.flow_loss_cuda import compute_flow_matching_loss
 from training.core.args import get_training_parser
 
 # Dynamic Import of the Phase 0.5 Distilled Model
@@ -23,29 +36,19 @@ from distilled_emb.model_cuda import TinyCharEncoderCUDA
 
 class E2EModel(nn.Module):
     """
-    联合训练容器：将 Mamba (大脑) 和 FlowMatcher (喷嘴) 缝合，带有各向异性先验
+    联合训练容器：将 Mamba (大脑) 和 FlowMatcher (喷嘴) 缝合
     """
-    def __init__(self, mamba, flow, prior_mean, prior_std):
+    def __init__(self, mamba, flow):
         super().__init__()
         self.mamba = mamba
         self.flow = flow
-        # 注册为 buffer，跟随模型设备但不参与梯度更新
-        self.register_buffer("prior_mean", prior_mean)
-        self.register_buffer("prior_std", prior_std)
         
     def forward(self, main_stream, z_target, mask):
         # 1. 大脑思考：Mamba 吸收历史算子，积分出当前的纯净势能 h_context
         h_context = self.mamba(main_stream, aux_streams=[])
         
-        # 2. 嘴巴吹风：FlowMatcher 在 h_context 的势能场下，尝试吹出微观轨迹 (引入各向异性先验)
-        loss = compute_flow_matching_loss_v2(
-            self.flow, 
-            z_target, 
-            h_context, 
-            prior_mean=self.prior_mean,
-            prior_std=self.prior_std,
-            mask=mask
-        )
+        # 2. 嘴巴吹风：FlowMatcher 在 h_context 的势能场下，尝试吹出微观轨迹
+        loss = compute_flow_matching_loss(self.flow, z_target, h_context, mask=mask)
         return loss
 
 def load_checkpoint(out_dir, prefix, model, optimizer, dataloader, device):
@@ -84,8 +87,8 @@ def load_checkpoint(out_dir, prefix, model, optimizer, dataloader, device):
         optimizer.load_state_dict(torch.load(os.path.join(latest_dir, "optimizer.pt"), map_location=device, weights_only=True))
         
     # Load Dataloader
-    if os.path.exists(os.path.join(latest_dir, "dataloader_phase1_1.json")):
-        with open(os.path.join(latest_dir, "dataloader_phase1_1.json"), "r") as f:
+    if os.path.exists(os.path.join(latest_dir, "dataloader_phase1.json")):
+        with open(os.path.join(latest_dir, "dataloader_phase1.json"), "r") as f:
             dataloader.load_state_dict(json.load(f))
             
     return max_step
@@ -102,7 +105,7 @@ def save_checkpoint(out_dir, prefix, step, model, optimizer, dataloader, keep_la
     torch.save(model.state_dict(), os.path.join(save_path, "e2e_model.pt"))
     torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
     
-    with open(os.path.join(save_path, "dataloader_phase1_1.json"), "w") as f:
+    with open(os.path.join(save_path, "dataloader_phase1.json"), "w") as f:
         json.dump(dataloader.state_dict(), f)
     print(f"Saved checkpoint to {save_path}")
     
@@ -122,7 +125,7 @@ def save_checkpoint(out_dir, prefix, step, model, optimizer, dataloader, keep_la
             print(f"Removed old checkpoint {oldest_dir}")
 
 def main():
-    parser = get_training_parser("Phase 1.1: Mamba & Flow Matching Training with Anisotropic Prior (CUDA Version)")
+    parser = get_training_parser("Phase 1: Mamba & Flow Matching Training (CUDA Version)")
     parser.add_argument("--max_episode_len", type=int, default=None, help="Sequence chunking limit.")
     parser.add_argument("--data_path", type=str, default="data/Basic_ZH/chunked_mixed_omni.parquet", help="Path to the parquet training data.")
     parser.add_argument("--tinybert_ckpt", type=str, default="checkpoints/distilled/tinybert_pt_v1_step_100000", help="Path to frozen Phase 0.5 distilled TinyBERT.")
@@ -131,9 +134,6 @@ def main():
     parser.add_argument("--mamba_d_conv", type=int, default=4, help="Mamba internal conv dimension.")
     parser.add_argument("--mamba_expand", type=int, default=2, help="Mamba internal expansion factor.")
     parser.add_argument("--flow_hidden_dim", type=int, default=2048, help="Hidden expansion dimension for the Flow Matcher nozzle.")
-    
-    # Phase 1.1 Specific Argument
-    parser.add_argument("--z_stats", type=str, default="checkpoints/z_space_stats.pt", help="Path to precomputed Z space statistics.")
     
     # Noise Scheduler Arguments
     parser.add_argument("--noise_warmup_steps", type=int, default=200000, help="Global steps before noise is injected")
@@ -191,18 +191,6 @@ def main():
     tiny_encoder.to(device)
     print("Phase 0.5 TinyCharEncoder loaded and frozen. We are now self-bootstrapping!")
     
-    # 2.5 加载预先统计的 Z 空间规范参数 (Phase 1.1 核心增量)
-    if not os.path.exists(args.z_stats):
-        raise FileNotFoundError(f"Missing {args.z_stats}! Please run tools/extract_z_space_stats.py first.")
-    
-    print(f"Loading Z-space statistics from {args.z_stats}...")
-    stats = torch.load(args.z_stats, map_location='cpu')
-    prior_mean = stats['mean'].to(device)
-    prior_std = stats['std'].to(device)
-    # 给一个小小的底噪保护，防止由于某些维度几乎为 0 导致后续网络梯度爆炸
-    prior_std = torch.clamp(prior_std, min=1e-4) 
-    print("Successfully loaded Anisotropic Gaussian Prior!")
-
     # 3. 实例化真正的训练目标：Mamba大脑 + 喷嘴
     mamba_planner = MambaPlanner(
         d_model=d_model, 
@@ -212,19 +200,19 @@ def main():
     )
     flow_matcher = FlowMatcher(d_model=d_model, hidden_dim=args.flow_hidden_dim)
     
-    e2e_model = E2EModel(mamba_planner, flow_matcher, prior_mean, prior_std).to(device)
+    e2e_model = E2EModel(mamba_planner, flow_matcher).to(device)
     
     optimizer = optim.AdamW(e2e_model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler() # AMP 加速
 
     # 4. 恢复状态
-    prefix = args.ckpt_prefix if args.ckpt_prefix else "p1_1_flow_cuda"
+    prefix = args.ckpt_prefix if args.ckpt_prefix else "p1_flow_cuda"
     start_step = 0
     if args.resume_from or args.auto_resume:
         load_target = args.resume_from if args.resume_from else args.out_dir
         start_step = load_checkpoint(load_target, prefix, e2e_model, optimizer, dataloader, device)
 
-    print(f"Starting Phase 1.1 E2E Physics Training on CUDA. Epochs: {args.epochs}, Batch Size: {args.batch_size}")
+    print(f"Starting Phase 1 E2E Physics Training on CUDA. Epochs: {args.epochs}, Batch Size: {args.batch_size}")
     global_step = start_step
 
     # Initialize Adaptive Noise Scheduler

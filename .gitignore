@@ -33,6 +33,7 @@ wheels/
 
 # Agent Metadata
 .agent/
+.antigravitycli/
 
 # Datasets & Weights
 data

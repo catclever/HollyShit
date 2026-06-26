@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.1.2
+torchvision
+torchaudio
+numpy<2.0.0
+transformers<4.40.0
+pandas
+pyarrow
+safetensors
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.4.0/causal_conv1d-1.4.0+cu118torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+https://github.com/state-spaces/mamba/releases/download/v2.2.2/mamba_ssm-2.2.2+cu118torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl

@@ -1,3 +1,13 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT: Phase 1 Inference (CUDA)
+#
+# [Reason for Archival]:
+# This was the PyTorch/CUDA counterpart to the Phase 1 inference script.
+# It evaluated the Mamba -> FlowMatcher pipeline on the server.
+# Because the Flow Matcher predicted a single Z point (destroying exact ordering), 
+# the pipeline is being replaced by Conditional Sequence Flow Matching.
+# =========================================================================
+
 import argparse
 import sys
 import os
@@ -7,9 +17,11 @@ import math
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.mamba_planner_cuda import MambaPlanner
-from model.flow_matcher_cuda import FlowMatcher
+# from model.flow_matcher_cuda import FlowMatcher
+from model.archive.flow_matcher_cuda import FlowMatcher
 from training.core.char_tokenizer import CharTokenizer
-from training.train_phase1_cuda import E2EModel
+# from training.train_phase1_cuda import E2EModel
+from training.archive.train_phase1_cuda import E2EModel
 from distilled_emb.model_cuda import TinyCharEncoderCUDA, WeakDecoderCUDA
 
 def load_e2e_model(ckpt_path, d_model=1024, mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, flow_hidden_dim=2048, device="cuda"):

@@ -1,3 +1,14 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT: End-to-End Inference (MLX)
+#
+# [Reason for Archival]:
+# This was the complete end-to-end inference script for the original Phase 1 pipeline 
+# on Apple Silicon (MLX). It chained together:
+# Text -> TinyCharEncoder -> Z_truth -> Mamba -> Z_pred -> FlowMatcher -> Z_flow -> WeakDecoder
+# Since the architecture is migrating away from Point-based Flow Matching to 
+# Sequence Flow Matching, the middle components (FlowMatcher/WeakDecoder) are obsolete.
+# =========================================================================
+
 import os
 import sys
 import argparse
@@ -10,7 +21,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model import TinyCharEncoder
 from model.mamba_planner import MambaConfig, MambaPlanner
-from model.flow_matcher import FlowMatcher
+# from model.flow_matcher import FlowMatcher
+from model.archive.flow_matcher import FlowMatcher
 from model.config import WeakDecoderConfig
 from model.decoder import WeakDecoder
 from training.core.checkpoint import Checkpointer

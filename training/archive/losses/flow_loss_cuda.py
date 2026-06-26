@@ -1,3 +1,14 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT
+#
+# [Reason for Archival]:
+# This script belongs to the old "Point-based Flow Matching" architecture. 
+# It was designed around predicting or manipulating a SINGLE macroscopic Z vector 
+# (e.g. 1024-d). Because a single pooled vector destroys exact sequence length 
+# and spatial token ordering, it was abandoned in favor of the new 
+# "Conditional Sequence Flow Matching" architecture which operates on [L, D] sequences.
+# =========================================================================
+
 import torch
 
 def compute_flow_matching_loss(flow_matcher, z_target: torch.Tensor, h_context: torch.Tensor, mask: torch.Tensor = None, cfg_drop_prob: float = 0.1):

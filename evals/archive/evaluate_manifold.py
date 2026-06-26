@@ -1,3 +1,13 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT: Z-Manifold Evaluator
+#
+# [Reason for Archival]:
+# This script was used to calculate properties (mean, variance, distance) of the 
+# SINGLE pooled Z vectors in the latent space. Since we are moving to Sequence 
+# Flow Matching where the manifold consists of [L, D] sequence trajectories 
+# instead of isolated points, this specific evaluation script is deprecated.
+# =========================================================================
+
 import torch
 import torch.nn.functional as F
 import argparse
@@ -7,7 +17,8 @@ from tqdm import tqdm
 
 from training.core.dataloader import TextDocumentDataLoader
 from training.core.char_tokenizer import CharTokenizer
-from training.train_phase1_cuda import E2EModel
+# from training.train_phase1_cuda import E2EModel
+from training.archive.train_phase1_cuda import E2EModel
 from distilled_emb.model_cuda import TinyCharEncoderCUDA, load_mlx_safetensors_into_torch
 
 def euler_ode_solve(flow_matcher, h_context, d_model=1024, num_steps=50, cfg_scale=1.0, device="cuda"):
@@ -53,8 +64,10 @@ def main():
     
     
     from model.mamba_planner_cuda import MambaPlanner
-    from model.flow_matcher_cuda import FlowMatcher
-    from training.train_phase1_cuda import E2EModel
+    # from model.flow_matcher_cuda import FlowMatcher
+    from model.archive.flow_matcher_cuda import FlowMatcher
+    # from training.train_phase1_cuda import E2EModel
+    from training.archive.train_phase1_cuda import E2EModel
     
     mamba_planner = MambaPlanner(d_model=1024, d_state=16, d_conv=4, expand=2)
     flow_matcher = FlowMatcher(d_model=1024, hidden_dim=2048)

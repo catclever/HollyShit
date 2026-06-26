@@ -1,3 +1,14 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT: Phase 0 (V1)
+#
+# [Reason for Archival]:
+# This is the V1 script for Phase 0 (training the GodEncoder to fuse 5 base 
+# model embeddings into a unified 1024-d Z space). It has been superseded by 
+# `train_phase0_v2.py`, which introduced `ChunkedNpzDataLoader` and significantly 
+# improved dynamic loading and caching for large embedding datasets.
+# This file is kept only as a historical reference for the early dataloading approach.
+# =========================================================================
+
 import os
 import argparse
 import mlx.core as mx

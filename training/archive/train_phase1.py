@@ -1,3 +1,14 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT
+#
+# [Reason for Archival]:
+# This script belongs to the old "Point-based Flow Matching" architecture. 
+# It was designed around predicting or manipulating a SINGLE macroscopic Z vector 
+# (e.g. 1024-d). Because a single pooled vector destroys exact sequence length 
+# and spatial token ordering, it was abandoned in favor of the new 
+# "Conditional Sequence Flow Matching" architecture which operates on [L, D] sequences.
+# =========================================================================
+
 import argparse
 import sys
 import os
@@ -11,12 +22,14 @@ import numpy as np
 
 from model.mamba_planner import MambaPlanner
 from model.mamba_mlx.mamba_mlx import MambaConfig
-from model.flow_matcher import FlowMatcher
+# from model.flow_matcher import FlowMatcher
+from model.archive.flow_matcher import FlowMatcher
 from training.core.dataloader import TextDocumentDataLoader
 from training.core.char_tokenizer import CharTokenizer
 from training.core.checkpoint import Checkpointer
 from training.core.schedule import linear_warmup_schedule
-from training.losses.flow_loss import compute_flow_matching_loss
+# from training.losses.flow_loss import compute_flow_matching_loss
+from training.archive.losses.flow_loss import compute_flow_matching_loss
 from training.core.args import get_training_parser
 
 # Dynamic Import of the Phase 0.5 Distilled Model

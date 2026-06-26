@@ -1,3 +1,14 @@
+# =========================================================================
+# [ARCHIVED] LEGACY SCRIPT: Anisotropic Flow Loss (V2)
+#
+# [Reason for Archival]:
+# This loss function introduced an Anisotropic Prior (using empirical mean and std
+# from the Z manifold) to optimize the ODE trajectory. While mathematically sound 
+# for a single point, it was designed for the "Point-based Flow Matching" architecture.
+# Because predicting a single pooled Z vector loses exact sequence token ordering, 
+# this loss is being retired in favor of a Sequence-based Flow Matching loss.
+# =========================================================================
+
 import torch
 
 def compute_flow_matching_loss_v2(flow_matcher, z_target: torch.Tensor, h_context: torch.Tensor, 
