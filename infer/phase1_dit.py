@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model import TinyCharEncoder
-from model.flow_matcher import NARFlowMatcher
+from model.phase1_dit import NARFlowMatcher
 
 def load_pt_checkpoint(pt_path):
     """

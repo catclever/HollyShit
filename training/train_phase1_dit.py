@@ -13,7 +13,7 @@ from training.core.char_tokenizer import CharTokenizer
 from training.core.args import get_training_parser
 
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
-from model.flow_matcher_cuda import NARFlowMatcherCUDA
+from model.phase1_dit_cuda import NARFlowMatcherCUDA
 
 class ChunkTextDataset(Dataset):
     def __init__(self, parquet_path):
