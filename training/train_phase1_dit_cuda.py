@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from training.core.char_tokenizer import CharTokenizer
 from training.core.args import get_training_parser
+from training.core.checkpoint import Checkpointer
 
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
 from model.phase1_dit_cuda import NARFlowMatcherCUDA
@@ -106,18 +107,43 @@ def main():
     optimizer = optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=1e-2)
     scaler = torch.cuda.amp.GradScaler()
     
+    # 4. Initialize Unified Checkpointer
+    checkpointer = Checkpointer(
+        out_dir=args.out_dir,
+        prefix=args.ckpt_prefix,
+        keep_last_k=args.keep_last_k
+    )
+    checkpointer.register_model("flow_matcher", decoder)
+    checkpointer.register_args(args)
+    
     global_step = 0
     start_epoch = 0
+    load_dir = None
     
+    # Handle Resume logic via Checkpointer
     if args.resume_from:
-        print(f"Resuming training from {args.resume_from}")
-        checkpoint = torch.load(args.resume_from, map_location='cpu')
-        decoder.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        global_step = checkpoint['global_step']
-        start_epoch = checkpoint['epoch']
-        print(f"Resumed at Epoch {start_epoch}, Step {global_step}")
+        global_step = checkpointer.load(args.resume_from)
+        load_dir = args.resume_from
+    elif args.auto_resume:
+        global_step = checkpointer.load_latest()
+        if global_step > 0:
+            base_name = f"step_{global_step}"
+            folder_name = f"{checkpointer.prefix}_{base_name}" if checkpointer.prefix else base_name
+            load_dir = os.path.join(args.out_dir, folder_name)
+            
+    # Load PyTorch specific optimizer/scaler states if resumed
+    if global_step > 0 and load_dir is not None:
+        opt_path = os.path.join(load_dir, "optimizer.pt")
+        scaler_path = os.path.join(load_dir, "scaler.pt")
+        if os.path.exists(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location='cpu', weights_only=True))
+            print(f"Resumed PyTorch optimizer state from {opt_path}")
+        if os.path.exists(scaler_path):
+            scaler.load_state_dict(torch.load(scaler_path, map_location='cpu'))
+            print(f"Resumed PyTorch scaler state from {scaler_path}")
+            
+        start_epoch = global_step // len(dataloader)
+        print(f"Resumed training at Epoch {start_epoch + 1}, Step {global_step}")
     
     print("Starting Sequence Flow Matcher Training...")
     
@@ -190,15 +216,15 @@ def main():
                 print(f"Epoch {epoch+1}/{args.epochs} | Step {global_step} | Loss: {loss.item():.4f}")
                 
             if global_step % args.save_steps == 0:
-                save_path = os.path.join(args.out_dir, f"flow_matcher_step_{global_step}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model_state_dict': decoder.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scaler_state_dict': scaler.state_dict()
-                }, save_path)
-                print(f"Saved checkpoint to {save_path}")
+                checkpointer.save(global_step)
+                
+                base_name = f"step_{global_step}"
+                folder_name = f"{checkpointer.prefix}_{base_name}" if checkpointer.prefix else base_name
+                save_dir = os.path.join(args.out_dir, folder_name)
+                
+                torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+                torch.save(scaler.state_dict(), os.path.join(save_dir, "scaler.pt"))
+                print(f"Saved PyTorch optimizer & scaler states to {save_dir}")
  
             if args.max_steps > 0 and global_step >= args.max_steps:
                 print(f"Reached max_steps ({args.max_steps}). Stopping training early.")
@@ -207,15 +233,16 @@ def main():
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
 
-        save_path = os.path.join(args.out_dir, f"flow_matcher_epoch_{epoch+1}.pt")
-        torch.save({
-            'epoch': epoch + 1,
-            'global_step': global_step,
-            'model_state_dict': decoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict()
-        }, save_path)
-        print(f"Saved Epoch {epoch+1} checkpoint to {save_path}")
+        # Save epoch checkpoint via Checkpointer
+        checkpointer.save(global_step)
+        
+        base_name = f"step_{global_step}"
+        folder_name = f"{checkpointer.prefix}_{base_name}" if checkpointer.prefix else base_name
+        save_dir = os.path.join(args.out_dir, folder_name)
+        
+        torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+        torch.save(scaler.state_dict(), os.path.join(save_dir, "scaler.pt"))
+        print(f"Saved Epoch {epoch+1} checkpoint to {save_dir}")
 
 if __name__ == "__main__":
     main()
