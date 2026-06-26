@@ -67,6 +67,24 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
         
     return "".join(decoded_chars)
 
+def load_training_args(flow_ckpt_path):
+    """
+    Attempts to load training_args.json from the parent directory of the flow checkpoint.
+    Returns a dictionary of found arguments or empty dict.
+    """
+    import json
+    ckpt_dir = os.path.dirname(flow_ckpt_path)
+    config_path = os.path.join(ckpt_dir, "training_args.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            print(f"Loaded companion training configuration from {config_path}")
+            return config
+        except Exception as e:
+            print(f"Warning: Failed to parse training_args.json at {config_path}: {e}")
+    return {}
+
 def get_args():
     parser = argparse.ArgumentParser(description="Sequence Flow Matcher Inference (CUDA/PyTorch)")
     parser.add_argument("--tinybert_ckpt", type=str, required=True, help="Path to frozen TinyCharEncoder weights")
@@ -99,14 +117,23 @@ def main():
     encoder.load_state_dict(weights, strict=False)
     encoder.to(device).eval()
     
+    # Auto-load hyperparams from companion training_args.json
+    config = load_training_args(args.flow_ckpt)
+    d_model = config.get("d_model", args.d_model)
+    n_layers = config.get("n_layers", args.n_layers)
+    n_heads = config.get("n_heads", args.n_heads)
+    max_seq_len = config.get("max_seq_len", args.max_seq_len)
+    
+    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}")
+    
     # 2. Instantiate Flow Matcher
     flow_matcher = NARFlowMatcherCUDA(
         z_dim=sniffed_z_dim,
         x_dim=sniffed_x_dim,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        max_seq_len=args.max_seq_len
+        d_model=d_model,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        max_seq_len=max_seq_len
     )
     
     print(f"Loading Flow Matcher weights from: {args.flow_ckpt}")
@@ -124,7 +151,7 @@ def main():
         tokenizer=tokenizer,
         prompt=args.prompt,
         steps=args.steps,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=max_seq_len,
         device=device
     )
     
