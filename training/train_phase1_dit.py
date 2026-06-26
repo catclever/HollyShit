@@ -1,4 +1,15 @@
 import os
+import sys
+
+# [BUG FIX]
+# (1) Specific Problem: Running this training script on servers via python command raises 
+#     "ModuleNotFoundError: No module named 'training'" because the workspace root is not in Python path.
+# (2) Method to Resolve: Explicitly insert the parent directory of this script (workspace root) 
+#     into the beginning of sys.path before importing local project packages (model, training).
+# (3) Caveats: Ensure any other newly created root-level script or nested script imports 
+#     local packages using absolute workspace imports by executing this path resolution first.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import argparse
 import time
 import math
