@@ -17,7 +17,7 @@ from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
 from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
 
-def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, device="cuda"):
+def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0, device="cuda"):
     encoder.eval()
     flow_matcher.eval()
     
@@ -53,6 +53,9 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
     # 5. Project final sequence back to vocabulary space (using frozen tok_emb weights)
     # tok_emb.weight shape: (vocab_size, x_dim)
     emb_weights = encoder.tok_emb.weight
+    
+    # Scale x_t back down to the original embedding scale before projection
+    x_t = x_t / scale_factor
     
     # Pointwise dot product similarity: (1, L, vocab_size)
     logits = torch.matmul(x_t, emb_weights.T)
@@ -125,7 +128,8 @@ def main():
     n_heads = config.get("n_heads", args.n_heads)
     max_seq_len = config.get("max_seq_len", args.max_seq_len)
     
-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}")
+    emb_scale_factor = config.get("emb_scale_factor", 1.0)
+    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
     
     # 2. Instantiate Flow Matcher
     flow_matcher = NARFlowMatcherCUDA(
@@ -153,6 +157,7 @@ def main():
         prompt=args.prompt,
         steps=args.steps,
         max_seq_len=max_seq_len,
+        scale_factor=emb_scale_factor,
         device=device
     )
     

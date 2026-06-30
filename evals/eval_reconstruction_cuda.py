@@ -52,7 +52,8 @@ def evaluate(args):
     n_layers = config.get("n_layers", args.n_layers)
     n_heads = config.get("n_heads", args.n_heads)
     max_seq_len = config.get("max_seq_len", args.max_seq_len)
-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}")
+    emb_scale_factor = config.get("emb_scale_factor", 1.0)
+    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
     
     # 3. Instantiate and Load Flow Matcher
     flow_matcher = NARFlowMatcherCUDA(
@@ -131,6 +132,10 @@ def evaluate(args):
                 
             # 3. Project to vocab and compute accuracy
             emb_weights = encoder.tok_emb.weight
+            
+            # Scale back to original embedding space
+            x_t = x_t / emb_scale_factor
+            
             with torch.cuda.amp.autocast():
                 logits = torch.matmul(x_t, emb_weights.T) # (B, L, V)
             predicted_tokens = torch.argmax(logits, dim=-1) # (B, L)
