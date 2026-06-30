@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
-from model.phase1_dit_cuda import NARFlowMatcherCUDA
+from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
 
 def load_training_args(flow_ckpt_path):
     ckpt_dir = os.path.dirname(flow_ckpt_path)

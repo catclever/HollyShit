@@ -15,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model import TinyCharEncoder
-from model.phase1_dit import NARFlowMatcher
+from model.pre_phase1_dit import NARFlowMatcher
 
 def load_pt_checkpoint(pt_path):
     """
@@ -29,12 +29,24 @@ def load_pt_checkpoint(pt_path):
     
     mlx_params = {}
     for k, v in state_dict.items():
-        # Transfer PyTorch tensor to MLX array
+        if "attn.in_proj_weight" in k:
+            q_w, k_w, v_w = v.chunk(3, dim=0)
+            mlx_params[k.replace("attn.in_proj_weight", "attention.q_proj.weight")] = mx.array(q_w.numpy())
+            mlx_params[k.replace("attn.in_proj_weight", "attention.k_proj.weight")] = mx.array(k_w.numpy())
+            mlx_params[k.replace("attn.in_proj_weight", "attention.v_proj.weight")] = mx.array(v_w.numpy())
+            continue
+        elif "attn.in_proj_bias" in k:
+            q_b, k_b, v_b = v.chunk(3, dim=0)
+            mlx_params[k.replace("attn.in_proj_bias", "attention.q_proj.bias")] = mx.array(q_b.numpy())
+            mlx_params[k.replace("attn.in_proj_bias", "attention.k_proj.bias")] = mx.array(k_b.numpy())
+            mlx_params[k.replace("attn.in_proj_bias", "attention.v_proj.bias")] = mx.array(v_b.numpy())
+            continue
+        elif "attn.out_proj." in k:
+            mlx_params[k.replace("attn.", "attention.")] = mx.array(v.numpy())
+            continue
+            
         arr = mx.array(v.detach().numpy())
-        
-        # Map PyTorch module names to MLX structures
         new_k = k
-        # PyTorch Sequential layers mapping
         new_k = new_k.replace("mlp.0.", "mlp.layers.0.")
         new_k = new_k.replace("mlp.2.", "mlp.layers.2.")
         new_k = new_k.replace("z_proj.0.", "z_proj.layers.0.")
@@ -42,9 +54,10 @@ def load_pt_checkpoint(pt_path):
         
         mlx_params[new_k] = arr
         
-    return mlx_params
+    import mlx.utils as mu
+    return mu.tree_unflatten(list(mlx_params.items()))
 
-def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64):
+def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0):
     """
     Instantly reconstructs sentence from raw text prompt by finding its Z_macro 
     and integrating the continuous flow from Gaussian noise.
@@ -77,6 +90,9 @@ def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_le
     # 5. Project final sequence back to vocabulary space (using frozen tok_emb weights)
     # tok_emb.weight shape: (vocab_size, x_dim)
     emb_weights = encoder.tok_emb.weight
+    
+    # Scale x_t back down to the original embedding scale before projection
+    x_t = x_t / scale_factor
     
     # Pointwise dot product similarity: (1, L, vocab_size)
     logits = mx.matmul(x_t, emb_weights.T)
@@ -139,8 +155,21 @@ def main():
         sniffed_z_dim = pt_weights['out_proj.weight'].shape[0]
         encoder = TinyCharEncoder(vocab_size=tokenizer.vocab_size, d_model=sniffed_x_dim, z_dim=sniffed_z_dim)
         
-        mlx_enc_params = {k: mx.array(v.numpy()) for k, v in pt_weights.items()}
-        encoder.update(mlx_enc_params)
+        mlx_enc_params = {}
+        for k, v in pt_weights.items():
+            new_k = k
+            if "layers." in new_k:
+                new_k = new_k.replace(".q_proj.", ".attention.q_proj.")
+                new_k = new_k.replace(".k_proj.", ".attention.k_proj.")
+                new_k = new_k.replace(".v_proj.", ".attention.v_proj.")
+                # the transformer layer has its own out_proj
+                # wait, let's be safe and check if it's layers.X.out_proj
+                # yes, layers.0.out_proj.weight -> layers.0.attention.out_proj.weight
+                new_k = new_k.replace(".out_proj.", ".attention.out_proj.")
+            mlx_enc_params[new_k] = mx.array(v.numpy())
+        import mlx.utils as mu
+        encoder.update(mu.tree_unflatten(list(mlx_enc_params.items())))
+        encoder.update(mu.tree_unflatten(list(mlx_enc_params.items())))
         
     # Auto-load hyperparams from companion training_args.json
     config = load_training_args(args.flow_ckpt)
@@ -149,7 +178,8 @@ def main():
     n_heads = config.get("n_heads", args.n_heads)
     max_seq_len = config.get("max_seq_len", args.max_seq_len)
     
-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}")
+    emb_scale_factor = config.get("emb_scale_factor", 1.0)
+    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
     
     # 2. Instantiate Flow Matcher
     flow_matcher = NARFlowMatcher(
@@ -174,7 +204,8 @@ def main():
         tokenizer=tokenizer,
         prompt=args.prompt,
         steps=args.steps,
-        max_seq_len=max_seq_len
+        max_seq_len=max_seq_len,
+        scale_factor=emb_scale_factor
     )
     
     print(f"Reconstructed: {reconstructed}")

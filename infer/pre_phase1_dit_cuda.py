@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
-from model.phase1_dit_cuda import NARFlowMatcherCUDA
+from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
 
 def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, device="cuda"):
     encoder.eval()

@@ -10,6 +10,18 @@ import sys
 #     local packages using absolute workspace imports by executing this path resolution first.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# [BUG FIX]
+# (1) Specific Problem: The training loss plateaus early and evaluation yields random noise. 
+#     This occurs because Flow Matching uses X_0 ~ N(0, 1), but the target embeddings X_1 
+#     have a very small standard deviation (e.g., 0.032). This scale mismatch causes the velocity 
+#     field to be dominated by noise, preventing the model from learning the target data distribution.
+# (2) Method to Resolve: Dynamically calculate the standard deviation of the target embeddings (X_1) 
+#     and compute a `scale_factor` to upscale X_1 to have a variance of ~1.0 during training.
+#     This factor must be saved to `training_args.json` and applied inversely during inference/evaluation.
+# (3) Caveats: NEVER attempt Flow Matching or Diffusion without matching the scale of the target 
+#     data to the scale of the initial noise distribution! Failure to do so mathematically 
+#     dooms the model to predict pure noise reduction.
+
 import argparse
 import time
 import math
@@ -25,7 +37,7 @@ from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
-from model.phase1_dit_cuda import NARFlowMatcherCUDA
+from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
 
 class ChunkTextDataset(Dataset):
     def __init__(self, parquet_path):
@@ -92,6 +104,12 @@ def main():
         param.requires_grad = False
     tiny_encoder.eval()
     tiny_encoder.to(device)
+    
+    # Calculate scale factor for Flow Matching
+    std_x = tiny_encoder.tok_emb.weight.std().item()
+    scale_factor = 1.0 / max(std_x, 1e-5)
+    args.emb_scale_factor = scale_factor
+    print(f"Calculated target embedding std: {std_x:.6f}, using scale_factor: {scale_factor:.2f}")
     
     # 3. Initialize Sequence Flow Matcher
     print(f"Initializing NARFlowMatcherCUDA: layers={args.n_layers}, d_model={args.d_model}, z_dim={sniffed_z_dim}, x_dim={sniffed_x_dim}")
@@ -181,6 +199,7 @@ def main():
                     z_truth = tiny_encoder(enc_ids, attention_mask=enc_mask) # (B, z_dim)
                     # Get ground truth static word embeddings as target X_1
                     X_1 = tiny_encoder.tok_emb(target_ids) # (B, L, x_dim)
+                    X_1 = X_1 * scale_factor # Scale target to match noise variance
                     
             # 2. Sample flow matching variables
             B, L, D = X_1.shape

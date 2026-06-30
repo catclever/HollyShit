@@ -40,10 +40,10 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
 
     def __call__(self, x: mx.array, mask: mx.array = None):
         B, L, _ = x.shape
