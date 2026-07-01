@@ -218,12 +218,10 @@ def main():
                 # Predict velocity field
                 V_t = decoder(X_t, t, z_truth) # (B, L, x_dim)
                 
-                # Compute MSE loss masked for PAD tokens
-                loss_elements = F.mse_loss(V_t, U_t, reduction='none') # (B, L, x_dim)
-                loss_per_token = loss_elements.mean(dim=-1) # (B, L)
-                
-                # Apply padding mask
-                loss = (loss_per_token * target_mask).sum() / target_mask.sum().clamp(min=1e-8)
+                # Compute MSE loss for ALL tokens (including PAD)
+                # If we don't train the model to denoise PAD tokens, the unconstrained noise 
+                # in the padded regions will corrupt the valid tokens via self-attention during inference!
+                loss = F.mse_loss(V_t, U_t)
                 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
