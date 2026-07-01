@@ -16,12 +16,15 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
 
     def timestep_embedding(self, t, dim, max_period=10000):
-        # t shape: (B,) or (B, 1)
+        # Scale continuous t in [0,1] to [0, 1000] to give the sinusoidal embeddings proper high-frequency resolution.
+        # Otherwise, for t in [0, 1], the arguments to sin/cos never even complete a single period!
+        t_scaled = t * 1000.0
+        
         half = dim // 2
         freqs = mx.exp(-math.log(max_period) * mx.arange(0, half, dtype=mx.float32) / half)
-        if len(t.shape) == 1:
-            t = mx.expand_dims(t, axis=1)
-        args = t * freqs
+        if len(t_scaled.shape) == 1:
+            t_scaled = mx.expand_dims(t_scaled, axis=1)
+        args = t_scaled * freqs
         embedding = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
         if dim % 2 == 1:
             embedding = mx.concatenate([embedding, mx.zeros((t.shape[0], 1))], axis=-1)
