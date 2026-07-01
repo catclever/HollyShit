@@ -18,12 +18,15 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        # t: (B,)
+        # Scale continuous t in [0,1] to [0, 1000] to give the sinusoidal embeddings proper high-frequency resolution.
+        # Otherwise, for t in [0, 1], the arguments to sin/cos never even complete a single period!
+        t_scaled = t * 1000.0
+        
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
         )
-        args = t.unsqueeze(1) * freqs.unsqueeze(0)
+        args = t_scaled.unsqueeze(1) * freqs.unsqueeze(0)
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2 == 1:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
