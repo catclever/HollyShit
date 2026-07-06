@@ -171,20 +171,20 @@ def main():
             global_step += 1
             
             # --- Prepare text IDs & Masks ---
-            enc_ids_list = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
+            enc_ids_list = [tokenizer.encode(t, add_special_tokens=True) for t in texts]
             
             e_ids_t, e_mask_t, d_ids_t = [], [], []
             for seq in enc_ids_list:
-                # Encoder input sequence
-                e_seq = seq[:args.max_seq_len]
-                e_pad = args.max_seq_len - len(e_seq)
-                e_ids_t.append(e_seq + [tokenizer.pad_token_id] * e_pad)
-                e_mask_t.append([1] * len(e_seq) + [0] * e_pad)
+                # Sequence with BOS and EOS
+                seq_trunc = seq[:args.max_seq_len]
+                pad_len = args.max_seq_len - len(seq_trunc)
                 
-                # Target sequence (with EOS and PAD)
-                d_seq = seq[:args.max_seq_len-1] + [tokenizer.eos_token_id]
-                d_pad = args.max_seq_len - len(d_seq)
-                d_ids_t.append(d_seq + [tokenizer.pad_token_id] * d_pad)
+                padded_seq = seq_trunc + [tokenizer.pad_token_id] * pad_len
+                mask = [1] * len(seq_trunc) + [0] * pad_len
+                
+                e_ids_t.append(padded_seq)
+                e_mask_t.append(mask)
+                d_ids_t.append(padded_seq)
                 
             enc_ids = torch.tensor(e_ids_t, dtype=torch.long, device=device)
             enc_mask = torch.tensor(e_mask_t, dtype=torch.long, device=device)
