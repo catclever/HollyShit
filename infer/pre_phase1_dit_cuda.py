@@ -17,7 +17,7 @@ from training.core.char_tokenizer import CharTokenizer
 from distilled_emb.model_cuda import TinyCharEncoderCUDA
 from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
 
-def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0, device="cuda"):
+def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0, decode_method="cosine", device="cuda"):
     encoder.eval()
     flow_matcher.eval()
     
@@ -63,13 +63,23 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
     # Scale x_t back down to the original embedding scale before projection
     x_t = x_t / scale_factor
     
-    # Cosine similarity for decoding
-    import torch.nn.functional as F
-    x_norm = F.normalize(x_t, p=2, dim=-1)
-    emb_norm = F.normalize(emb_weights, p=2, dim=-1)
-    
-    # (1, L, D) @ (D, vocab_size) -> (1, L, vocab_size)
-    logits = torch.matmul(x_norm, emb_norm.T)
+    # Choose decoding method
+    if decode_method == "cosine":
+        # Cosine similarity for decoding
+        import torch.nn.functional as F
+        x_norm = F.normalize(x_t, p=2, dim=-1)
+        emb_norm = F.normalize(emb_weights, p=2, dim=-1)
+        # (1, L, D) @ (D, vocab_size) -> (1, L, vocab_size)
+        logits = torch.matmul(x_norm, emb_norm.T)
+    elif decode_method == "euclidean":
+        # Euclidean distance for decoding (smaller is better, so negate it for argmax)
+        # (1, L, 1, D) - (1, 1, vocab_size, D)
+        x_t_exp = x_t.unsqueeze(2) # (1, L, 1, D)
+        emb_exp = emb_weights.unsqueeze(0).unsqueeze(0) # (1, 1, vocab, D)
+        dist_sq = torch.sum((x_t_exp - emb_exp)**2, dim=-1) # (1, L, vocab)
+        logits = -dist_sq
+    else:
+        raise ValueError(f"Unknown decode_method: {decode_method}")
     
     # Decode argmax tokens
     predicted_tokens = torch.argmax(logits, dim=-1)[0].tolist()
@@ -110,6 +120,7 @@ def get_args():
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_layers", type=int, default=6)
     parser.add_argument("--n_heads", type=int, default=8)
+    parser.add_argument("--decode_method", type=str, default="cosine", choices=["cosine", "euclidean"], help="Method for decoding vectors back to discrete tokens")
     return parser.parse_args()
 
 def main():
@@ -160,6 +171,7 @@ def main():
     
     print("\n--- Running CUDA Flow Matching Reconstruction Test ---")
     print(f"Original Text: {args.prompt}")
+    print(f"Decode Method: {args.decode_method}")
     
     reconstructed = generate_flow_cuda(
         encoder=encoder,
@@ -169,6 +181,7 @@ def main():
         steps=args.steps,
         max_seq_len=max_seq_len,
         scale_factor=emb_scale_factor,
+        decode_method=args.decode_method,
         device=device
     )
     

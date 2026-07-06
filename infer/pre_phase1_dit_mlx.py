@@ -57,7 +57,7 @@ def load_pt_checkpoint(pt_path):
     import mlx.utils as mu
     return mu.tree_unflatten(list(mlx_params.items()))
 
-def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0):
+def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0, decode_method="cosine"):
     """
     Instantly reconstructs sentence from raw text prompt by finding its Z_macro 
     and integrating the continuous flow from Gaussian noise.
@@ -94,12 +94,21 @@ def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_le
     # Scale x_t back down to the original embedding scale before projection
     x_t = x_t / scale_factor
     
-    # Cosine similarity for decoding
-    x_norm = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8)
-    emb_norm = emb_weights / (mx.linalg.norm(emb_weights, axis=-1, keepdims=True) + 1e-8)
-    
-    # Pointwise cosine similarity: (1, L, vocab_size)
-    logits = mx.matmul(x_norm, emb_norm.T)
+    # Choose decoding method
+    if decode_method == "cosine":
+        # Cosine similarity for decoding
+        x_norm = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8)
+        emb_norm = emb_weights / (mx.linalg.norm(emb_weights, axis=-1, keepdims=True) + 1e-8)
+        # Pointwise cosine similarity: (1, L, vocab_size)
+        logits = mx.matmul(x_norm, emb_norm.T)
+    elif decode_method == "euclidean":
+        # Euclidean distance for decoding (smaller is better, so negate it for argmax)
+        x_t_exp = mx.expand_dims(x_t, axis=2) # (1, L, 1, D)
+        emb_exp = mx.expand_dims(mx.expand_dims(emb_weights, axis=0), axis=0) # (1, 1, vocab, D)
+        dist_sq = mx.sum(mx.square(x_t_exp - emb_exp), axis=-1) # (1, L, vocab)
+        logits = -dist_sq
+    else:
+        raise ValueError(f"Unknown decode_method: {decode_method}")
     
     # Decode argmax tokens
     predicted_tokens = mx.argmax(logits, axis=-1)[0].tolist()
@@ -167,15 +176,15 @@ def main():
                 new_k = new_k.replace(".k_proj.", ".attention.k_proj.")
                 new_k = new_k.replace(".v_proj.", ".attention.v_proj.")
                 # the transformer layer has its own out_proj
-                # wait, let's be safe and check if it's layers.X.out_proj
-                # yes, layers.0.out_proj.weight -> layers.0.attention.out_proj.weight
-                new_k = new_k.replace(".out_proj.", ".attention.out_proj.")
-            mlx_enc_params[new_k] = mx.array(v.numpy())
-        import mlx.utils as mu
-        encoder.update(mu.tree_unflatten(list(mlx_enc_params.items())))
-        encoder.update(mu.tree_unflatten(list(mlx_enc_params.items())))
         
-    # Auto-load hyperparams from companion training_args.json
+    sniffed_x_dim = pt_weights['tok_emb.weight'].shape[1]
+    sniffed_z_dim = pt_weights['out_proj.weight'].shape[0]
+    
+    encoder = TinyCharEncoder(vocab_size=tokenizer.vocab_size, d_model=sniffed_x_dim, z_dim=sniffed_z_dim)
+    mlx_enc_params = convert_pt_to_mlx(pt_weights)
+    encoder.update(mlx_enc_params)
+    
+    # 2. Auto-load hyperparams from companion training_args.json
     config = load_training_args(args.flow_ckpt)
     d_model = config.get("d_model", args.d_model)
     n_layers = config.get("n_layers", args.n_layers)
@@ -185,22 +194,23 @@ def main():
     emb_scale_factor = config.get("emb_scale_factor", 1.0)
     print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
     
-    # 2. Instantiate Flow Matcher
+    # 3. Instantiate Flow Matcher
     flow_matcher = NARFlowMatcher(
-        z_dim=encoder.out_proj.weight.shape[0],
-        x_dim=encoder.tok_emb.weight.shape[1],
+        z_dim=sniffed_z_dim,
+        x_dim=sniffed_x_dim,
         d_model=d_model,
         n_layers=n_layers,
         n_heads=n_heads,
         max_seq_len=max_seq_len
     )
     
-    # Load Flow Matcher weights
+    print(f"Loading Flow Matcher weights from: {args.flow_ckpt}")
     mlx_flow_params = load_pt_checkpoint(args.flow_ckpt)
     flow_matcher.update(mlx_flow_params)
     
-    print("\n--- Running Flow Matching Reconstruction Test ---")
+    print("\n--- Running MLX Flow Matching Reconstruction Test ---")
     print(f"Original Text: {args.prompt}")
+    print(f"Decode Method: {args.decode_method}")
     
     reconstructed = generate_flow(
         encoder=encoder,
@@ -209,7 +219,8 @@ def main():
         prompt=args.prompt,
         steps=args.steps,
         max_seq_len=max_seq_len,
-        scale_factor=emb_scale_factor
+        scale_factor=emb_scale_factor,
+        decode_method=args.decode_method
     )
     
     print(f"Reconstructed: {reconstructed}")
