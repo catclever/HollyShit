@@ -21,20 +21,26 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
     encoder.eval()
     flow_matcher.eval()
     
-    # 1. Encode prompt
+    # 1. Encode prompt and pad to max_seq_len
     ids = tokenizer.encode(prompt, add_special_tokens=True)
-    L = len(ids)
-    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
-    mask = torch.tensor([[1] * L], dtype=torch.float32, device=device)
+    
+    # Truncate and Pad to exactly max_seq_len
+    seq_trunc = ids[:max_seq_len]
+    pad_len = max_seq_len - len(seq_trunc)
+    padded_seq = seq_trunc + [tokenizer.pad_token_id] * pad_len
+    mask_list = [1] * len(seq_trunc) + [0] * pad_len
+    
+    input_ids = torch.tensor([padded_seq], dtype=torch.long, device=device)
+    mask = torch.tensor([mask_list], dtype=torch.float32, device=device)
     
     # 2. Extract macro condition Z_macro (pooled sentence representation)
     with torch.no_grad():
         with torch.cuda.amp.autocast():
             z_macro = encoder(input_ids, attention_mask=mask) # (1, z_dim)
         
-    # 3. Sample initial gaussian noise sequence X_0
+    # 3. Sample initial gaussian noise sequence X_0 (always use max_seq_len)
     x_dim = encoder.tok_emb.weight.shape[1] # e.g. 1024
-    x_t = torch.randn((1, L, x_dim), device=device)
+    x_t = torch.randn((1, max_seq_len, x_dim), device=device)
     
     # 4. Integrate ODE trajectory using Euler method
     dt = 1.0 / steps
