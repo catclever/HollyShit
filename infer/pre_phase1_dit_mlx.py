@@ -63,17 +63,17 @@ def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_le
     and integrating the continuous flow from Gaussian noise.
     """
     # 1. Encode prompt
-    ids = tokenizer.encode(prompt, add_special_tokens=False)[:max_seq_len]
-    pad_len = max_seq_len - len(ids)
-    input_ids = mx.array([ids + [tokenizer.pad_token_id] * pad_len])
-    mask = mx.array([[1] * len(ids) + [0] * pad_len])
+    ids = tokenizer.encode(prompt, add_special_tokens=True)
+    L = len(ids)
+    input_ids = mx.array([ids])
+    mask = mx.array([[1] * L])
     
     # 2. Extract macro condition Z_macro (pooled sentence representation)
     z_macro = encoder(input_ids, attention_mask=mask) # (1, z_dim)
     
     # 3. Sample initial gaussian noise sequence X_0
     x_dim = encoder.tok_emb.weight.shape[1] # e.g. 1024
-    x_t = mx.random.normal((1, max_seq_len, x_dim))
+    x_t = mx.random.normal((1, L, x_dim))
     
     # 4. Integrate ODE trajectory using Euler method
     dt = 1.0 / steps
@@ -94,8 +94,12 @@ def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_le
     # Scale x_t back down to the original embedding scale before projection
     x_t = x_t / scale_factor
     
-    # Pointwise dot product similarity: (1, L, vocab_size)
-    logits = mx.matmul(x_t, emb_weights.T)
+    # Cosine similarity for decoding
+    x_norm = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8)
+    emb_norm = emb_weights / (mx.linalg.norm(emb_weights, axis=-1, keepdims=True) + 1e-8)
+    
+    # Pointwise cosine similarity: (1, L, vocab_size)
+    logits = mx.matmul(x_norm, emb_norm.T)
     
     # Decode argmax tokens
     predicted_tokens = mx.argmax(logits, axis=-1)[0].tolist()

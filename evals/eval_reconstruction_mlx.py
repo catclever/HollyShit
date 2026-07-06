@@ -132,17 +132,18 @@ def evaluate(args):
         texts = test_chunks[start_idx:end_idx]
         B = len(texts)
         
-        enc_ids_list = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
+        enc_ids_list = [tokenizer.encode(t, add_special_tokens=True) for t in texts]
         e_ids_t, e_mask_t, d_ids_t = [], [], []
         for seq in enc_ids_list:
-            e_seq = seq[:max_seq_len]
-            e_pad = max_seq_len - len(e_seq)
-            e_ids_t.append(e_seq + [tokenizer.pad_token_id] * e_pad)
-            e_mask_t.append([1] * len(e_seq) + [0] * e_pad)
+            seq_trunc = seq[:max_seq_len]
+            pad_len = max_seq_len - len(seq_trunc)
             
-            d_seq = seq[:max_seq_len-1] + [tokenizer.eos_token_id]
-            d_pad = max_seq_len - len(d_seq)
-            d_ids_t.append(d_seq + [tokenizer.pad_token_id] * d_pad)
+            padded_seq = seq_trunc + [tokenizer.pad_token_id] * pad_len
+            mask = [1] * len(seq_trunc) + [0] * pad_len
+            
+            e_ids_t.append(padded_seq)
+            e_mask_t.append(mask)
+            d_ids_t.append(padded_seq)
             
         enc_ids = mx.array(e_ids_t)
         enc_mask = mx.array(e_mask_t)
@@ -169,7 +170,11 @@ def evaluate(args):
         # Scale back to original embedding space
         x_t = x_t / emb_scale_factor
         
-        logits = mx.matmul(x_t, emb_weights.T) # (B, L, V)
+        # Cosine similarity for decoding
+        x_norm = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8)
+        emb_norm = emb_weights / (mx.linalg.norm(emb_weights, axis=-1, keepdims=True) + 1e-8)
+        
+        logits = mx.matmul(x_norm, emb_norm.T) # (B, L, V)
         predicted_tokens = mx.argmax(logits, axis=-1) # (B, L)
         
         correct_mask = (predicted_tokens == target_ids) * target_mask
