@@ -22,10 +22,10 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
     flow_matcher.eval()
     
     # 1. Encode prompt
-    ids = tokenizer.encode(prompt, add_special_tokens=False)[:max_seq_len]
-    pad_len = max_seq_len - len(ids)
-    input_ids = torch.tensor([ids + [tokenizer.pad_token_id] * pad_len], dtype=torch.long, device=device)
-    mask = torch.tensor([[1] * len(ids) + [0] * pad_len], dtype=torch.float32, device=device)
+    ids = tokenizer.encode(prompt, add_special_tokens=True)
+    L = len(ids)
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    mask = torch.tensor([[1] * L], dtype=torch.float32, device=device)
     
     # 2. Extract macro condition Z_macro (pooled sentence representation)
     with torch.no_grad():
@@ -34,7 +34,7 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
         
     # 3. Sample initial gaussian noise sequence X_0
     x_dim = encoder.tok_emb.weight.shape[1] # e.g. 1024
-    x_t = torch.randn((1, max_seq_len, x_dim), device=device)
+    x_t = torch.randn((1, L, x_dim), device=device)
     
     # 4. Integrate ODE trajectory using Euler method
     dt = 1.0 / steps
@@ -57,8 +57,13 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
     # Scale x_t back down to the original embedding scale before projection
     x_t = x_t / scale_factor
     
-    # Pointwise dot product similarity: (1, L, vocab_size)
-    logits = torch.matmul(x_t, emb_weights.T)
+    # Cosine similarity for decoding
+    import torch.nn.functional as F
+    x_norm = F.normalize(x_t, p=2, dim=-1)
+    emb_norm = F.normalize(emb_weights, p=2, dim=-1)
+    
+    # (1, L, D) @ (D, vocab_size) -> (1, L, vocab_size)
+    logits = torch.matmul(x_norm, emb_norm.T)
     
     # Decode argmax tokens
     predicted_tokens = torch.argmax(logits, dim=-1)[0].tolist()
