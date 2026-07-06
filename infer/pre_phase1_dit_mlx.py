@@ -102,10 +102,12 @@ def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_le
         # Pointwise cosine similarity: (1, L, vocab_size)
         logits = mx.matmul(x_norm, emb_norm.T)
     elif decode_method == "euclidean":
-        # Euclidean distance for decoding (smaller is better, so negate it for argmax)
-        x_t_exp = mx.expand_dims(x_t, axis=2) # (1, L, 1, D)
-        emb_exp = mx.expand_dims(mx.expand_dims(emb_weights, axis=0), axis=0) # (1, 1, vocab, D)
-        dist_sq = mx.sum(mx.square(x_t_exp - emb_exp), axis=-1) # (1, L, vocab)
+        # Euclidean distance using expansion: (a-b)^2 = a^2 + b^2 - 2ab
+        # This avoids broadcasting a massive intermediate tensor
+        x_sq = mx.sum(mx.square(x_t), axis=-1, keepdims=True) # (1, L, 1)
+        emb_sq = mx.expand_dims(mx.expand_dims(mx.sum(mx.square(emb_weights), axis=-1), axis=0), axis=0) # (1, 1, vocab_size)
+        ab = mx.matmul(x_t, emb_weights.T) # (1, L, vocab_size)
+        dist_sq = x_sq + emb_sq - 2 * ab # (1, L, vocab_size)
         logits = -dist_sq
     else:
         raise ValueError(f"Unknown decode_method: {decode_method}")

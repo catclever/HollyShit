@@ -72,11 +72,12 @@ def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_s
         # (1, L, D) @ (D, vocab_size) -> (1, L, vocab_size)
         logits = torch.matmul(x_norm, emb_norm.T)
     elif decode_method == "euclidean":
-        # Euclidean distance for decoding (smaller is better, so negate it for argmax)
-        # (1, L, 1, D) - (1, 1, vocab_size, D)
-        x_t_exp = x_t.unsqueeze(2) # (1, L, 1, D)
-        emb_exp = emb_weights.unsqueeze(0).unsqueeze(0) # (1, 1, vocab, D)
-        dist_sq = torch.sum((x_t_exp - emb_exp)**2, dim=-1) # (1, L, vocab)
+        # Euclidean distance using expansion: (a-b)^2 = a^2 + b^2 - 2ab
+        # This avoids broadcasting a massive (1, L, vocab_size, D) intermediate tensor
+        x_sq = torch.sum(x_t**2, dim=-1, keepdim=True) # (1, L, 1)
+        emb_sq = torch.sum(emb_weights**2, dim=-1).unsqueeze(0).unsqueeze(0) # (1, 1, vocab_size)
+        ab = torch.matmul(x_t, emb_weights.T) # (1, L, vocab_size)
+        dist_sq = x_sq + emb_sq - 2 * ab # (1, L, vocab_size)
         logits = -dist_sq
     else:
         raise ValueError(f"Unknown decode_method: {decode_method}")
