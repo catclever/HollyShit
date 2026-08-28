@@ -1,0 +1,162 @@
+Restored the following arguments from checkpoint (defaults):
+  batch_size: 128 (default) -> 32 (saved)
+  save_steps: 1000 (default) -> 5000 (saved)
+  seed: None (default) -> 529052 (saved)
+  auto_resume: False (default) -> True (saved)
+  kernel_size: 5 (default) -> 7 (saved)
+Preserved the following command-line training arguments (overriding checkpoint):
+  epochs: 5 (saved) -> 10 (CLI override)
+  lr: 0.0001 (saved) -> 5e-05 (CLI override)
+  ckpt_prefix: depthwise (saved) -> depthwise_polish (CLI override)
+  resume_from: None (saved) -> checkpoints/phase2_2_conv/depthwise_pinned_27005 (CLI override)
+  noise_min: 0.01 (saved) -> 0.05 (CLI override)
+  noise_max: 0.2 (saved) -> 0.15 (CLI override)
+ [WARNING] The following arguments were OVERRIDDEN to match the checkpoint:
+   - batch_size: 128 (default) -> 32 (saved)
+   - save_steps: 1000 (default) -> 5000 (saved)
+   - seed: None (default) -> 529052 (saved)
+   - auto_resume: False (default) -> True (saved)
+   - kernel_size: 5 (default) -> 7 (saved)
+Loaded DepthwiseConvDecoderConfig from checkpoints/phase2_2_conv/depthwise_pinned_27005/decoder_config.json
+Loading Omni data from data/Basic_ZH/chunked_mixed_omni.parquet...
+Loaded 551502 Omni documents.
+Building Omni aligned indices (max_len=512)...
+Index built! Total aligned sequences: 854859
+[WeightUtils] Successfully loaded PyTorch weights into MLX model from checkpoints/basencoder_step_115000/student.pt
+Loaded encoder from checkpoints/basencoder_step_115000/student.pt
+Resuming from checkpoint checkpoints/phase2_2_conv/depthwise_pinned_27005...
+Set epoch deterministic seed to 529052
+Epoch 1 | Step 100 | Loss: 1.3538 | Time/100steps: 56.91s
+Epoch 1 | Step 200 | Loss: 0.8768 | Time/100steps: 56.45s
+Epoch 1 | Step 300 | Loss: 1.0829 | Time/100steps: 54.67s
+Epoch 1 | Step 400 | Loss: 1.0262 | Time/100steps: 54.86s
+Epoch 1 | Step 500 | Loss: 0.9143 | Time/100steps: 59.24s
+Epoch 1 | Step 600 | Loss: 1.0694 | Time/100steps: 63.84s
+Epoch 1 | Step 700 | Loss: 0.9744 | Time/100steps: 61.71s
+Epoch 1 | Step 800 | Loss: 0.9139 | Time/100steps: 61.48s
+Epoch 1 | Step 900 | Loss: 1.0077 | Time/100steps: 60.07s
+Epoch 1 | Step 1000 | Loss: 1.0853 | Time/100steps: 59.85s
+
+--- EVAL STEP 1000 ---
+Target: 欧洲火药桶又称巴尔干火药桶，是指20世纪早期至第一次世界大战前巴尔干半岛的紧张状态。当时欧洲的主要大国，如俄罗斯帝国、奥匈帝国、德意志帝国以及相对较小的鄂图曼帝国、英国和义大利王国等国在巴尔干半岛主张的领土和势力范围存在重叠。除了该地区的帝国主义所主张的势力范围外，生活在巴尔干半岛的当地人民民族主义也在增长，这导致希腊、塞尔维亚、蒙特内哥罗、保加利亚、罗马尼亚和阿尔巴尼亚等国纷纷从鄂图曼帝国独立出去。欧洲火药桶最终引燃了第一次世界大战，这场战争始于奥匈帝国和塞尔维亚之间的冲突。奥匈帝国皇储弗朗茨·斐迪南大公被青年波斯尼亚运动的一名塞尔维亚裔波斯尼亚人暗杀。奥匈帝国随后向塞尔维亚发出最后通牒。塞尔维亚政府接受最后通牒中的大部分条件，除了第六个条件，即允许奥匈帝国参与塞尔维亚对暗杀事件的司法调查。塞尔维亚表示此项要求违宪并侵犯其主权，奥匈帝国以此为战争借口入侵塞尔维亚。俄罗斯帝国随后亦开始动员起来支持塞尔维亚。由于此时欧洲各国互相结盟（三国同盟、三国协约），这导致冲突不断升级，最终英国和法国也不得不动员并宣战。
+Generated: 欧洲亚主主又称巴尔亚领权，是指20世纪早期至第一次世界大略占巴尔干半岛的紧心战役。它地欧洲的主要大区，如俄罗斯帝国、亚粹帝国、马意亚帝国以及几对较小的埃尔曼帝国、法国和义大利王国之国在埃尔尔亚岛主争的领斯和势尔范围存在战岛。除了欧地区的帝国主义所主岛的势力范围外，生活在巴尔尔欧岛的当地亚民民主主也在领战，这导致希腊、塞尔维亚、埃尔内疆邦、塞尔利亚、皇兰尼亚和埃尔尔尼亚政国于埃尔尔帝国独立权去。欧洲尔最终占到了第一次世界条战，这些战争称于亚尔帝区和塞尔维亚之间的贸突。奥尔帝国皇领埃斯尔尔尔国公爵前尔斯尼亚部权的一些塞尔维亚·波斯尼亚人之领。奥尔帝国最后塞尔维亚发最后主权。塞尔维亚政府战领最后亚之中的大部分条时，除了第两个条间，即尔尔亚占帝国塞尔维亚尔亚领事件的国法调策。塞尔维亚领示此总要求吞并侵其主权，奥尔帝国以此为国争尔维亚。俄罗斯帝国随后支持塞尔维亚。由于此洲（、帝国协约），这次致，并终法国和法国也不得不为侵役。
+-------------------------
+
+Epoch 1 | Step 1100 | Loss: 1.1164 | Time/100steps: 59.65s
+Epoch 1 | Step 1200 | Loss: 1.1690 | Time/100steps: 59.24s
+Epoch 1 | Step 1300 | Loss: 1.1534 | Time/100steps: 59.12s
+Epoch 1 | Step 1400 | Loss: 0.9459 | Time/100steps: 59.07s
+Epoch 1 | Step 1500 | Loss: 0.9750 | Time/100steps: 59.30s
+Epoch 1 | Step 1600 | Loss: 0.7529 | Time/100steps: 1034.05s
+Epoch 1 | Step 1700 | Loss: 0.6474 | Time/100steps: 968.85s
+Epoch 1 | Step 1800 | Loss: 0.8973 | Time/100steps: 957.71s
+Epoch 1 | Step 1900 | Loss: 0.8025 | Time/100steps: 186.06s
+Epoch 1 | Step 2000 | Loss: 0.9590 | Time/100steps: 69.04s
+
+--- EVAL STEP 2000 ---
+Target: * Superbee：参加了SMTM开播至今所有的赛季，但在SMTM4之前从未通过第一轮* 이노베이터：Rapper老手，之前签约的唱片公司已倒闭，现无所属公司。曾与Jiggy Fellaz、Basick组成Double Trouble活动AOMG队* 地球人：Rhythm Power成员，隶属아메바컬쳐旗下* Lil Boi：Geeks组合成员，隶属Grandline娱乐及RBW旗下。Buckwilds crew成员* Sik-K：Yellows mob成员，曾属H1GHER MUSIC旗下* 데이 데이：制作人兼词曲家，本名为David Kim，曾为乐队斑点狗成员ZiPal队* One：曾作为1Punch的队长兼Rapper隶属Brave娱乐旗下，节目结束后作为独唱歌手签约YG。
+Generated: * Superbee：参作了Smm工开播至今所有的流作，但在SM与尔4之前产前通过第一三数：Rapherd份，以前签约的唱子公司已支队，现一所属公司。曾与re、lelemar* 球队：Rhyt Mower成员，称“rviecuoeneo队员* ril Boi：Geers组合成员，同rClarinefy成长。Buckilre员* Sil g：Rellos mor成员，曾括R1r为SICUd* Fy ly：于作人继词曲家，单名为Dagid Kim，曾为单队股字成员higal * abe：曾成为Purch的成长兼e，节目结束后作为支歌手约5。
+-------------------------
+
+Epoch 1 | Step 2100 | Loss: 0.9256 | Time/100steps: 54.91s
+Epoch 1 | Step 2200 | Loss: 0.8644 | Time/100steps: 55.62s
+Epoch 1 | Step 2300 | Loss: 0.7852 | Time/100steps: 54.75s
+Epoch 1 | Step 2400 | Loss: 1.2237 | Time/100steps: 55.48s
+Epoch 1 | Step 2500 | Loss: 0.7742 | Time/100steps: 56.34s
+Epoch 1 | Step 2600 | Loss: 0.8662 | Time/100steps: 64.05s
+Epoch 1 | Step 2700 | Loss: 1.2130 | Time/100steps: 68.41s
+Epoch 1 | Step 2800 | Loss: 1.1708 | Time/100steps: 71.17s
+Epoch 1 | Step 2900 | Loss: 0.6675 | Time/100steps: 61.93s
+Epoch 1 | Step 3000 | Loss: 0.7219 | Time/100steps: 61.81s
+
+--- EVAL STEP 3000 ---
+Target: 你好 我把我的钥匙留在房间里了 但我现在进不去了请告诉我你的名字和房间号？我是莫洛波，我的房间是5022。好的，先生。请上楼去吧 会有人给你开门的非常感谢。
+Generated: 你好 我把我的钥匙留在房间里了 但我现在就过去了请告诉我你的名字和房间号？我是谢洛福，我的房间是5022。好的，先生。请上楼去 你会有人给你开做的非常感谢。
+-------------------------
+
+Epoch 1 | Step 3100 | Loss: 1.0618 | Time/100steps: 62.73s
+Epoch 1 | Step 3200 | Loss: 0.7343 | Time/100steps: 62.08s
+Epoch 1 | Step 3300 | Loss: 0.8172 | Time/100steps: 69.16s
+Epoch 1 | Step 3400 | Loss: 1.0880 | Time/100steps: 83.24s
+Epoch 1 | Step 3500 | Loss: 1.0334 | Time/100steps: 84.69s
+Epoch 1 | Step 3600 | Loss: 1.0674 | Time/100steps: 83.85s
+Epoch 1 | Step 3700 | Loss: 0.7357 | Time/100steps: 104.29s
+Epoch 1 | Step 3800 | Loss: 0.7427 | Time/100steps: 83.83s
+Epoch 1 | Step 3900 | Loss: 0.8103 | Time/100steps: 88.34s
+Epoch 1 | Step 4000 | Loss: 0.8961 | Time/100steps: 101.23s
+
+--- EVAL STEP 4000 ---
+Target: 你从华盛顿回来后打算做什么？我打算呆在城市里。你整天会做什么？我要和我父亲在商店里工作。晚上，我会看书。周末，我会和我的家人去海滩。你曾经工作过吗？没有，但我可以学习。这个夏天你打算做什么？我要去参加夏令营。我已经参加了四个夏天的夏令营。我从来没有参加过夏令营。你在那里都做些什么?我们做很多事情。在早上，我们去游泳和划船。在下午，我们打篮球或网球。晚上我们围坐在篝火旁。我们唱歌或讲故事。这听起来很好。是很好。约翰今年夏天要做什么？我想他要和他的父母去山里。
+Generated: 你从你都尼回来后打算做什么？我打算呆在城市里。你整天会做什么？我要和我父亲在商店里工作。晚上，我会看过。周末，我会和我的家人去海滩。你曾经工作过吗？没有，但我可以学习。这个夏天你打算做什么？我要去参加么么动。我已经参加了四个夏天的夏么休。我从你没有参加过作么动。你在那里街做些什么?我们做很多天情。在早上，我们去喝泳和雕狗。在下午，我们打篮球或网球。晚上我们工坐在篝练他。我们唱里或讲故事。这听带来很好。是很好。约翰今天夏天要做什么？我想他要和他的父母去空里。
+-------------------------
+
+Epoch 1 | Step 4100 | Loss: 0.8479 | Time/100steps: 95.80s
+Epoch 1 | Step 4200 | Loss: 0.9391 | Time/100steps: 95.86s
+Epoch 1 | Step 4300 | Loss: 0.8404 | Time/100steps: 94.43s
+Epoch 1 | Step 4400 | Loss: 0.7840 | Time/100steps: 86.77s
+Epoch 1 | Step 4500 | Loss: 1.0075 | Time/100steps: 93.23s
+Epoch 1 | Step 4600 | Loss: 0.9601 | Time/100steps: 87.68s
+Epoch 1 | Step 4700 | Loss: 0.9574 | Time/100steps: 89.72s
+Epoch 1 | Step 4800 | Loss: 0.9696 | Time/100steps: 89.09s
+Epoch 1 | Step 4900 | Loss: 0.8583 | Time/100steps: 101.74s
+Epoch 1 | Step 5000 | Loss: 1.0568 | Time/100steps: 98.90s
+
+--- EVAL STEP 5000 ---
+Target: 丹麦在欧洲歌唱大赛之历年表现丹麦已参加欧洲歌唱大赛51次（截止至2023年），其中首次参赛是在1957年。连续参赛10年后，从1967年到1977年间，丹麦中断参赛11年。自1978年到现在的这段时间里，丹麦只缺席过4届比赛。丹麦一共取得过3次比赛冠军。1957年，代表丹麦首次登场的Birthe Wilke和Gustav Winckler获得了第3名的成绩。丹麦第一次夺冠是在1963，获胜歌曲是由Grethe and Jørgen Ingmann演唱的《舞动之歌》"Dansevise"。该国曾有超过20年的时间未能在比赛中再次挤入前5强，直到1984年上Hot Eyes再次为丹麦取得一个第4名。热眼乐团这个组合还在随后的1988年欧洲歌唱大赛上取得过第3名。Birthe Kjær也在1989年取得过第3名。在20世纪90年代中，因为战绩不佳，该国还曾3次被踢出比赛(1994年，1996年和1998年)。他们在90年代也曾3次入围过前10名(1990年，1995年和1999年)，其中1995年参赛的Aud Wilken排名最高，排到了当年的第5名。2000年，丹麦诞生了第2个冠军。
+Generated: 丹朗在首洲歌场一赛的括年参过丹敦已参加欧洲歌场比赛41次（截止至2024年），其中首次参赛是在1954年。连续参赛10年后，于1967年到1917年间，丹麦中共参赛11岁。自1968年他现在的这段冠主王，丹麦拿晋胜过6届比赛。丹麦一次取得到3届比赛冠军。1977年，代表英兰首次rn的lirtre WilderGuscan ginnnler获得了第6名的特绩。丹麦第一次夺冠是在1966，获到首曲是由Crethe ann Fmuren Ingmannn唱的《俱乐尔rnrnunserisel。他乐这有超过20年的家间n加在杯赛中再次到入尔5m，直到1983年Juot Eresn 为rr取得一个第4名。丹恩学练这个组合还在最后到1988年欧洲r尔大n中获得入第3名。Bertre Cdnr也在1989年出得入第3名。在2r世纪90年代中，因为r绩不y，他在还曾3n最唱出n赛（1994年，1996年和1998年)。他们在90年队也曾3次入赛的中国0名（1990年，1995年和1999年)，其中1997年获赛的Mud Firder排名最高，获到了新年的第5名。2000年，哈麦名生了第2个冠名。
+-------------------------
+
+[Checkpoint] Saved at step 5000 to checkpoints/phase2_2_conv/depthwise_polish_step_5000
+Saved intermediate checkpoint at global step 5000.
+Epoch 1 | Step 5100 | Loss: 0.7700 | Time/100steps: 86.82s
+Epoch 1 | Step 5200 | Loss: 0.7797 | Time/100steps: 85.78s
+Epoch 1 | Step 5300 | Loss: 0.7488 | Time/100steps: 84.68s
+Epoch 1 | Step 5400 | Loss: 0.9189 | Time/100steps: 94.54s
+Epoch 1 | Step 5500 | Loss: 0.7974 | Time/100steps: 89.24s
+Epoch 1 | Step 5600 | Loss: 0.9200 | Time/100steps: 99.79s
+Epoch 1 | Step 5700 | Loss: 0.8998 | Time/100steps: 98.97s
+Epoch 1 | Step 5800 | Loss: 0.9247 | Time/100steps: 99.01s
+Epoch 1 | Step 5900 | Loss: 0.7988 | Time/100steps: 85.47s
+Epoch 1 | Step 6000 | Loss: 0.6683 | Time/100steps: 87.35s
+
+--- EVAL STEP 6000 ---
+Target: ）* 单行本：2011年9月7日发售、ISBN 978-4-34-402046-7* 文库版：2013年4月10日发售、ISBN 978-4-34-442008-3电视剧于2009年5月29日至6月12日播出，全3集。由藤原纪香和原田泰造主演。监修由精神科医师野村总一郎担当。2010年5月28日发售DVD。
+Generated: ）* 单行本：2011年9月7日发售、ISBN 977 6-34-402046-7* 文光版：2013年4月10日发售、ISBN 978-4-34-342008-3电视剧于2009年7月29日至6月12日播出，全3集。由藤原天香和原田泰造主演。监编由精神教医师院 总一到D（。2010年5月28日发版DVD。
+-------------------------
+
+Epoch 1 | Step 6100 | Loss: 0.8618 | Time/100steps: 113.79s
+Epoch 1 | Step 6200 | Loss: 0.8804 | Time/100steps: 111.08s
+Epoch 1 | Step 6300 | Loss: 0.8513 | Time/100steps: 88.22s
+Epoch 1 | Step 6400 | Loss: 0.7044 | Time/100steps: 84.66s
+Epoch 1 | Step 6500 | Loss: 0.9231 | Time/100steps: 98.87s
+Epoch 1 | Step 6600 | Loss: 0.9798 | Time/100steps: 107.64s
+Epoch 1 | Step 6700 | Loss: 0.5891 | Time/100steps: 90.08s
+Epoch 1 | Step 6800 | Loss: 0.8311 | Time/100steps: 89.80s
+Epoch 1 | Step 6900 | Loss: 0.9612 | Time/100steps: 90.61s
+Epoch 1 | Step 7000 | Loss: 1.1332 | Time/100steps: 95.58s
+
+--- EVAL STEP 7000 ---
+Target: 2010年7月13日起根据《澳门特别行政区公报》第100/2010号社会文化司司长批示重新公布体育发展局管辖的体育设施附表被正名为奥林匹克体育中心多层停车场。近年，因应澳门政府政策研究和区域发展局之前身政策研究室确定设于本大楼，澳门奥委会办事处遂迁往路氹国际体育综合体保龄球中心2楼继续运作。大楼内部简单地说，奥林匹克体育中心多层停车场大楼只有五楼是办公地方，而地面只作为大堂接待处之用，一至四楼是为停车场楼层；下表是为大楼内部的分布情况：
+Generated: 2010年5月17日起根据《澳门专别行政区公报》单100/2010号社会文化司司长批示重新公布体育发展局管辖的体育设施附表被正名为奥林匹克体育中心多层停车场。另年，因爱澳门政府政策研究和区域发展局之头畜户策研究室等定设于基大楼，澳门奥委会办事处邻迁往路德国际体育综合体保护场中心2楼继续运作。大楼内部简单地场，供林匹克体育中心多层停车场大楼只有六楼是办公地方，而地每只作为区席于待处之用，一至四楼是为停车场楼层；下表是为大楼内部的分布情况：
+-------------------------
+
+Epoch 1 | Step 7100 | Loss: 0.8193 | Time/100steps: 85.02s
+Epoch 1 | Step 7200 | Loss: 0.8014 | Time/100steps: 88.64s
+Epoch 1 | Step 7300 | Loss: 0.9728 | Time/100steps: 85.11s
+Epoch 1 | Step 7400 | Loss: 0.8255 | Time/100steps: 97.58s
+Epoch 1 | Step 7500 | Loss: 0.9020 | Time/100steps: 101.61s
+Epoch 1 | Step 7600 | Loss: 0.7069 | Time/100steps: 138.08s
+Epoch 1 | Step 7700 | Loss: 0.7356 | Time/100steps: 421.58s
+Epoch 1 | Step 7800 | Loss: 1.0909 | Time/100steps: 1026.83s
+Epoch 1 | Step 7900 | Loss: 0.9442 | Time/100steps: 184.04s
+Epoch 1 | Step 8000 | Loss: 0.9766 | Time/100steps: 66.49s
+
+--- EVAL STEP 8000 ---
+Target: 对不起，我可以用你的电脑来打我的论文吗？没问题我怕我今天下午打不完。你今晚什么时候用？哦，不要紧，我已经完成了我的论文。所以你今晚可以用它。
+Generated: 对不起，我可以用你的电脑你打你的论动吗？没问题你怕你今天下午打不完。你今晚什么时候用？哦，不要紧，我已经完成了你的英文。所以你今晚可以用它。
+-------------------------
+
+Training interrupted manually.
+[Checkpoint] Saved at step 8033 to checkpoints/phase2_2_conv/depthwise_polish_step_8033
+[Checkpoint] Saved at step 8033 to checkpoints/phase2_2_conv/depthwise_polish_step_8033
+Training finished.

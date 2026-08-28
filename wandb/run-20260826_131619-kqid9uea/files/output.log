@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/Users/kael/workbench/HollyShit/training/train_phase2_2_convdecoder.py", line 208, in <module>
+    train()
+  File "/Users/kael/workbench/HollyShit/training/train_phase2_2_convdecoder.py", line 33, in train
+    from model.conv_decoder_mlx import ConvDecoderConfig
+  File "/Users/kael/workbench/HollyShit/model/conv_decoder_mlx.py", line 37
+    \"\"\"
+     ^
+SyntaxError: unexpected character after line continuation character

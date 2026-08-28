@@ -1,0 +1,4121 @@
+diff --git a/evals/eval_reconstruction_cuda.py b/evals/eval_reconstruction_cuda.py
+index 9437ad2..da667df 100644
+--- a/evals/eval_reconstruction_cuda.py
++++ b/evals/eval_reconstruction_cuda.py
+@@ -11,8 +11,8 @@ from torch.utils.data import DataLoader, Dataset
+ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+ 
+ from training.core.char_tokenizer import CharTokenizer
+-from distilled_emb.model_cuda import TinyCharEncoderCUDA
+-from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
++from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
++from model.phase2_dit_cuda import NARFlowMatcherCUDA
+ 
+ def load_training_args(flow_ckpt_path):
+     ckpt_dir = os.path.dirname(flow_ckpt_path)
+@@ -48,12 +48,15 @@ def evaluate(args):
+     
+     # 2. Load Flow Matcher Configuration
+     config = load_training_args(args.flow_ckpt)
+-    d_model = config.get("d_model", args.d_model)
+-    n_layers = config.get("n_layers", args.n_layers)
+-    n_heads = config.get("n_heads", args.n_heads)
+-    max_seq_len = config.get("max_seq_len", args.max_seq_len)
++    if not config:
++        print("Warning: training_args.json not found! Using fallback defaults (d_model=512, n_layers=6, n_heads=8, max_seq_len=64)")
++    
++    d_model = config.get("d_model", 512)
++    n_layers = config.get("n_layers", 6)
++    n_heads = config.get("n_heads", 8)
++    max_seq_len = config.get("max_seq_len", 64)
+     emb_scale_factor = config.get("emb_scale_factor", 1.0)
+-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
++    print(f"Model parameters loaded from config: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
+     
+     # 3. Instantiate and Load Flow Matcher
+     flow_matcher = NARFlowMatcherCUDA(
+@@ -85,6 +88,9 @@ def evaluate(args):
+     correct_chars = 0
+     total_sentences = 0
+     exact_match_sentences = 0
++    good_match_sentences = 0
++    perfect_match_strings = []
++    good_match_examples = []
+     total_cosine_sim = 0.0
+     cosine_count = 0
+     
+@@ -121,15 +127,33 @@ def evaluate(args):
+                 # Get ground truth embedding X_1
+                 X_1 = encoder.tok_emb(target_ids)
+                 
+-            # 2. ODE Solver (Euler Integration)
++            # 2. ODE Solver (Spherical Euler Integration)
++            # Sample initial gaussian noise sequence X_0 and project to hypersphere
+             x_t = torch.randn((B, max_seq_len, sniffed_x_dim), device=device)
++            import torch.nn.functional as F
++            x_t = F.normalize(x_t, p=2, dim=-1) * emb_scale_factor
++            
+             dt = 1.0 / args.steps
+             for i in range(args.steps):
+                 t_val = float(i) / args.steps
+                 t_tensor = torch.tensor([t_val] * B, device=device, dtype=torch.float32)
+                 with torch.cuda.amp.autocast():
+-                    v_pred = flow_matcher(x_t, t_tensor, z_macro)
++                    if args.cfg_scale == 1.0:
++                        v_pred = flow_matcher(x_t, t_tensor, z_macro)
++                    else:
++                        # Classifier-Free Guidance (CFG)
++                        # 1. Compute conditional velocity
++                        v_cond = flow_matcher(x_t, t_tensor, z_macro)
++                        # 2. Compute unconditional velocity (z_macro = 0)
++                        z_uncond = torch.zeros_like(z_macro)
++                        v_uncond = flow_matcher(x_t, t_tensor, z_uncond)
++                        # 3. Extrapolate
++                        v_pred = v_uncond + args.cfg_scale * (v_cond - v_uncond)
++                
++                # Euler Step along the tangent
+                 x_t = x_t + v_pred * dt
++                # Re-project to stay strictly on the hypersphere
++                x_t = F.normalize(x_t, p=2, dim=-1) * emb_scale_factor
+                 
+             # 3. Project to vocab and compute accuracy
+             emb_weights = encoder.tok_emb.weight
+@@ -155,8 +179,19 @@ def evaluate(args):
+                 sent_len = sent_mask.sum().item()
+                 sent_correct = correct_mask[b].sum().item()
+                 total_sentences += 1
++                if sent_len > 0 and (sent_correct / sent_len) >= 0.60:
++                    good_match_sentences += 1
++                    if sent_correct < sent_len and len(good_match_examples) < 10:
++                        token_list = predicted_tokens[b][:int(sent_len)].tolist()
++                        decoded_str = tokenizer.decode(token_list)
++                        original_str = texts[b]
++                        good_match_examples.append((original_str, decoded_str, (sent_correct / sent_len) * 100))
+                 if sent_correct == sent_len:
+                     exact_match_sentences += 1
++                    # Decode to string (skip special tokens if you want, but they are exactly matched)
++                    token_list = predicted_tokens[b][:int(sent_len)].tolist()
++                    decoded_str = tokenizer.decode(token_list)
++                    perfect_match_strings.append(decoded_str)
+                     
+             # Compute cosine similarity between generated representation and X_1
+             dot_product = (x_t * X_1).sum(dim=-1) # (B, L)
+@@ -170,6 +205,7 @@ def evaluate(args):
+             
+     char_acc = (correct_chars / total_chars) * 100 if total_chars > 0 else 0
+     em_rate = (exact_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
++    good_rate = (good_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
+     avg_cos = (total_cosine_sim / cosine_count) if cosine_count > 0 else 0
+     
+     print("\n" + "="*50)
+@@ -182,11 +218,32 @@ def evaluate(args):
+     print(f"Avg Cosine Sim:   {avg_cos:.4f} (Closer to 1.0 is better)")
+     print(f"Char Accuracy:    {char_acc:.2f}% (Token-level matching)")
+     print(f"Sentence EM:      {em_rate:.2f}% (Entire sentence matching)")
++    print(f"Sentences (>=60%):{good_rate:.2f}% (Sentences with >= 60% char acc)")
+     print("="*50)
+-    print("\nStopping Criterion Reference:")
+-    print(" - Char Accuracy > 90% and Sentence EM > 50%: Model is fully converged and ready to stop.")
+-    print(" - If Char Accuracy plateaus for 1 Epoch: Can stop and proceed to Phase 2.")
++    print("="*50)
++    print("\n[Phase 2] Stopping Criterion Reference:")
++    print(" - Char Accuracy > 90% and Sentence EM > 50%: Flow Matcher is fully converged.")
++    print(" - Model is ready for downstream latent generation (Phase 3).")
+     print("="*50 + "\n")
++    
++    if perfect_match_strings:
++        print("\n" + "*"*50)
++        print("  🎉 Perfectly Reconstructed Sentences (Examples) ")
++        print("*"*50)
++        # Show up to 20 exact matches
++        for i, s in enumerate(perfect_match_strings[:20]):
++            print(f" {i+1}. {s}")
++        print("*"*50 + "\n")
++        
++    if good_match_examples:
++        print("\n" + "*"*50)
++        print("  🤔 Good Reconstructions (>=60% but <100%) ")
++        print("*"*50)
++        for i, (orig, recon, acc) in enumerate(good_match_examples):
++            print(f"--- Example {i+1} (Acc: {acc:.1f}%) ---")
++            print(f"Original: {orig}")
++            print(f"Reconstr: {recon}\n")
++        print("*"*50 + "\n")
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser(description="Evaluate Flow Matcher Reconstruction Accuracy (CUDA)")
+@@ -194,11 +251,8 @@ if __name__ == "__main__":
+     parser.add_argument("--flow_ckpt", type=str, required=True, help="Path to trained flow matcher PyTorch checkpoint")
+     parser.add_argument("--parquet_path", type=str, required=True, help="Path to evaluation dataset")
+     parser.add_argument("--num_samples", type=int, default=200, help="Number of samples to evaluate on")
+-    parser.add_argument("--steps", type=int, default=20, help="Integration steps")
+-    parser.add_argument("--max_seq_len", type=int, default=64)
+-    parser.add_argument("--d_model", type=int, default=512)
+-    parser.add_argument("--n_layers", type=int, default=6)
+-    parser.add_argument("--n_heads", type=int, default=8)
++    parser.add_argument("--steps", type=int, default=50, help="Integration steps")
++    parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-Free Guidance scale (1.0 means no guidance)")
+     
+     args = parser.parse_args()
+     evaluate(args)
+diff --git a/evals/eval_reconstruction_mlx.py b/evals/eval_reconstruction_mlx.py
+index 1f8aecd..5a4c22a 100644
+--- a/evals/eval_reconstruction_mlx.py
++++ b/evals/eval_reconstruction_mlx.py
+@@ -9,8 +9,8 @@ import mlx.core as mx
+ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+ 
+ from training.core.char_tokenizer import CharTokenizer
+-from distilled_emb.model import TinyCharEncoder
+-from model.pre_phase1_dit import NARFlowMatcher
++from model.phase1_charencoder import TinyCharEncoder
++from model.phase2_dit import NARFlowMatcher
+ 
+ def load_pt_checkpoint(pt_path):
+     import torch
+@@ -124,6 +124,9 @@ def evaluate(args):
+     correct_chars = 0
+     total_sentences = 0
+     exact_match_sentences = 0
++    good_match_sentences = 0
++    perfect_match_strings = []
++    good_match_examples = []
+     total_cosine_sim = 0.0
+     cosine_count = 0
+     
+@@ -155,14 +158,26 @@ def evaluate(args):
+         z_macro = encoder(enc_ids, attention_mask=enc_mask)
+         X_1 = encoder.tok_emb(target_ids)
+         
+-        # 2. ODE Solver (Euler Integration)
++        # 2. ODE Solver (Spherical Euler Integration)
+         x_t = mx.random.normal((B, max_seq_len, sniffed_x_dim))
++        x_t = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8) * emb_scale_factor
++        
+         dt = 1.0 / args.steps
+         for i in range(args.steps):
+             t_val = float(i) / args.steps
+             t_tensor = mx.array([t_val] * B)
+-            v_pred = flow_matcher(x_t, t_tensor, z_macro)
++            if args.cfg_scale == 1.0:
++                v_pred = flow_matcher(x_t, t_tensor, z_macro)
++            else:
++                v_cond = flow_matcher(x_t, t_tensor, z_macro)
++                z_uncond = mx.zeros_like(z_macro)
++                v_uncond = flow_matcher(x_t, t_tensor, z_uncond)
++                v_pred = v_uncond + args.cfg_scale * (v_cond - v_uncond)
++            
++            # Euler step
+             x_t = x_t + v_pred * dt
++            # Re-project to hypersphere
++            x_t = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8) * emb_scale_factor
+             
+         # 3. Project to vocab and compute accuracy
+         emb_weights = encoder.tok_emb.weight
+@@ -193,8 +208,16 @@ def evaluate(args):
+             correct_chars += s_corr
+             total_chars += s_len
+             total_sentences += 1
++            if s_len > 0 and (s_corr / s_len) >= 0.60:
++                good_match_sentences += 1
++                if s_corr < s_len and len(good_match_examples) < 10:
++                    token_list = predicted_tokens[b][:s_len].tolist()
++                    decoded_str = tokenizer.decode(token_list)
++                    original_str = texts[b]
++                    good_match_examples.append((original_str, decoded_str, (s_corr / s_len) * 100))
+             if s_corr == s_len:
+                 exact_match_sentences += 1
++                perfect_match_strings.append(texts[b])
+                 
+         # Compute cosine similarity
+         dot_product = (x_t * X_1).sum(axis=-1)
+@@ -212,6 +235,7 @@ def evaluate(args):
+ 
+     char_acc = (correct_chars / total_chars) * 100 if total_chars > 0 else 0
+     em_rate = (exact_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
++    good_rate = (good_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
+     avg_cos = (total_cosine_sim / cosine_count) if cosine_count > 0 else 0
+     
+     print("\n" + "="*50)
+@@ -224,7 +248,31 @@ def evaluate(args):
+     print(f"Avg Cosine Sim:   {avg_cos:.4f} (Closer to 1.0 is better)")
+     print(f"Char Accuracy:    {char_acc:.2f}% (Token-level matching)")
+     print(f"Sentence EM:      {em_rate:.2f}% (Entire sentence matching)")
++    print(f"Sentences (>=60%):{good_rate:.2f}% (Sentences with >= 60% char acc)")
+     print("="*50)
++    
++    if perfect_match_strings:
++        print("\n" + "*"*50)
++        print("  🎉 Perfectly Reconstructed Sentences (Examples) ")
++        print("*"*50)
++        for i, s in enumerate(perfect_match_strings[:20]):
++            print(f" {i+1}. {s}")
++        print("*"*50 + "\n")
++        
++    if good_match_examples:
++        print("\n" + "*"*50)
++        print("  🤔 Good Reconstructions (>=60% but <100%) ")
++        print("*"*50)
++        for i, (orig, recon, acc) in enumerate(good_match_examples):
++            print(f"--- Example {i+1} (Acc: {acc:.1f}%) ---")
++            print(f"Original: {orig}")
++            print(f"Reconstr: {recon}\n")
++        print("*"*50 + "\n")
++        
++    print("\n[Phase 2] Stopping Criterion Reference:")
++    print(" - Char Accuracy > 90% and Sentence EM > 50%: Flow Matcher is fully converged.")
++    print(" - Model is ready for downstream latent generation (Phase 3).")
++    print("="*50 + "\n")
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser(description="Evaluate Flow Matcher Reconstruction Accuracy (MLX)")
+@@ -233,6 +281,7 @@ if __name__ == "__main__":
+     parser.add_argument("--parquet_path", type=str, required=True, help="Path to evaluation dataset")
+     parser.add_argument("--num_samples", type=int, default=200, help="Number of samples to evaluate on")
+     parser.add_argument("--steps", type=int, default=20, help="Integration steps")
++    parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-Free Guidance scale")
+     parser.add_argument("--max_seq_len", type=int, default=64)
+     parser.add_argument("--d_model", type=int, default=512)
+     parser.add_argument("--n_layers", type=int, default=6)
+diff --git a/infer/pre_phase1_dit_cuda.py b/infer/pre_phase1_dit_cuda.py
+deleted file mode 100644
+index d8522da..0000000
+--- a/infer/pre_phase1_dit_cuda.py
++++ /dev/null
+@@ -1,193 +0,0 @@
+-import os
+-import sys
+-
+-# [BUG FIX]
+-# (1) Specific Problem: Running this inference script on servers via python command raises 
+-#     "ModuleNotFoundError: No module named 'training'" or similar because the workspace root is not in Python path.
+-# (2) Method to Resolve: Explicitly insert the parent directory of this script (workspace root) 
+-#     into the beginning of sys.path before importing local project packages (model, training, distilled_emb).
+-# (3) Caveats: Ensure any other newly created root-level script or nested script imports 
+-#     local packages using absolute workspace imports by executing this path resolution first.
+-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+-
+-import argparse
+-import torch
+-import torch.nn as nn
+-from training.core.char_tokenizer import CharTokenizer
+-from distilled_emb.model_cuda import TinyCharEncoderCUDA
+-from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
+-
+-def generate_flow_cuda(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0, decode_method="cosine", device="cuda"):
+-    encoder.eval()
+-    flow_matcher.eval()
+-    
+-    # 1. Encode prompt and pad to max_seq_len
+-    ids = tokenizer.encode(prompt, add_special_tokens=True)
+-    
+-    # Truncate and Pad to exactly max_seq_len
+-    seq_trunc = ids[:max_seq_len]
+-    pad_len = max_seq_len - len(seq_trunc)
+-    padded_seq = seq_trunc + [tokenizer.pad_token_id] * pad_len
+-    mask_list = [1] * len(seq_trunc) + [0] * pad_len
+-    
+-    input_ids = torch.tensor([padded_seq], dtype=torch.long, device=device)
+-    mask = torch.tensor([mask_list], dtype=torch.float32, device=device)
+-    
+-    # 2. Extract macro condition Z_macro (pooled sentence representation)
+-    with torch.no_grad():
+-        with torch.cuda.amp.autocast():
+-            z_macro = encoder(input_ids, attention_mask=mask) # (1, z_dim)
+-        
+-    # 3. Sample initial gaussian noise sequence X_0 (always use max_seq_len)
+-    x_dim = encoder.tok_emb.weight.shape[1] # e.g. 1024
+-    x_t = torch.randn((1, max_seq_len, x_dim), device=device)
+-    
+-    # 4. Integrate ODE trajectory using Euler method
+-    dt = 1.0 / steps
+-    for i in range(steps):
+-        t_val = float(i) / steps
+-        t_tensor = torch.tensor([t_val], device=device, dtype=torch.float32) # (1,)
+-        
+-        # Predict velocity field vector
+-        with torch.no_grad():
+-            with torch.cuda.amp.autocast():
+-                v_pred = flow_matcher(x_t, t_tensor, z_macro)
+-            
+-        # Euler Step
+-        x_t = x_t + v_pred * dt
+-        
+-    # 5. Project final sequence back to vocabulary space (using frozen tok_emb weights)
+-    # tok_emb.weight shape: (vocab_size, x_dim)
+-    emb_weights = encoder.tok_emb.weight
+-    
+-    # Scale x_t back down to the original embedding scale before projection
+-    x_t = x_t / scale_factor
+-    
+-    # Choose decoding method
+-    if decode_method == "cosine":
+-        # Cosine similarity for decoding
+-        import torch.nn.functional as F
+-        x_norm = F.normalize(x_t, p=2, dim=-1)
+-        emb_norm = F.normalize(emb_weights, p=2, dim=-1)
+-        # (1, L, D) @ (D, vocab_size) -> (1, L, vocab_size)
+-        logits = torch.matmul(x_norm, emb_norm.T)
+-    elif decode_method == "euclidean":
+-        # Euclidean distance using expansion: (a-b)^2 = a^2 + b^2 - 2ab
+-        # This avoids broadcasting a massive (1, L, vocab_size, D) intermediate tensor
+-        x_sq = torch.sum(x_t**2, dim=-1, keepdim=True) # (1, L, 1)
+-        emb_sq = torch.sum(emb_weights**2, dim=-1).unsqueeze(0).unsqueeze(0) # (1, 1, vocab_size)
+-        ab = torch.matmul(x_t, emb_weights.T) # (1, L, vocab_size)
+-        dist_sq = x_sq + emb_sq - 2 * ab # (1, L, vocab_size)
+-        logits = -dist_sq
+-    else:
+-        raise ValueError(f"Unknown decode_method: {decode_method}")
+-    
+-    # Decode argmax tokens
+-    predicted_tokens = torch.argmax(logits, dim=-1)[0].tolist()
+-    
+-    decoded_chars = []
+-    for token in predicted_tokens:
+-        if token == tokenizer.eos_token_id:
+-            break
+-        decoded_chars.append(tokenizer.decode([token]))
+-        
+-    return "".join(decoded_chars)
+-
+-def load_training_args(flow_ckpt_path):
+-    """
+-    Attempts to load training_args.json from the parent directory of the flow checkpoint.
+-    Returns a dictionary of found arguments or empty dict.
+-    """
+-    import json
+-    ckpt_dir = os.path.dirname(flow_ckpt_path)
+-    config_path = os.path.join(ckpt_dir, "training_args.json")
+-    if os.path.exists(config_path):
+-        try:
+-            with open(config_path, "r", encoding="utf-8") as f:
+-                config = json.load(f)
+-            print(f"Loaded companion training configuration from {config_path}")
+-            return config
+-        except Exception as e:
+-            print(f"Warning: Failed to parse training_args.json at {config_path}: {e}")
+-    return {}
+-
+-def get_args():
+-    parser = argparse.ArgumentParser(description="Sequence Flow Matcher Inference (CUDA/PyTorch)")
+-    parser.add_argument("--tinybert_ckpt", type=str, required=True, help="Path to frozen TinyCharEncoder weights")
+-    parser.add_argument("--flow_ckpt", type=str, required=True, help="Path to trained flow matcher PyTorch checkpoint")
+-    parser.add_argument("--prompt", type=str, default="今天天气真好，我们出去散步吧。", help="Prompt to test the reconstruction pipeline")
+-    parser.add_argument("--steps", type=int, default=20, help="Number of Euler integration steps")
+-    parser.add_argument("--max_seq_len", type=int, default=64)
+-    parser.add_argument("--d_model", type=int, default=512)
+-    parser.add_argument("--n_layers", type=int, default=6)
+-    parser.add_argument("--n_heads", type=int, default=8)
+-    parser.add_argument("--decode_method", type=str, default="cosine", choices=["cosine", "euclidean"], help="Method for decoding vectors back to discrete tokens")
+-    return parser.parse_args()
+-
+-def main():
+-    args = get_args()
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+-    tokenizer = CharTokenizer()
+-    
+-    # 1. Load TinyCharEncoder
+-    print(f"Loading TinyCharEncoderCUDA from {args.tinybert_ckpt}")
+-    if args.tinybert_ckpt.endswith(".safetensors"):
+-        from safetensors.torch import load_file
+-        weights = load_file(args.tinybert_ckpt)
+-    else:
+-        weights = torch.load(args.tinybert_ckpt, map_location='cpu', weights_only=True)
+-        
+-    sniffed_x_dim = weights['tok_emb.weight'].shape[1]
+-    sniffed_z_dim = weights['out_proj.weight'].shape[0]
+-    
+-    encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size, d_model=sniffed_x_dim, z_dim=sniffed_z_dim)
+-    encoder.load_state_dict(weights, strict=False)
+-    encoder.to(device).eval()
+-    
+-    # Auto-load hyperparams from companion training_args.json
+-    config = load_training_args(args.flow_ckpt)
+-    d_model = config.get("d_model", args.d_model)
+-    n_layers = config.get("n_layers", args.n_layers)
+-    n_heads = config.get("n_heads", args.n_heads)
+-    max_seq_len = config.get("max_seq_len", args.max_seq_len)
+-    
+-    emb_scale_factor = config.get("emb_scale_factor", 1.0)
+-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
+-    
+-    # 2. Instantiate Flow Matcher
+-    flow_matcher = NARFlowMatcherCUDA(
+-        z_dim=sniffed_z_dim,
+-        x_dim=sniffed_x_dim,
+-        d_model=d_model,
+-        n_layers=n_layers,
+-        n_heads=n_heads,
+-        max_seq_len=max_seq_len
+-    )
+-    
+-    print(f"Loading Flow Matcher weights from: {args.flow_ckpt}")
+-    checkpoint = torch.load(args.flow_ckpt, map_location='cpu')
+-    state_dict = checkpoint.get('model_state_dict', checkpoint)
+-    flow_matcher.load_state_dict(state_dict)
+-    flow_matcher.to(device).eval()
+-    
+-    print("\n--- Running CUDA Flow Matching Reconstruction Test ---")
+-    print(f"Original Text: {args.prompt}")
+-    print(f"Decode Method: {args.decode_method}")
+-    
+-    reconstructed = generate_flow_cuda(
+-        encoder=encoder,
+-        flow_matcher=flow_matcher,
+-        tokenizer=tokenizer,
+-        prompt=args.prompt,
+-        steps=args.steps,
+-        max_seq_len=max_seq_len,
+-        scale_factor=emb_scale_factor,
+-        decode_method=args.decode_method,
+-        device=device
+-    )
+-    
+-    print(f"Reconstructed: {reconstructed}")
+-    print("-------------------------------------------------")
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/infer/pre_phase1_dit_mlx.py b/infer/pre_phase1_dit_mlx.py
+deleted file mode 100644
+index 53bf339..0000000
+--- a/infer/pre_phase1_dit_mlx.py
++++ /dev/null
+@@ -1,232 +0,0 @@
+-import os
+-import sys
+-
+-# [BUG FIX]
+-# (1) Specific Problem: Running this inference script on servers/macs via python command raises 
+-#     "ModuleNotFoundError: No module named 'training'" or similar because the workspace root is not in Python path.
+-# (2) Method to Resolve: Explicitly insert the parent directory of this script (workspace root) 
+-#     into the beginning of sys.path before importing local project packages (model, training, distilled_emb).
+-# (3) Caveats: Ensure any other newly created root-level script or nested script imports 
+-#     local packages using absolute workspace imports by executing this path resolution first.
+-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+-
+-import argparse
+-import mlx.core as mx
+-import mlx.nn as nn
+-from training.core.char_tokenizer import CharTokenizer
+-from distilled_emb.model import TinyCharEncoder
+-from model.pre_phase1_dit import NARFlowMatcher
+-
+-def load_pt_checkpoint(pt_path):
+-    """
+-    Load PyTorch checkpoint state dict using torch CPU backend if available,
+-    and convert parameters to MLX arrays.
+-    """
+-    import torch
+-    print(f"Loading weights from PyTorch checkpoint: {pt_path}")
+-    checkpoint = torch.load(pt_path, map_location='cpu')
+-    state_dict = checkpoint.get('model_state_dict', checkpoint)
+-    
+-    mlx_params = {}
+-    for k, v in state_dict.items():
+-        if "attn.in_proj_weight" in k:
+-            q_w, k_w, v_w = v.chunk(3, dim=0)
+-            mlx_params[k.replace("attn.in_proj_weight", "attention.q_proj.weight")] = mx.array(q_w.numpy())
+-            mlx_params[k.replace("attn.in_proj_weight", "attention.k_proj.weight")] = mx.array(k_w.numpy())
+-            mlx_params[k.replace("attn.in_proj_weight", "attention.v_proj.weight")] = mx.array(v_w.numpy())
+-            continue
+-        elif "attn.in_proj_bias" in k:
+-            q_b, k_b, v_b = v.chunk(3, dim=0)
+-            mlx_params[k.replace("attn.in_proj_bias", "attention.q_proj.bias")] = mx.array(q_b.numpy())
+-            mlx_params[k.replace("attn.in_proj_bias", "attention.k_proj.bias")] = mx.array(k_b.numpy())
+-            mlx_params[k.replace("attn.in_proj_bias", "attention.v_proj.bias")] = mx.array(v_b.numpy())
+-            continue
+-        elif "attn.out_proj." in k:
+-            mlx_params[k.replace("attn.", "attention.")] = mx.array(v.numpy())
+-            continue
+-            
+-        arr = mx.array(v.detach().numpy())
+-        new_k = k
+-        new_k = new_k.replace("mlp.0.", "mlp.layers.0.")
+-        new_k = new_k.replace("mlp.2.", "mlp.layers.2.")
+-        new_k = new_k.replace("z_proj.0.", "z_proj.layers.0.")
+-        new_k = new_k.replace("z_proj.2.", "z_proj.layers.2.")
+-        
+-        mlx_params[new_k] = arr
+-        
+-    import mlx.utils as mu
+-    return mu.tree_unflatten(list(mlx_params.items()))
+-
+-def generate_flow(encoder, flow_matcher, tokenizer, prompt, steps=20, max_seq_len=64, scale_factor=1.0, decode_method="cosine"):
+-    """
+-    Instantly reconstructs sentence from raw text prompt by finding its Z_macro 
+-    and integrating the continuous flow from Gaussian noise.
+-    """
+-    # 1. Encode prompt
+-    ids = tokenizer.encode(prompt, add_special_tokens=True)
+-    L = len(ids)
+-    input_ids = mx.array([ids])
+-    mask = mx.array([[1] * L])
+-    
+-    # 2. Extract macro condition Z_macro (pooled sentence representation)
+-    z_macro = encoder(input_ids, attention_mask=mask) # (1, z_dim)
+-    
+-    # 3. Sample initial gaussian noise sequence X_0
+-    x_dim = encoder.tok_emb.weight.shape[1] # e.g. 1024
+-    x_t = mx.random.normal((1, L, x_dim))
+-    
+-    # 4. Integrate ODE trajectory using Euler method
+-    dt = 1.0 / steps
+-    for i in range(steps):
+-        t_val = float(i) / steps
+-        t_arr = mx.array([t_val]) # (1,)
+-        
+-        # Predict velocity field vector
+-        v_pred = flow_matcher(x_t, t_arr, z_macro)
+-        
+-        # Euler Step
+-        x_t = x_t + v_pred * dt
+-        
+-    # 5. Project final sequence back to vocabulary space (using frozen tok_emb weights)
+-    # tok_emb.weight shape: (vocab_size, x_dim)
+-    emb_weights = encoder.tok_emb.weight
+-    
+-    # Scale x_t back down to the original embedding scale before projection
+-    x_t = x_t / scale_factor
+-    
+-    # Choose decoding method
+-    if decode_method == "cosine":
+-        # Cosine similarity for decoding
+-        x_norm = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8)
+-        emb_norm = emb_weights / (mx.linalg.norm(emb_weights, axis=-1, keepdims=True) + 1e-8)
+-        # Pointwise cosine similarity: (1, L, vocab_size)
+-        logits = mx.matmul(x_norm, emb_norm.T)
+-    elif decode_method == "euclidean":
+-        # Euclidean distance using expansion: (a-b)^2 = a^2 + b^2 - 2ab
+-        # This avoids broadcasting a massive intermediate tensor
+-        x_sq = mx.sum(mx.square(x_t), axis=-1, keepdims=True) # (1, L, 1)
+-        emb_sq = mx.expand_dims(mx.expand_dims(mx.sum(mx.square(emb_weights), axis=-1), axis=0), axis=0) # (1, 1, vocab_size)
+-        ab = mx.matmul(x_t, emb_weights.T) # (1, L, vocab_size)
+-        dist_sq = x_sq + emb_sq - 2 * ab # (1, L, vocab_size)
+-        logits = -dist_sq
+-    else:
+-        raise ValueError(f"Unknown decode_method: {decode_method}")
+-    
+-    # Decode argmax tokens
+-    predicted_tokens = mx.argmax(logits, axis=-1)[0].tolist()
+-    
+-    decoded_chars = []
+-    for token in predicted_tokens:
+-        if token == tokenizer.eos_token_id:
+-            break
+-        decoded_chars.append(tokenizer.decode([token]))
+-        
+-    return "".join(decoded_chars)
+-
+-def load_training_args(flow_ckpt_path):
+-    """
+-    Attempts to load training_args.json from the parent directory of the flow checkpoint.
+-    Returns a dictionary of found arguments or empty dict.
+-    """
+-    import json
+-    ckpt_dir = os.path.dirname(flow_ckpt_path)
+-    config_path = os.path.join(ckpt_dir, "training_args.json")
+-    if os.path.exists(config_path):
+-        try:
+-            with open(config_path, "r", encoding="utf-8") as f:
+-                config = json.load(f)
+-            print(f"Loaded companion training configuration from {config_path}")
+-            return config
+-        except Exception as e:
+-            print(f"Warning: Failed to parse training_args.json at {config_path}: {e}")
+-    return {}
+-
+-def get_args():
+-    parser = argparse.ArgumentParser(description="Sequence Flow Matcher Local Inference (MLX)")
+-    parser.add_argument("--tinybert_ckpt", type=str, required=True, help="Path to frozen TinyCharEncoder weights")
+-    parser.add_argument("--flow_ckpt", type=str, required=True, help="Path to trained flow matcher PyTorch checkpoint")
+-    parser.add_argument("--prompt", type=str, default="今天天气真好，我们出去散步吧。", help="Prompt to test the reconstruction pipeline")
+-    parser.add_argument("--steps", type=int, default=20, help="Number of Euler integration steps")
+-    parser.add_argument("--max_seq_len", type=int, default=64)
+-    parser.add_argument("--d_model", type=int, default=512)
+-    parser.add_argument("--n_layers", type=int, default=6)
+-    parser.add_argument("--n_heads", type=int, default=8)
+-    return parser.parse_args()
+-
+-def main():
+-    args = get_args()
+-    tokenizer = CharTokenizer()
+-    
+-    # 1. Load TinyCharEncoder
+-    print(f"Loading TinyCharEncoder from {args.tinybert_ckpt}")
+-    if args.tinybert_ckpt.endswith(".safetensors"):
+-        encoder = TinyCharEncoder(vocab_size=tokenizer.vocab_size)
+-        encoder.load_weights(args.tinybert_ckpt)
+-    else:
+-        # Bridge PyTorch pt weights if needed
+-        import torch
+-        pt_weights = torch.load(args.tinybert_ckpt, map_location='cpu', weights_only=True)
+-        sniffed_x_dim = pt_weights['tok_emb.weight'].shape[1]
+-        sniffed_z_dim = pt_weights['out_proj.weight'].shape[0]
+-        encoder = TinyCharEncoder(vocab_size=tokenizer.vocab_size, d_model=sniffed_x_dim, z_dim=sniffed_z_dim)
+-        
+-        mlx_enc_params = {}
+-        for k, v in pt_weights.items():
+-            new_k = k
+-            if "layers." in new_k:
+-                new_k = new_k.replace(".q_proj.", ".attention.q_proj.")
+-                new_k = new_k.replace(".k_proj.", ".attention.k_proj.")
+-                new_k = new_k.replace(".v_proj.", ".attention.v_proj.")
+-                # the transformer layer has its own out_proj
+-        
+-    sniffed_x_dim = pt_weights['tok_emb.weight'].shape[1]
+-    sniffed_z_dim = pt_weights['out_proj.weight'].shape[0]
+-    
+-    encoder = TinyCharEncoder(vocab_size=tokenizer.vocab_size, d_model=sniffed_x_dim, z_dim=sniffed_z_dim)
+-    mlx_enc_params = convert_pt_to_mlx(pt_weights)
+-    encoder.update(mlx_enc_params)
+-    
+-    # 2. Auto-load hyperparams from companion training_args.json
+-    config = load_training_args(args.flow_ckpt)
+-    d_model = config.get("d_model", args.d_model)
+-    n_layers = config.get("n_layers", args.n_layers)
+-    n_heads = config.get("n_heads", args.n_heads)
+-    max_seq_len = config.get("max_seq_len", args.max_seq_len)
+-    
+-    emb_scale_factor = config.get("emb_scale_factor", 1.0)
+-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
+-    
+-    # 3. Instantiate Flow Matcher
+-    flow_matcher = NARFlowMatcher(
+-        z_dim=sniffed_z_dim,
+-        x_dim=sniffed_x_dim,
+-        d_model=d_model,
+-        n_layers=n_layers,
+-        n_heads=n_heads,
+-        max_seq_len=max_seq_len
+-    )
+-    
+-    print(f"Loading Flow Matcher weights from: {args.flow_ckpt}")
+-    mlx_flow_params = load_pt_checkpoint(args.flow_ckpt)
+-    flow_matcher.update(mlx_flow_params)
+-    
+-    print("\n--- Running MLX Flow Matching Reconstruction Test ---")
+-    print(f"Original Text: {args.prompt}")
+-    print(f"Decode Method: {args.decode_method}")
+-    
+-    reconstructed = generate_flow(
+-        encoder=encoder,
+-        flow_matcher=flow_matcher,
+-        tokenizer=tokenizer,
+-        prompt=args.prompt,
+-        steps=args.steps,
+-        max_seq_len=max_seq_len,
+-        scale_factor=emb_scale_factor,
+-        decode_method=args.decode_method
+-    )
+-    
+-    print(f"Reconstructed: {reconstructed}")
+-    print("-------------------------------------------------")
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/model/phase0_5_charencoder.py b/model/phase0_5_charencoder.py
+deleted file mode 100644
+index 0a201b3..0000000
+--- a/model/phase0_5_charencoder.py
++++ /dev/null
+@@ -1,61 +0,0 @@
+-import mlx.core as mx
+-import mlx.nn as nn
+-import math
+-
+-class TinyCharEncoder(nn.Module):
+-    """
+-    A lightweight, pure-native Text-to-Vector encoder.
+-    Distilled from the GodEncoder multi-view space.
+-    Upgraded: Uses RoPE (Rotary Position Embeddings) to allow infinite length extrapolation 
+-    without O(N^2) memory bloating during training!
+-    """
+-    def __init__(self, vocab_size: int, d_model: int = 1024, n_heads: int = 8, n_layers: int = 6, max_seq_len: int = 512, z_dim: int = 1024):
+-        super().__init__()
+-        
+-        self.tok_emb = nn.Embedding(vocab_size, d_model)
+-        
+-        # A custom symmetric encoder explicitly built with RoPE logic
+-        self.layers = [RoPETransformerLayer(d_model, n_heads) for _ in range(n_layers)]
+-        self.final_ln = nn.LayerNorm(d_model)
+-        
+-        # Final projection from inner transformer dimension to the absolute GodEncoder semantic space dimension
+-        self.out_proj = nn.Linear(d_model, z_dim)
+-        
+-    def __call__(self, x: mx.array, attention_mask: mx.array = None, return_seq: bool = False) -> mx.array:
+-        """
+-        x: (B, L)
+-        attention_mask: (B, L) where 1 is valid, 0 is pad
+-        """
+-        B, L = x.shape
+-        
+-        # Pure Token Embeddings (No Abs POS Emb!)
+-        h = self.tok_emb(x) # (B, L, d_model)
+-        
+-        # Create non-causal additive padding mask
+-        mask = None
+-        if attention_mask is not None:
+-            mask = mx.where(attention_mask[:, None, None, :] == 0, mx.array(-1e9), mx.array(0.0))
+-            
+-        # Pumping through the RoPE Stack
+-        for layer in self.layers:
+-            h = layer(h, mask)
+-            
+-        h = self.final_ln(h)
+-        
+-        if return_seq:
+-            return self.out_proj(h) # (B, L, z_dim)
+-        
+-        # Average Pooling (Masked) to extract the holistic sentence representation
+-        if attention_mask is not None:
+-            h_masked = h * attention_mask[:, :, None] # zero out padded positions
+-            # Safe division by sum
+-            h_pool = h_masked.sum(axis=1) / mx.maximum(attention_mask.sum(axis=1, keepdims=True), 1e-8)
+-        else:
+-            h_pool = h.mean(axis=1) # (B, d_model)
+-            
+-        # Project into the 1024-D Z_target space!
+-        z_pred = self.out_proj(h_pool) # (B, z_dim)
+-        
+-        return z_pred
+-
+-
+diff --git a/model/phase0_5_charencoder_cuda.py b/model/phase0_5_charencoder_cuda.py
+deleted file mode 100644
+index 3c39cc6..0000000
+--- a/model/phase0_5_charencoder_cuda.py
++++ /dev/null
+@@ -1,70 +0,0 @@
+-import torch
+-import torch.nn as nn
+-
+-class TinyCharEncoderCUDA(nn.Module):
+-    """
+-    The PyTorch Clone of the Teacher-Distilled Character Flow Encoder.
+-    Completely refactored for native CUDA performance, utilizing pure PyTorch primitives.
+-    """
+-    def __init__(self, vocab_size: int, d_model: int = 1024, n_heads: int = 8, n_layers: int = 6, max_seq_len: int = 512, z_dim: int = 1024):
+-        super().__init__()
+-        
+-        self.tok_emb = nn.Embedding(vocab_size, d_model)
+-        self.layers = nn.ModuleList([RoPETransformerLayerCUDA(d_model, n_heads) for _ in range(n_layers)])
+-        
+-        self.final_ln = nn.LayerNorm(d_model)
+-        self.out_proj = nn.Linear(d_model, z_dim)
+-        
+-        # Better initialization for embedding table
+-        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=d_model**-0.5)
+-
+-    def forward(self, x, attention_mask=None):
+-        h = self.tok_emb(x)
+-        
+-        for layer in self.layers:
+-            h = layer(h, attention_mask)
+-            
+-        h = self.final_ln(h)
+-        
+-        if attention_mask is not None:
+-            # attention_mask: (B, L) where 1 is valid, 0 is pad
+-            # Safely mask out padding without risking 0 * NaN = NaN propagation
+-            h_masked = torch.where(attention_mask.unsqueeze(-1) > 0, h, torch.zeros_like(h))
+-            
+-            # Safe avg pool
+-            sum_mask = attention_mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+-            h_pool = h_masked.sum(dim=1) / sum_mask
+-        else:
+-            h_pool = h.mean(dim=1)
+-            
+-        return self.out_proj(h_pool)
+-
+-def load_mlx_safetensors_into_torch(torch_module, safetensor_path):
+-    """
+-    Seamlessly loads an MLX-generated safetensors file into a PyTorch nn.Module.
+-    MLX and PyTorch nn.Linear weight shapes identically map to (out_features, in_features).
+-    """
+-    from safetensors.torch import load_file
+-    state_dict = load_file(safetensor_path)
+-    target_keys = set(torch_module.state_dict().keys())
+-    remapped = {}
+-    for k, v in state_dict.items():
+-        new_k = k
+-        new_k = new_k.replace(".net.layers.0.", ".fc1.")
+-        new_k = new_k.replace(".net.layers.2.", ".fc2.")
+-        new_k = new_k.replace("net.layers.0.", "fc1.")
+-        new_k = new_k.replace("net.layers.2.", "fc2.")
+-        new_k = new_k.replace(".norm.", ".norm.") # Unchanged, just to be explicit
+-        remapped[new_k] = v
+-    state_dict = remapped
+-    # Add support for WeakDecoder if any key needs remapping (it perfectly matches)
+-    for k in list(state_dict.keys()):
+-        if k.endswith('.wq.weight'):
+-            state_dict[k.replace('.wq.', '.query_proj.')] = state_dict.pop(k)
+-        elif k.endswith('.wk.weight'):
+-            state_dict[k.replace('.wk.', '.key_proj.')] = state_dict.pop(k)
+-        elif k.endswith('.wv.weight'):
+-            state_dict[k.replace('.wv.', '.value_proj.')] = state_dict.pop(k)
+-        elif k.endswith('.wo.weight'):
+-            state_dict[k.replace('.wo.', '.out_proj.')] = state_dict.pop(k)
+-
+diff --git a/model/pre_phase1_dit.py b/model/pre_phase1_dit.py
+deleted file mode 100644
+index 8b857f0..0000000
+--- a/model/pre_phase1_dit.py
++++ /dev/null
+@@ -1,165 +0,0 @@
+-import mlx.core as mx
+-import mlx.nn as nn
+-import math
+-
+-class TimestepEmbedder(nn.Module):
+-    """
+-    Embeds scalar timesteps into vector representations in MLX.
+-    """
+-    def __init__(self, hidden_size, frequency_embedding_size=256):
+-        super().__init__()
+-        self.mlp = nn.Sequential(
+-            nn.Linear(frequency_embedding_size, hidden_size),
+-            nn.SiLU(),
+-            nn.Linear(hidden_size, hidden_size)
+-        )
+-        self.frequency_embedding_size = frequency_embedding_size
+-
+-    def timestep_embedding(self, t, dim, max_period=10000):
+-        # Scale continuous t in [0,1] to [0, 1000] to give the sinusoidal embeddings proper high-frequency resolution.
+-        # Otherwise, for t in [0, 1], the arguments to sin/cos never even complete a single period!
+-        t_scaled = t * 1000.0
+-        
+-        half = dim // 2
+-        freqs = mx.exp(-math.log(max_period) * mx.arange(0, half, dtype=mx.float32) / half)
+-        if len(t_scaled.shape) == 1:
+-            t_scaled = mx.expand_dims(t_scaled, axis=1)
+-        args = t_scaled * freqs
+-        embedding = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
+-        if dim % 2 == 1:
+-            embedding = mx.concatenate([embedding, mx.zeros((t.shape[0], 1))], axis=-1)
+-        return embedding
+-
+-    def __call__(self, t):
+-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+-        return self.mlp(t_freq)
+-
+-
+-class MultiHeadAttention(nn.Module):
+-    """
+-    Standard Multi-Head Attention without RoPE, specifically for sequence flow matching.
+-    """
+-    def __init__(self, d_model: int, n_heads: int):
+-        super().__init__()
+-        self.n_heads = n_heads
+-        self.d_head = d_model // n_heads
+-        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+-        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+-        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+-
+-    def __call__(self, x: mx.array, mask: mx.array = None):
+-        B, L, _ = x.shape
+-        q = self.q_proj(x).reshape(B, L, self.n_heads, self.d_head)
+-        k = self.k_proj(x).reshape(B, L, self.n_heads, self.d_head)
+-        v = self.v_proj(x).reshape(B, L, self.n_heads, self.d_head)
+-        
+-        q = q.transpose(0, 2, 1, 3) # (B, H, L, D)
+-        k = k.transpose(0, 2, 1, 3)
+-        v = v.transpose(0, 2, 1, 3)
+-        
+-        out = mx.fast.scaled_dot_product_attention(
+-            q, k, v,
+-            scale=1.0 / (self.d_head ** 0.5),
+-            mask=mask
+-        )
+-        
+-        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+-        return self.out_proj(out)
+-
+-
+-class AdaLNTransformerLayer(nn.Module):
+-    """
+-    Transformer layer with Adaptive Layer Normalization (AdaLN) in MLX.
+-    """
+-    def __init__(self, d_model: int, n_heads: int, dim_cond: int):
+-        super().__init__()
+-        self.attention = MultiHeadAttention(d_model, n_heads)
+-        self.ln1 = nn.LayerNorm(d_model)
+-        self.ln2 = nn.LayerNorm(d_model)
+-        
+-        self.mlp = nn.Sequential(
+-            nn.Linear(d_model, d_model * 4),
+-            nn.GELU(),
+-            nn.Linear(d_model * 4, d_model)
+-        )
+-        
+-        self.cond_proj = nn.Linear(dim_cond, d_model * 6)
+-        
+-    def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
+-        ada_params = self.cond_proj(cond) # (B, d_model * 6)
+-        ada_params = mx.expand_dims(ada_params, axis=1) # (B, 1, d_model * 6)
+-        
+-        splits = mx.split(ada_params, 6, axis=-1)
+-        scale_a, shift_a, gate_a, scale_m, shift_m, gate_m = splits
+-        
+-        # Attention block with AdaLN
+-        x_norm = self.ln1(x)
+-        x_mod = x_norm * (1.0 + scale_a) + shift_a
+-        attn_out = self.attention(x_mod)
+-        x = x + gate_a * attn_out
+-        
+-        # MLP block with AdaLN
+-        x_norm2 = self.ln2(x)
+-        x_mod2 = x_norm2 * (1.0 + scale_m) + shift_m
+-        mlp_out = self.mlp(x_mod2)
+-        x = x + gate_m * mlp_out
+-        
+-        return x
+-
+-
+-class NARFlowMatcher(nn.Module):
+-    """
+-    Conditional Sequence Flow Matcher (MLX Version).
+-    """
+-    def __init__(self, z_dim: int, x_dim: int, d_model: int = 512, n_layers: int = 6, n_heads: int = 8, max_seq_len: int = 64):
+-        super().__init__()
+-        self.z_dim = z_dim
+-        self.x_dim = x_dim
+-        self.max_seq_len = max_seq_len
+-        self.d_model = d_model
+-        
+-        # Map input features to d_model if dimensions don't match
+-        self.in_proj = nn.Linear(x_dim, d_model) if x_dim != d_model else nn.Identity()
+-        self.out_proj = nn.Linear(d_model, x_dim) if x_dim != d_model else nn.Identity()
+-        
+-        # Condition embeddings
+-        self.t_embedder = TimestepEmbedder(d_model)
+-        self.z_proj = nn.Sequential(
+-            nn.Linear(z_dim, d_model),
+-            nn.SiLU(),
+-            nn.Linear(d_model, d_model)
+-        )
+-        
+-        # Absolute position embeddings
+-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+-        
+-        # Transformer Layer Stack
+-        self.layers = [
+-            AdaLNTransformerLayer(d_model, n_heads, d_model) for _ in range(n_layers)
+-        ]
+-        self.final_ln = nn.LayerNorm(d_model)
+-        
+-    def __call__(self, x_t: mx.array, t: mx.array, z_macro: mx.array) -> mx.array:
+-        """
+-        x_t: (B, L, x_dim)
+-        t: (B,)
+-        z_macro: (B, z_dim)
+-        """
+-        B, L, _ = x_t.shape
+-        
+-        h = self.in_proj(x_t) # (B, L, d_model)
+-        
+-        positions = mx.arange(L)[None, :] # (1, L)
+-        h = h + self.pos_emb(positions) # (B, L, d_model)
+-        
+-        t_emb = self.t_embedder(t) # (B, d_model)
+-        z_emb = self.z_proj(z_macro) # (B, d_model)
+-        cond = t_emb + z_emb # (B, d_model)
+-        
+-        for layer in self.layers:
+-            h = layer(h, cond)
+-            
+-        h = self.final_ln(h)
+-        v_pred = self.out_proj(h) # (B, L, x_dim)
+-        return v_pred
+diff --git a/model/pre_phase1_dit_cuda.py b/model/pre_phase1_dit_cuda.py
+deleted file mode 100644
+index 4d2bb00..0000000
+--- a/model/pre_phase1_dit_cuda.py
++++ /dev/null
+@@ -1,148 +0,0 @@
+-import torch
+-import torch.nn as nn
+-import torch.nn.functional as F
+-import math
+-
+-class TimestepEmbedder(nn.Module):
+-    """
+-    Embeds scalar timesteps into vector representations.
+-    """
+-    def __init__(self, hidden_size, frequency_embedding_size=256):
+-        super().__init__()
+-        self.mlp = nn.Sequential(
+-            nn.Linear(frequency_embedding_size, hidden_size),
+-            nn.SiLU(),
+-            nn.Linear(hidden_size, hidden_size),
+-        )
+-        self.frequency_embedding_size = frequency_embedding_size
+-
+-    @staticmethod
+-    def timestep_embedding(t, dim, max_period=10000):
+-        # Scale continuous t in [0,1] to [0, 1000] to give the sinusoidal embeddings proper high-frequency resolution.
+-        # Otherwise, for t in [0, 1], the arguments to sin/cos never even complete a single period!
+-        t_scaled = t * 1000.0
+-        
+-        half = dim // 2
+-        freqs = torch.exp(
+-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+-        )
+-        args = t_scaled.unsqueeze(1) * freqs.unsqueeze(0)
+-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+-        if dim % 2 == 1:
+-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+-        return embedding
+-
+-    def forward(self, t):
+-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+-        return self.mlp(t_freq)
+-
+-
+-class AdaLNTransformerLayerCUDA(nn.Module):
+-    """
+-    Transformer layer with Adaptive Layer Normalization (AdaLN) modulation.
+-    Uses PyTorch's native scaled_dot_product_attention (FlashAttention on CUDA).
+-    """
+-    def __init__(self, d_model, n_heads, dim_cond):
+-        super().__init__()
+-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+-        self.ln1 = nn.LayerNorm(d_model, elementwise_affine=False)
+-        self.ln2 = nn.LayerNorm(d_model, elementwise_affine=False)
+-        
+-        self.mlp = nn.Sequential(
+-            nn.Linear(d_model, d_model * 4),
+-            nn.GELU(),
+-            nn.Linear(d_model * 4, d_model)
+-        )
+-        
+-        # AdaLN parameter projection: predicts scale, shift, gate for both attention and MLP
+-        self.cond_proj = nn.Linear(dim_cond, d_model * 6)
+-        
+-        # Initialize cond_proj to zeros so that the network starts as an identity block
+-        nn.init.zeros_(self.cond_proj.weight)
+-        nn.init.zeros_(self.cond_proj.bias)
+-
+-    def forward(self, x, cond):
+-        # x: (B, L, d_model)
+-        # cond: (B, dim_cond)
+-        ada_params = self.cond_proj(cond) # (B, d_model * 6)
+-        ada_params = ada_params.unsqueeze(1) # (B, 1, d_model * 6)
+-        scale_a, shift_a, gate_a, scale_m, shift_m, gate_m = torch.chunk(ada_params, 6, dim=-1)
+-        
+-        # Self-Attention Block with AdaLN
+-        x_norm = self.ln1(x)
+-        x_mod = x_norm * (1 + scale_a) + shift_a
+-        attn_out, _ = self.attn(x_mod, x_mod, x_mod)
+-        x = x + gate_a * attn_out
+-        
+-        # MLP Block with AdaLN
+-        x_norm2 = self.ln2(x)
+-        x_mod2 = x_norm2 * (1 + scale_m) + shift_m
+-        mlp_out = self.mlp(x_mod2)
+-        x = x + gate_m * mlp_out
+-        
+-        return x
+-
+-
+-class NARFlowMatcherCUDA(nn.Module):
+-    """
+-    Conditional Sequence Flow Matcher (PyTorch CUDA Version).
+-    Predicts the vector field v_t given intermediate flow state X_t, timestep t, and macro condition Z_macro.
+-    """
+-    def __init__(self, z_dim: int, x_dim: int, d_model: int = 512, n_layers: int = 6, n_heads: int = 8, max_seq_len: int = 64):
+-        super().__init__()
+-        self.z_dim = z_dim
+-        self.x_dim = x_dim # e.g. 1024, matching TinyCharEncoder's tok_emb dimension
+-        self.max_seq_len = max_seq_len
+-        self.d_model = d_model
+-        
+-        # Map input features to d_model if dimensions don't match
+-        self.in_proj = nn.Linear(x_dim, d_model) if x_dim != d_model else nn.Identity()
+-        self.out_proj = nn.Linear(d_model, x_dim) if x_dim != d_model else nn.Identity()
+-        
+-        # Condition embeddings
+-        self.t_embedder = TimestepEmbedder(d_model)
+-        self.z_proj = nn.Sequential(
+-            nn.Linear(z_dim, d_model),
+-            nn.SiLU(),
+-            nn.Linear(d_model, d_model)
+-        )
+-        
+-        # Absolute position embeddings
+-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+-        
+-        # Transformer Layer Stack
+-        self.layers = nn.ModuleList([
+-            AdaLNTransformerLayerCUDA(d_model, n_heads, d_model) for _ in range(n_layers)
+-        ])
+-        self.final_ln = nn.LayerNorm(d_model)
+-        
+-    def forward(self, x_t, t, z_macro):
+-        """
+-        x_t: (B, L, x_dim) - intermediate flow state
+-        t: (B,) - scalar flow timesteps
+-        z_macro: (B, z_dim) - global macro condition
+-        Returns: Predicted vector field v_t (B, L, x_dim)
+-        """
+-        B, L, _ = x_t.shape
+-        
+-        # 1. Project input sequence to hidden dimension
+-        h = self.in_proj(x_t) # (B, L, d_model)
+-        
+-        # 2. Add position embeddings
+-        positions = torch.arange(L, device=x_t.device).unsqueeze(0) # (1, L)
+-        h = h + self.pos_emb(positions) # (B, L, d_model)
+-        
+-        # 3. Compute global condition vector
+-        t_emb = self.t_embedder(t) # (B, d_model)
+-        z_emb = self.z_proj(z_macro) # (B, d_model)
+-        cond = t_emb + z_emb # (B, d_model)
+-        
+-        # 4. Process through Transformer layers
+-        for layer in self.layers:
+-            h = layer(h, cond)
+-            
+-        h = self.final_ln(h)
+-        
+-        # 5. Project back to output dimension
+-        v_pred = self.out_proj(h) # (B, L, x_dim)
+-        return v_pred
+Submodule training/core contains modified content
+diff --git a/training/core/args.py b/training/core/args.py
+index b8dfbce..2647c89 100644
+--- a/training/core/args.py
++++ b/training/core/args.py
+@@ -33,4 +33,11 @@ def get_training_parser(description: str = "Training Script"):
+     parser.add_argument("--snap_ce_weight", type=float, default=0.1, help="Weight for snap cross-entropy loss (0=disabled)")
+     parser.add_argument("--t_power", type=float, default=0.5, help="Power for high-t sampling bias (1.0=uniform, 0.5=sqrt bias)")
+     
++    # Concept Decoder Specific
++    parser.add_argument("--noise_min", type=float, default=0.01, help="Minimum noise scale added to concept cloud during training")
++    parser.add_argument("--noise_max", type=float, default=0.2, help="Maximum noise scale added to concept cloud during training")
++    parser.add_argument("--cpu_batch_size", type=int, default=256, help="Documents per super-batch")
++    
++    parser.add_argument("--seq_len", type=int, default=512, help="Fixed sequence length for training and chunking dataset samples")
++    parser.add_argument("--num_concept_blocks", type=int, default=10, help="Number of highest-resonance concept blocks to retain as anchors")
+     return parser
+diff --git a/training/core/checkpoint.py b/training/core/checkpoint.py
+index c3c2847..9835adc 100644
+--- a/training/core/checkpoint.py
++++ b/training/core/checkpoint.py
+@@ -5,6 +5,33 @@ import sys
+ import argparse
+ from typing import Dict, Any
+ 
++
++
++class ResumedDataLoader:
++    """Wraps a dataloader to transparently skip a specified number of batches and maintain __len__."""
++    def __init__(self, dataloader, skip_steps):
++        self.dataloader = dataloader
++        self.skip_steps = skip_steps
++
++    def __iter__(self):
++        it = iter(self.dataloader)
++        for _ in range(self.skip_steps):
++            try:
++                next(it)
++            except StopIteration:
++                break
++        return it
++
++    def __len__(self):
++        # We return the original length so tqdm displays correctly, 
++        # though ideally it could be max(0, len(self.dataloader) - self.skip_steps)
++        # Keeping original length keeps global epoch math consistent in some scripts.
++        return len(self.dataloader)
++
++    def set_epoch(self, epoch):
++        if hasattr(self.dataloader, 'sampler') and hasattr(self.dataloader.sampler, 'set_epoch'):
++            self.dataloader.sampler.set_epoch(epoch)
++
+ class Checkpointer:
+     """
+     A unified checkpointer that manages saving/loading Model weights and Dataloader states.
+@@ -45,6 +72,10 @@ class Checkpointer:
+         
+     def register_args(self, args: argparse.Namespace):
+         """Register parsed CLI arguments to be saved inside the checkpoint."""
++        if hasattr(args, 'seed') and args.seed is None:
++            import time
++            args.seed = int(time.time() * 1000) % 1000000
++            print(f"No seed provided. Auto-generated fresh random seed: {args.seed}")
+         self._args = args
+ 
+     def _setup_signals(self):
+@@ -57,7 +88,7 @@ class Checkpointer:
+ 
+     def save(self, step: int, is_emergency: bool = False):
+         """Saves registered models and dataloaders."""
+-        base_name = "latest_emergency" if is_emergency else f"step_{step}"
++        base_name = f"step_{step}_emergency" if is_emergency else f"step_{step}"
+         folder_name = f"{self.prefix}_{base_name}" if self.prefix else base_name
+         save_path = os.path.join(self.out_dir, folder_name)
+         
+@@ -86,6 +117,11 @@ class Checkpointer:
+                 except ImportError:
+                     print(f"Warning: Model {name} looks like PyTorch but torch is not installed.")
+                     
++            # Check if model has a get_config method to save its architecture parameters
++            if hasattr(model, "get_config"):
++                with open(f"{save_path}/{name}_config.json", "w") as f:
++                    json.dump(model.get_config(), f, indent=4)
++                    
+         # Save optimizers
+         if self._optimizers:
+             import mlx.core as mx
+@@ -135,10 +171,6 @@ class Checkpointer:
+             if not os.path.isdir(d_path):
+                 continue
+                 
+-            # Don't delete emergency saves automatically
+-            if "latest_emergency" in d:
+-                continue
+-                
+             # Match current prefix
+             if self.prefix and self.prefix != "TIMESTAMP":
+                 if not d.startswith(f"{self.prefix}_step_"):
+@@ -148,13 +180,13 @@ class Checkpointer:
+                 # Parse step
+                 step = -1
+                 if "_step_" in d:
+-                    parts = d.split("_step_")
+-                    if len(parts) == 2 and parts[1].isdigit():
+-                        step = int(parts[1])
+-                elif d.startswith("step_"):
+-                    parts = d.split("step_")
+-                    if len(parts) == 2 and parts[1].isdigit():
+-                        step = int(parts[1])
++                    step_str = d.split("_step_")[1]
++                else:
++                    step_str = d.split("step_")[1]
++                
++                step_str = step_str.replace("_emergency", "")
++                if step_str.isdigit():
++                    step = int(step_str)
+                         
+                 if step != -1:
+                     saved_ckpts.append((step, d_path))
+@@ -171,11 +203,10 @@ class Checkpointer:
+                 except Exception as e:
+                     print(f"  -> [GC] Failed to remove {path}: {e}")
+             
+-    def load_latest(self) -> int:
+-        """Automatically finds the checkpoint with the highest global_step."""
++    def get_latest_checkpoint_path(self) -> str:
++        """Finds the path to the checkpoint with the highest global_step."""
+         if not os.path.exists(self.out_dir):
+-            print(f"No existing checkpoints found in {self.out_dir}. Starting fresh.")
+-            return 0
++            return None
+             
+         latest_dir = None
+         max_step = -1
+@@ -204,24 +235,18 @@ class Checkpointer:
+                         except:
+                             pass
+                             
+-                # Fallback to folder name parsing if JSON parsing failed
+                 if step == -1:
+-                    if "_step_" in d:
+-                        parts = d.split("_step_")
+-                        if len(parts) == 2 and parts[1].isdigit():
+-                            step = int(parts[1])
+-                    elif d.startswith("step_"):
+-                        parts = d.split("step_")
+-                        if len(parts) == 2 and parts[1].isdigit():
+-                            step = int(parts[1])
++                    import re
++                    m = re.search(r'step_(\d+)', d)
++                    if m:
++                        step = int(m.group(1))
+                         
+                 if step > max_step:
+                     max_step = step
+                     latest_dir = d
+                     
+         if not latest_dir:
+-            print(f"No valid checkpoints found in {self.out_dir}. Starting fresh.")
+-            return 0
++            return None
+             
+         # Extract the prefix to continue seamlessly
+         if latest_dir.endswith("latest_emergency"):
+@@ -236,8 +261,81 @@ class Checkpointer:
+                 self.prefix = latest_dir.split("_step_")[0]
+                 
+         print(f"Auto-resume overriding future saves to use prefix: '{self.prefix}' (Extracted from {latest_dir})")
+-        load_path = os.path.join(self.out_dir, latest_dir)
++        return os.path.join(self.out_dir, latest_dir)
++
++    def load_latest(self) -> int:
++        """Automatically finds and loads the checkpoint with the highest global_step."""
++        load_path = self.get_latest_checkpoint_path()
++        if not load_path:
++            print(f"No valid checkpoints found in {self.out_dir}. Starting fresh.")
++            return 0
+         return self.load(load_path)
++        
++    def load_args(self, load_path: str, current_args: argparse.Namespace) -> argparse.Namespace:
++        """
++        Loads training_args.json from the checkpoint and overrides current_args.
++        Prints a warning for any arguments that were modified to match the checkpoint.
++        """
++        args_file = os.path.join(load_path, "training_args.json")
++        if not os.path.exists(args_file):
++            print(f"Warning: No training_args.json found in {load_path}. Proceeding with command line args.")
++            return current_args
++            
++        with open(args_file, "r") as f:
++            saved_args_dict = json.load(f)
++            
++        current_args_dict = vars(current_args)
++        
++        # Parse raw sys.argv to find which arguments were explicitly provided by the user
++        import sys
++        explicit_args = set()
++        for arg in sys.argv[1:]:
++            if arg.startswith("--"):
++                explicit_args.add(arg[2:].split('=')[0])
++                
++        overridden_keys = []
++        preserved_keys = []
++        rejected_keys = []
++        
++        # Define arguments that are STRICTLY tied to model architecture or dataset shape
++        # These CANNOT be changed during resume.
++        STRICT_MODEL_ARGS = {"embed_dim", "hidden_dim", "num_layers", "num_heads", "max_len", "seq_len", "z_dim", "tokenizer_id"}
++        
++        for k, v in saved_args_dict.items():
++            if k in current_args_dict and current_args_dict[k] != v:
++                if k in explicit_args:
++                    if k in STRICT_MODEL_ARGS:
++                        # Reject user's attempt to override a strict model parameter during resume
++                        rejected_keys.append(f"{k}: user requested {current_args_dict[k]}, but forced to keep saved {v}")
++                        current_args_dict[k] = v
++                    else:
++                        # Allow user to override training hyperparameters (lr, batch_size, global_attention_ratio, etc)
++                        preserved_keys.append(f"{k}: {v} (saved) -> {current_args_dict[k]} (CLI override)")
++                else:
++                    overridden_keys.append(f"{k}: {current_args_dict[k]} (default) -> {v} (saved)")
++                    current_args_dict[k] = v
++                    
++        if overridden_keys:
++            print("Restored the following arguments from checkpoint (defaults):")
++            for msg in overridden_keys:
++                print(f"  {msg}")
++                
++        if preserved_keys:
++            print("Preserved the following command-line training arguments (overriding checkpoint):")
++            for msg in preserved_keys:
++                print(f"  {msg}")
++                
++        if rejected_keys:
++            print("WARNING: Rejected attempt to change STRICT model parameters during resume:")
++            for msg in rejected_keys:
++                print(f"  {msg}")
++                
++        if overridden_keys:
++            print(f" [WARNING] The following arguments were OVERRIDDEN to match the checkpoint:")
++            for msg in overridden_keys:
++                print(f"   - {msg}")
++                
++        return current_args
+             
+     def load(self, load_path: str) -> int:
+         """Loads registered models and dataloaders, returning the resumed global_step."""
+@@ -295,3 +393,53 @@ class Checkpointer:
+                 
+         self.current_step = step
+         return step
++
++
++    def get_skip_steps(self, resumed_step: int, dataloader_len: int) -> int:
++        """
++        Calculates how many batches to skip in the current epoch when resuming.
++        """
++        if dataloader_len == 0:
++            return 0
++        return resumed_step % dataloader_len
++
++    def setup_epoch_seed(self, epoch: int, base_seed: int = None):
++        """
++        Sets deterministic pseudo-random seeds for the current epoch to ensure reproducible dataloader shuffling.
++        If base_seed is None, falls back to 42.
++        """
++        try:
++            import mlx.core as mx
++        except ImportError:
++            mx = None
++        import numpy as np
++        import torch
++        import random
++        
++        epoch_seed = (base_seed if base_seed is not None else 42) + epoch
++        
++        if mx is not None:
++            mx.random.seed(epoch_seed)
++        np.random.seed(epoch_seed)
++        torch.manual_seed(epoch_seed)
++        random.seed(epoch_seed)
++        print(f"Set epoch deterministic seed to {epoch_seed}")
++
++    def wrap_dataloader(self, dataloader, epoch: int, global_step: int):
++        """
++        Sets the seed for the epoch and returns a wrapped dataloader that automatically skips 
++        the already processed batches if resuming mid-epoch.
++        """
++        base_seed = self._args.seed if hasattr(self._args, 'seed') else None
++        self.setup_epoch_seed(epoch, base_seed)
++        
++        # Only skip if we are on the exact start_epoch that we resumed from
++        start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
++        skip_steps = 0
++        if epoch == start_epoch:
++            skip_steps = self.get_skip_steps(global_step, len(dataloader))
++            
++        if skip_steps > 0:
++            print(f"Checkpointer: Auto-skipping first {skip_steps} batches of Epoch {epoch+1}")
++            return ResumedDataLoader(dataloader, skip_steps)
++        return dataloader
+diff --git a/training/core/dataloader.py b/training/core/dataloader.py
+deleted file mode 100644
+index c5533d6..0000000
+--- a/training/core/dataloader.py
++++ /dev/null
+@@ -1,715 +0,0 @@
+-import numpy as np
+-import pandas as pd
+-
+-import json
+-import os
+-import glob
+-import re
+-import queue
+-import threading
+-from typing import List, Tuple, Dict, Any
+-
+-class MultiEmbDataLoader:
+-    """
+-    Dataloader that handles:
+-    1. Reading text chunks from Parquet (in-memory, fast enough for 7M strings).
+-    2. Zero-copy / mmap loading of 4 massive .npy embedding files.
+-    3. Dynamic tokenization & padding.
+-    4. Interrupt / Resume Checkpointing (Saving the exact shuffled order).
+-    """
+-    def __init__(self, 
+-                 parquet_path: str,
+-                 emb_paths: List[str],
+-                 tokenizer,
+-                 batch_size: int = 256,
+-                 max_seq_len: int = 512,
+-                 shuffle: bool = True,
+-                 seed: int = 42,
+-                 backend: str = 'mlx'):
+-        
+-        self.backend = backend
+-        
+-        self.batch_size = batch_size
+-        self.max_seq_len = max_seq_len
+-        self.shuffle = shuffle
+-        self.seed = seed if seed is not None else int(__import__("time").time())
+-        self.tokenizer = tokenizer
+-        
+-        # 1. Load Text Data
+-        print(f"Loading Text Parquet from {parquet_path}...")
+-        df = pd.read_parquet(parquet_path)
+-        # Explode the lists of chunks into a flat list of 7.6M strings
+-        # dropna() just in case
+-        self.text_chunks = df['chunks'].explode().dropna().tolist()
+-        self.total_samples = len(self.text_chunks)
+-        print(f"Loaded {self.total_samples} text chunks into memory.")
+-        del df # free up memory of the original dataframe
+-        
+-        # 2. Memory-Map the Numpy Embeddings
+-        print("Memory-mapping embedding arrays...")
+-        self.embs = []
+-        for path in emb_paths:
+-            # mmap_mode='r' completely avoids loading the massive files into RAM
+-            arr = np.load(path, mmap_mode='r')
+-            assert arr.shape[0] == self.total_samples, f"Shape mismatch in {path}: {arr.shape[0]} != {self.total_samples}"
+-            self.embs.append(arr)
+-            
+-        print("Embeddings mapped successfully.")
+-        
+-        # 3. Epoch & Batch tracking
+-        self.rng = np.random.default_rng(seed)
+-        self.current_epoch = 0
+-        self.batch_idx = 0
+-        self.indices = np.arange(self.total_samples)
+-        
+-        if self.shuffle:
+-            self.rng.shuffle(self.indices)
+-            
+-        self.num_batches = int(np.ceil(self.total_samples / self.batch_size))
+-        
+-    def __iter__(self):
+-        return self
+-        
+-    def __next__(self) -> Tuple[Any, List[Any], Any]:
+-        if self.batch_idx >= self.num_batches:
+-            # End of Epoch
+-            self.current_epoch += 1
+-            self.batch_idx = 0
+-            if self.shuffle:
+-                self.rng.shuffle(self.indices)
+-            raise StopIteration
+-            
+-        start_idx = self.batch_idx * self.batch_size
+-        end_idx = min(start_idx + self.batch_size, self.total_samples)
+-        
+-        batch_indices = self.indices[start_idx:end_idx]
+-        
+-        # 1. Fetch Texts
+-        batch_texts = [self.text_chunks[i] for i in batch_indices]
+-        
+-        # 2. Tokenize and Pad dynamically using Custom CharTokenizer
+-        encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in batch_texts]
+-        max_len = max(len(seq) for seq in encoded_list)
+-        
+-        padded_ids = []
+-        masks = []
+-        for seq in encoded_list:
+-            pad_len = max_len - len(seq)
+-            padded_ids.append(seq + [self.tokenizer.pad_token_id] * pad_len)
+-            masks.append([1] * len(seq) + [0] * pad_len)
+-            
+-        # 3. Fetch Embeddings via Mmap
+-        # This triggers Disk I/O precisely for these specific indices
+-        if self.backend == 'torch':
+-            import torch
+-            token_inputs = torch.tensor(padded_ids, dtype=torch.long)
+-            attention_mask = torch.tensor(masks, dtype=torch.float32)
+-            batch_embs = [torch.from_numpy(np.array(arr[batch_indices])).float() for arr in self.embs]
+-        else:
+-            import mlx.core as mx
+-            token_inputs = mx.array(padded_ids)
+-            attention_mask = mx.array(masks)
+-            batch_embs = [mx.array(arr[batch_indices]) for arr in self.embs]
+-        
+-        self.batch_idx += 1
+-        
+-        return token_inputs, batch_embs, attention_mask
+-
+-    # --- Checkpointing / Interrupt Resume Support ---
+-    
+-    def state_dict(self) -> Dict[str, Any]:
+-        """Returns the internal state for resuming."""
+-        return {
+-            "current_epoch": self.current_epoch,
+-            "batch_idx": self.batch_idx,
+-            "indices": self.indices.tolist() # Safe to serialize exactly how it was shuffled
+-        }
+-        
+-    def load_state_dict(self, state: Dict[str, Any]):
+-        """Restores the exact shuffle and position."""
+-        self.current_epoch = state["current_epoch"]
+-        self.batch_idx = state["batch_idx"]
+-        self.indices = np.array(state["indices"])
+-        print(f"Resumed Dataloader from Epoch {self.current_epoch}, Batch {self.batch_idx}/{self.num_batches}")
+-
+-class ChunkedNpzDataLoader:
+-    """
+-    专门适配从 ModelScope (如 catclever/emb_npy) 拉取的 `.npz` 切片矩阵设计的双层乱序 DataLoader。
+-    机制：
+-    1. 不吃内存：只在内存驻留"当前正在训练的任务块"的特征（比如每次只把某个 50w 条特征解压进 RAM）。
+-    2. 双层乱序 (Double Shuffle)：每个 Epoch 开始时打乱所有 Chunk 文件的流转顺序；在读取单个 Chunk 时，在 Chunk 内部将其局部 batch 完全乱序。
+-    """
+-    def __init__(self, 
+-                 parquet_path: str,
+-                 models: List[str], # 对应你的模型标识，例如 ["bge", "qwen", "xiaobu"]
+-                 chunk_patterns: dict = None,
+-                 tokenizer=None,
+-                 ms_repo_id: str = None, 
+-                 chunk_size: int = 500000,
+-                 local_npz_dir: str = None,
+-                 batch_size: int = 256,
+-                 max_seq_len: int = 512,
+-                 shuffle: bool = True,
+-                 seed: int = 42,
+-                 backend: str = 'mlx',
+-                 lazy_start: bool = False,
+-                 cache_dir: str = './datas',
+-                 auto_cleanup: bool = True):
+-        
+-        self.backend = backend
+-        self.batch_size = batch_size
+-        self.max_seq_len = max_seq_len
+-        self.shuffle = shuffle
+-        self.seed = seed if seed is not None else int(__import__("time").time())
+-        self.models = models
+-        self.chunk_patterns = chunk_patterns or {}
+-        self.ms_repo_id = ms_repo_id
+-        self.tokenizer = tokenizer
+-        self.cache_dir = cache_dir
+-        self.auto_cleanup = auto_cleanup
+-        
+-        # 3. 提取对应的全体文本数据 (先行提取，以获得 total_samples 决定边界)
+-        print(f"[DataLoader] 正在装载基准文本体系: {parquet_path}...")
+-        df = pd.read_parquet(parquet_path)
+-        self.text_chunks = df['chunks'].explode().dropna().tolist()
+-        self.total_samples = len(self.text_chunks)
+-        print(f"[DataLoader] 成功吃进文本池: {self.total_samples} 条")
+-        del df
+-        
+-        # 1. 自动挂载魔搭数据集或加载本地路径 (改为只验证配置，去除暴力的 snapshot_download 全本拉取)
+-        if ms_repo_id:
+-            try:
+-                from modelscope.hub.file_download import dataset_file_download
+-                print(f"[DataLoader] 已启用 ModelScope 终极按需流式串流模式: {ms_repo_id}...")
+-            except ImportError:
+-                raise RuntimeError("请安装 modelscope: pip install modelscope")
+-        else:
+-            self.npz_dir = local_npz_dir
+-            if not self.npz_dir or not os.path.isdir(self.npz_dir):
+-                raise ValueError("必须提供 ms_repo_id 或有效的 local_npz_dir")
+-
+-        # 2. 按模型分别探测物理分块，按 start 索引取交集（容错不同模型尾部 end 不同）
+-        self.chunk_bounds = []
+-        self._per_model_bounds = {}  # {model_name: {start: end}}
+-        try:
+-            if self.ms_repo_id:
+-                from modelscope.hub.api import HubApi
+-                api = HubApi()
+-                res = api.get_dataset_files(self.ms_repo_id, recursive=True)
+-                chunk_files = [f.get("Path", f.get("Name", "")) for f in res]
+-            else:
+-                chunk_files = glob.glob(os.path.join(self.npz_dir, "**", "*.npz"), recursive=True)
+-            
+-            # 按模型归类，各自收集 start → end 的映射
+-            for model_name in self.models:
+-                pattern = self.chunk_patterns.get(model_name, "")
+-                prefix = pattern.split("/")[0] if "/" in pattern else model_name
+-                start_to_end = {}
+-                for f in chunk_files:
+-                    f_normalized = f.replace("\\", "/")
+-                    if f_normalized.endswith(".npz") and (f_normalized.startswith(prefix + "/") or f"/{prefix}/" in f_normalized):
+-                        match = re.search(r'chunk_(\d+)_(\d+)\.npz', os.path.basename(f))
+-                        if match:
+-                            start_to_end[int(match.group(1))] = int(match.group(2))
+-                self._per_model_bounds[model_name] = start_to_end
+-                print(f"[DataLoader]   {model_name}: {len(start_to_end)} 个分块")
+-            
+-            # 按 start 索引取交集（容错：youtu 的 end=9000000 和 bge 的 end=8656199 都算 start=8500000）
+-            if self._per_model_bounds:
+-                common_starts = set.intersection(*[set(d.keys()) for d in self._per_model_bounds.values()])
+-                for s in sorted(common_starts):
+-                    # 取所有模型中最小的 end 作为安全数据范围
+-                    min_end = min(self._per_model_bounds[m][s] for m in self.models)
+-                    self.chunk_bounds.append((s, min_end))
+-            
+-            print(f"[DataLoader] 多模型安全交集（按start容错）：{len(self.chunk_bounds)} 个共享分块。")
+-        except Exception as e:
+-            print(f"[DataLoader] 物理探测失败，回退到严格数学计算: {e}")
+-            self.chunk_bounds = []
+-            for start_idx in range(0, self.total_samples, chunk_size):
+-                 end_idx = min(start_idx + chunk_size, self.total_samples)
+-                 self.chunk_bounds.append((start_idx, end_idx))
+-
+-
+-        
+-        # 4. 统计与 Epoch 控制变量
+-        self.rng = np.random.default_rng(seed)
+-        self.current_epoch = 0
+-        
+-        # 宏观控制表 (Chunks)
+-        self.macro_chunk_indices = np.arange(len(self.chunk_bounds))
+-        if self.shuffle:
+-             self.rng.shuffle(self.macro_chunk_indices)
+-             
+-        self.active_macro_idx_ptr = 0 # 当前正训练到第几个 chunk
+-        
+-        # 微观控制表 (内部流)
+-        self.active_chunk_embs = None
+-        self.active_micro_indices = []
+-        self.active_micro_ptr = 0
+-        self._prev_chunk_paths = []  # 上一个已消费分块的缓存路径，用于清理
+-        
+-        # 异步流水线 (Async Prefetch)
+-        self.prefetch_queue = queue.Queue(maxsize=1) # 内存里永远只多塞一块，极限控流
+-        self.stop_event = threading.Event()
+-        self._started = False
+-        
+-        # 延迟启动：如果要从 checkpoint 恢复，不要在这里白白下载一个块
+-        if not lazy_start:
+-            self._do_start()
+-
+-    def _do_start(self):
+-        """真正启动后台下载，首次加载第一个块"""
+-        if self._started:
+-            return
+-        self._started = True
+-        self._start_prefetching(start_macro_ptr=0)
+-        self._pop_next_chunk()
+-
+-    def _cleanup_cached_files(self, paths: list):
+-        """清理已经消费完毕的 ModelScope 缓存文件，释放磁盘空间"""
+-        cleaned = 0
+-        for p in paths:
+-            try:
+-                if p and os.path.exists(p):
+-                    os.remove(p)
+-                    cleaned += 1
+-            except OSError:
+-                pass
+-        if cleaned:
+-            print(f"[DataLoader] 🧹 已清理 {cleaned} 个已消费缓存文件")
+-
+-    def _start_prefetching(self, start_macro_ptr):
+-        """挂起旧线程，启动全新后台线程，从指定的 macro_ptr 开始默默搬取"""
+-        self.stop_event.set()
+-        
+-        # 清空队列残骸
+-        while not self.prefetch_queue.empty():
+-            try:
+-                self.prefetch_queue.get_nowait()
+-            except queue.Empty:
+-                break
+-                
+-        self.stop_event = threading.Event()
+-        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, args=(start_macro_ptr,), daemon=True)
+-        self.prefetch_thread.start()
+-        
+-    def _prefetch_worker(self, start_macro_ptr):
+-        """高强度纯后台下载/解压打工仔，永远走在 GPU 的前面"""
+-        worker_macro_ptr = start_macro_ptr
+-        while not self.stop_event.is_set():
+-            if worker_macro_ptr >= len(self.macro_chunk_indices):
+-                # 提示时代结束
+-                self.prefetch_queue.put(None)
+-                return
+-
+-            chunk_idx = self.macro_chunk_indices[worker_macro_ptr]
+-            start_idx, end_idx = self.chunk_bounds[chunk_idx]
+-            
+-            try:
+-                active_chunk_embs = []
+-                cached_paths = []  # 记录下载路径用于后续清理
+-                for model_name in self.models:
+-                    pattern = self.chunk_patterns.get(model_name, f"{model_name}_chunk_{'{start:07d}'}_{'{end:07d}'}.npz")
+-                    # 用该模型自己的真实 end（容错命名差异，如 youtu 的 9000000 vs bge 的 8656199）
+-                    model_end = self._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+-                    cand_name = pattern.format(start=start_idx, end=model_end)
+-                    
+-                    if self.ms_repo_id:
+-                         from modelscope.hub.file_download import dataset_file_download
+-                         path = dataset_file_download(self.ms_repo_id, cand_name, cache_dir=self.cache_dir)
+-                    else:
+-                         path = os.path.join(self.npz_dir, cand_name)
+-                         if not os.path.exists(path):
+-                              raise FileNotFoundError(f"后台打工仔抓取失败！本地目标块缺失：{path}")
+-                    
+-                    arr = np.load(path)['features']
+-                    active_chunk_embs.append(arr)
+-                    cached_paths.append(path)
+-                    
+-                cur_chunk_size = end_idx - start_idx
+-                active_micro_indices = np.arange(cur_chunk_size)
+-                
+-                if self.shuffle:
+-                    # 构建独立的后台局部无序宇宙
+-                    rng = np.random.default_rng(self.seed + worker_macro_ptr + self.current_epoch)
+-                    rng.shuffle(active_micro_indices)
+-                    
+-                payload = {
+-                    "embs": active_chunk_embs,
+-                    "micro_indices": active_micro_indices,
+-                    "global_start": start_idx,
+-                    "macro_idx_ptr": worker_macro_ptr,
+-                    "cached_paths": cached_paths
+-                }
+-                # 这里会阻塞！直到上一块被 GPU 吃光
+-                self.prefetch_queue.put(payload)
+-                worker_macro_ptr += 1
+-            except Exception as e:
+-                print(f"\n[DataLoader] 后台打工仔抓取/加载失败 (网络可能断开了？): {e}")
+-                print(f"[DataLoader] 这不是致命错误！打工仔将在 10 秒后原地重新尝试拉取 Chunk {chunk_idx}...")
+-                import time
+-                time.sleep(10)
+-                # 不退出进程，不抛出异常。
+-                # 既然失败了，worker_macro_ptr 就不加 1，直接 continue，下一轮会继续死磕这个块！
+-                continue
+-
+-    def _pop_next_chunk(self):
+-        """主线程调用的吸星大法，把工人装好的箱子拿走"""
+-        # 先清理上一个已消费的分块缓存
+-        if self.auto_cleanup and self._prev_chunk_paths:
+-            self._cleanup_cached_files(self._prev_chunk_paths)
+-            self._prev_chunk_paths = []
+-        
+-        payload = self.prefetch_queue.get()
+-        if payload is None:
+-            raise StopIteration
+-        if isinstance(payload, Exception):
+-            raise payload
+-            
+-        self.active_chunk_embs = payload["embs"]
+-        self.active_micro_indices = payload["micro_indices"]
+-        self.active_global_start = payload["global_start"]
+-        self.active_macro_idx_ptr = payload["macro_idx_ptr"]
+-        self.active_micro_ptr = 0
+-        self._prev_chunk_paths = payload.get("cached_paths", [])
+-        
+-        if not hasattr(self, 'emb_dims'):
+-            self.emb_dims = [arr.shape[-1] for arr in self.active_chunk_embs]
+-            print(f"[DataLoader] 自动侦测到多路特征维度: {self.emb_dims}")
+-            
+-        print(f"\n[DataLoader] 💥 无缝吸入后台新缓存块 (全局起点: {self.active_global_start}) - 纯异步无卡顿！")
+-
+-    def __iter__(self):
+-        if not self._started:
+-            self._do_start()
+-        return self
+-
+-    def __next__(self) -> Tuple[Any, List[Any], Any]:
+-        # 如果当前 Chunk 已经被彻底吸干了，无缝提取下一个
+-        if self.active_micro_ptr >= len(self.active_micro_indices):
+-            try:
+-                self._pop_next_chunk()
+-            except StopIteration:
+-                # 一个 Epoch 完结！
+-                self.current_epoch += 1
+-                if self.shuffle:
+-                    self.rng.shuffle(self.macro_chunk_indices)
+-                # 重新使唤工人从头开始搬砖
+-                self._start_prefetching(start_macro_ptr=0)
+-                self._pop_next_chunk()  # 直接抓下一个 Epoch 的第一块
+-                raise StopIteration
+-            
+-        fetch_len = min(self.batch_size, len(self.active_micro_indices) - self.active_micro_ptr)
+-        batch_local_indices = self.active_micro_indices[self.active_micro_ptr : self.active_micro_ptr + fetch_len]
+-        self.active_micro_ptr += fetch_len
+-        
+-        # 1. 映射回全局索引以抓取物理对应的文本序列
+-        batch_global_indices = self.active_global_start + batch_local_indices
+-        batch_texts = [self.text_chunks[i] for i in batch_global_indices]
+-        
+-        # 2. Tokenize & Pad (与旧版完全一致)
+-        encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in batch_texts]
+-        max_len = max(max(len(seq) for seq in encoded_list), 1)
+-        
+-        padded_ids = []
+-        masks = []
+-        for seq in encoded_list:
+-            pad_len = max_len - len(seq)
+-            padded_ids.append(seq + [self.tokenizer.pad_token_id] * pad_len)
+-            masks.append([1] * len(seq) + [0] * pad_len)
+-            
+-        # 3. 局域拷贝内存数据构造 Tensor/Array
+-        if self.backend == 'torch':
+-            import torch
+-            token_inputs = torch.tensor(padded_ids, dtype=torch.long)
+-            attention_mask = torch.tensor(masks, dtype=torch.float32)
+-            batch_embs = [torch.from_numpy(arr[batch_local_indices].copy()).float() for arr in self.active_chunk_embs]
+-        else:
+-            import mlx.core as mx
+-            token_inputs = mx.array(padded_ids)
+-            attention_mask = mx.array(masks)
+-            batch_embs = [mx.array(arr[batch_local_indices]) for arr in self.active_chunk_embs]
+-            
+-        return token_inputs, batch_embs, attention_mask
+-
+-    def state_dict(self) -> Dict[str, Any]:
+-        return {
+-            "current_epoch": self.current_epoch,
+-            "active_macro_idx_ptr": getattr(self, "active_macro_idx_ptr", 0),
+-            "macro_chunk_indices": getattr(self, "macro_chunk_indices", np.array([])).tolist(),
+-            "active_micro_ptr": getattr(self, "active_micro_ptr", 0),  # 保存当前块内部的微观进度！
+-            "seed_snapshot": getattr(self, "seed", int(__import__("time").time()))  # 永久锁定随机种子
+-        }
+-        
+-    def load_state_dict(self, state: Dict[str, Any]):
+-        self.current_epoch = state["current_epoch"]
+-        self.active_macro_idx_ptr = state["active_macro_idx_ptr"]
+-        self.macro_chunk_indices = np.array(state["macro_chunk_indices"])
+-        
+-        print(f"[DataLoader] 🔌 自断点恢复：正处于 Epoch {self.current_epoch},  宏观 Chunk 指针 {self.active_macro_idx_ptr}/{len(self.macro_chunk_indices)}")
+-
+-        # 核心漏洞修复法则：如果是从早期未记录种子与微观游标的破损失忆版本恢复（当前情况）
+-        # 强行拨动宏观指针进入下一个崭新纯净块，避免在一锅被错乱打散重组的烂粥里吃重复数据
+-        is_legacy_state = "seed_snapshot" not in state or "active_micro_ptr" not in state
+-        
+-        if is_legacy_state:
+-            self.active_macro_idx_ptr = min(self.active_macro_idx_ptr + 1, len(self.macro_chunk_indices) - 1)
+-            print(f"[DataLoader] ⚠️ 检测到历史遗留 Checkpoint 缺乏微秩序信息，为了避免重复喂入，已强行剥离并将指针拨至下一块干净数据：{self.active_macro_idx_ptr}。")
+-        else:
+-            # 未来恢复逻辑：一切数据时空完美复刻
+-            self.seed = state["seed_snapshot"]
+-            
+-        # 断点恢复：直接从历史断点启动下载，跳过 __init__ 的默认启动
+-        self._started = True
+-        self._start_prefetching(start_macro_ptr=self.active_macro_idx_ptr)
+-        self._pop_next_chunk()
+-        
+-        if not is_legacy_state:
+-            # 严格对准之前在这个块里吃过的条数（只有新形态拥有这个待遇）
+-            self.active_micro_ptr = state["active_micro_ptr"]
+-            print(f"[DataLoader] 📍 已还原微观读取游标与世界线乱序定律：从当前块的第 {self.active_micro_ptr} 条语句无缝继续训练！")
+-        else:
+-            # 遗留强行跳块版本下，微观进度自然是从 0 重新算起
+-            self.active_micro_ptr = 0
+-
+-class Phase1DataLoader:
+-    """
+-    Dataloader specifically for Phase 1 (Mamba Spatiotemporal Dynamics).
+-    It pulls *contiguous entire documents* dynamically instead of fixed arbitrary slices,
+-    to ensure Mamba learns the true, uncorrupted semantic arc of an article.
+-    """
+-    def __init__(self, 
+-                 parquet_path: str,
+-                 emb_paths: List[str],
+-                 batch_size: int = 16,
+-                 max_episode_len: int = None,
+-                 seed: int = 42,
+-                 backend: str = 'mlx'):
+-        
+-        self.backend = backend
+-        
+-        self.batch_size = batch_size
+-        self.max_episode_len = max_episode_len
+-        
+-        # 1. Load exact document boundaries to avoid crossing them!
+-        print("Reading Document Chunk Counts...")
+-        df = pd.read_parquet(parquet_path, columns=['chunk_count'])
+-        self.chunk_counts = df['chunk_count'].values
+-        
+-        # 2. Cumulative sum gives us the exact starting index for each document in the giant mmapped arrays
+-        self.doc_start_indices = np.concatenate(([0], np.cumsum(self.chunk_counts)[:-1]))
+-        self.total_docs = len(self.chunk_counts)
+-        print(f"Loaded strictly bounded {self.total_docs} semantic documents.")
+-        
+-        del df
+-        
+-        print("Mmapping embedding arrays for Phase 1...")
+-        self.embs = []
+-        for path in emb_paths:
+-            arr = np.load(path, mmap_mode='r')
+-            self.embs.append(arr)
+-            
+-        self.rng = np.random.default_rng(seed)
+-        self.current_epoch = 0
+-        self.batch_idx = 0
+-        
+-        self.indices = np.arange(self.total_docs)
+-        self.rng.shuffle(self.indices)
+-        self.num_batches = int(np.ceil(self.total_docs / self.batch_size))
+-        
+-    def __iter__(self):
+-        return self
+-        
+-    def __next__(self) -> Tuple[List[Any], Any]:
+-        if self.batch_idx >= self.num_batches:
+-            self.current_epoch += 1
+-            self.batch_idx = 0
+-            self.rng.shuffle(self.indices)
+-            raise StopIteration
+-            
+-        start_idx = self.batch_idx * self.batch_size
+-        end_idx = min(start_idx + self.batch_size, self.total_docs)
+-        
+-        batch_doc_indices = self.indices[start_idx:end_idx]
+-        
+-        # 1. Fetch exactly the bounded chunks for each document
+-        raw_embs_list = [[] for _ in range(len(self.embs))]
+-        lengths = []
+-        
+-        for doc_idx in batch_doc_indices:
+-            start_pos = self.doc_start_indices[doc_idx]
+-            count = self.chunk_counts[doc_idx]
+-            
+-            if self.max_episode_len is not None:
+-                eff_len = min(count, self.max_episode_len)
+-            else:
+-                eff_len = min(count, 256) # Safety cap
+-                
+-            lengths.append(eff_len)
+-            
+-            for i in range(len(self.embs)):
+-                # Just copy the slice into memory
+-                raw_embs_list[i].append(np.array(self.embs[i][start_pos : start_pos+eff_len]))
+-                
+-        # 2. Pad to the length of the longest document in THIS specific batch (Dynamic Batching)
+-        max_len = max(lengths)
+-        
+-        # 2. Pad to the maximum document length in THIS specific batch
+-        padded_embs = [[] for _ in range(len(self.embs))]
+-        masks = []
+-        
+-        for b in range(len(batch_doc_indices)):
+-            l = lengths[b]
+-            pad_len = max_len - l
+-            
+-            for i in range(len(self.embs)):
+-                arr = raw_embs_list[i][b]
+-                embs_dim = arr.shape[-1]
+-                if pad_len > 0:
+-                    pad_array = np.zeros((pad_len, embs_dim), dtype=arr.dtype)
+-                    arr = np.concatenate([arr, pad_array], axis=0)
+-                padded_embs[i].append(arr)
+-                
+-            masks.append([1] * l + [0] * pad_len)
+-            
+-        # Convert to arrays matching backend
+-        if self.backend == 'torch':
+-            import torch
+-            batch_embs_tensor = [torch.from_numpy(np.stack(padded_embs[i])).float() for i in range(len(self.embs))]
+-            masks_tensor = torch.tensor(masks, dtype=torch.float32)
+-            self.batch_idx += 1
+-            return batch_embs_tensor, masks_tensor
+-        else:
+-            import mlx.core as mx
+-            batch_embs_mx = [mx.array(np.stack(padded_embs[i])) for i in range(len(self.embs))]
+-            masks_mx = mx.array(masks)
+-            self.batch_idx += 1
+-            return batch_embs_mx, masks_mx
+-        
+-    def state_dict(self) -> Dict[str, Any]:
+-        return {"batch_idx": self.batch_idx, "current_epoch": self.current_epoch, "indices": self.indices.tolist()}
+-        
+-    def load_state_dict(self, state: Dict[str, Any]):
+-        self.batch_idx = state["batch_idx"]
+-        self.current_epoch = state["current_epoch"]
+-        self.indices = np.array(state["indices"])
+-
+-class TextDocumentDataLoader:
+-    """
+-    DataLoader specifically for Phase 1 End-to-End.
+-    Reads `.parquet` text chunks, groups them into full documents (causal sequences),
+-    and yields 3D token tensors: (Batch, Max_Sentences, Max_Tokens).
+-    """
+-    def __init__(self, 
+-                 parquet_path: str,
+-                 tokenizer,
+-                 batch_size: int = 16,
+-                 max_episode_len: int = None,
+-                 max_seq_len: int = 256,
+-                 seed: int = 42,
+-                 backend: str = 'mlx'):
+-        
+-        self.backend = backend
+-        self.tokenizer = tokenizer
+-        self.batch_size = batch_size
+-        self.max_episode_len = max_episode_len
+-        self.max_seq_len = max_seq_len
+-        
+-        print("Reading Document Texts and Chunk Counts...")
+-        df = pd.read_parquet(parquet_path)
+-        self.text_chunks = df['chunks'].explode().dropna().tolist()
+-        self.chunk_counts = df['chunk_count'].values
+-        
+-        self.doc_start_indices = np.concatenate(([0], np.cumsum(self.chunk_counts)[:-1]))
+-        self.total_docs = len(self.chunk_counts)
+-        print(f"Loaded strictly bounded {self.total_docs} semantic documents (Text only).")
+-        
+-        del df
+-        
+-        self.rng = np.random.default_rng(seed)
+-        self.current_epoch = 0
+-        self.batch_idx = 0
+-        
+-        self.indices = np.arange(self.total_docs)
+-        self.rng.shuffle(self.indices)
+-        self.num_batches = int(np.ceil(self.total_docs / self.batch_size))
+-        
+-    def __iter__(self):
+-        return self
+-        
+-    def __next__(self) -> Tuple[Any, Any, Any]:
+-        if self.batch_idx >= self.num_batches:
+-            self.current_epoch += 1
+-            self.batch_idx = 0
+-            self.rng.shuffle(self.indices)
+-            raise StopIteration
+-            
+-        start_idx = self.batch_idx * self.batch_size
+-        end_idx = min(start_idx + self.batch_size, self.total_docs)
+-        
+-        batch_doc_indices = self.indices[start_idx:end_idx]
+-        
+-        batch_docs_sentences = []
+-        for doc_idx in batch_doc_indices:
+-            start_pos = self.doc_start_indices[doc_idx]
+-            count = self.chunk_counts[doc_idx]
+-            
+-            if self.max_episode_len is not None:
+-                eff_len = min(count, self.max_episode_len)
+-            else:
+-                eff_len = min(count, 256) # Safety cap
+-                
+-            sentences = self.text_chunks[start_pos : start_pos + eff_len]
+-            batch_docs_sentences.append(sentences)
+-            
+-        # 强制固定句子长度维度！这是为了防止 Apple MLX 的 @mx.compile 
+-        # 因为每一批次的 shape 不同而疯狂重新编译，最终导致图缓存撑爆统一内存 (Jetsam Kill)。
+-        max_sentences = self.max_episode_len if self.max_episode_len else 256
+-        
+-        # We will flatten to tokenize efficiently, then reshape
+-        flat_texts = []
+-        for doc in batch_docs_sentences:
+-            flat_texts.extend(doc)
+-            
+-        encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in flat_texts]
+-        max_tokens = max(max((len(seq) for seq in encoded_list), default=1), 1)
+-        
+-        # Prepare 3D tensors: (B, max_sentences, max_tokens)
+-        padded_ids = np.zeros((len(batch_docs_sentences), max_sentences, max_tokens), dtype=np.int32)
+-        padded_ids.fill(self.tokenizer.pad_token_id)
+-        
+-        attention_mask = np.zeros((len(batch_docs_sentences), max_sentences, max_tokens), dtype=np.float32)
+-        sentence_mask = np.zeros((len(batch_docs_sentences), max_sentences), dtype=np.float32)
+-        
+-        flat_idx = 0
+-        for b, doc in enumerate(batch_docs_sentences):
+-            for s, _ in enumerate(doc):
+-                seq = encoded_list[flat_idx]
+-                seq_len = len(seq)
+-                padded_ids[b, s, :seq_len] = seq
+-                attention_mask[b, s, :seq_len] = 1.0
+-                sentence_mask[b, s] = 1.0
+-                flat_idx += 1
+-                
+-        if self.backend == 'torch':
+-            import torch
+-            ids_t = torch.tensor(padded_ids, dtype=torch.long)
+-            att_t = torch.tensor(attention_mask, dtype=torch.float32)
+-            sen_t = torch.tensor(sentence_mask, dtype=torch.float32)
+-        else:
+-            import mlx.core as mx
+-            ids_t = mx.array(padded_ids)
+-            att_t = mx.array(attention_mask)
+-            sen_t = mx.array(sentence_mask)
+-            
+-        self.batch_idx += 1
+-        return ids_t, att_t, sen_t
+-        
+-    def state_dict(self) -> Dict[str, Any]:
+-        return {"batch_idx": self.batch_idx, "current_epoch": self.current_epoch, "indices": self.indices.tolist()}
+-        
+-    def load_state_dict(self, state: Dict[str, Any]):
+-        self.batch_idx = state["batch_idx"]
+-        self.current_epoch = state["current_epoch"]
+-        self.indices = np.array(state["indices"])
+diff --git a/training/train_phase0_5_charencoder.py b/training/train_phase0_5_charencoder.py
+deleted file mode 100644
+index 00c5781..0000000
+--- a/training/train_phase0_5_charencoder.py
++++ /dev/null
+@@ -1,593 +0,0 @@
+-import argparse
+-import os
+-import re
+-import json
+-import glob
+-import numpy as np
+-import shutil
+-import threading
+-import time
+-import mlx.core as mx
+-import mlx.nn as nn
+-import mlx.optimizers as optim
+-
+-from model.config import ModelConfig
+-from model.adapter import SensoryFuser
+-from model.god_encoder import GodEncoder
+-from training.core.dataloader import MultiEmbDataLoader, ChunkedNpzDataLoader
+-from training.core.char_tokenizer import CharTokenizer
+-from training.core.checkpoint import Checkpointer
+-from training.core.schedule import linear_warmup_schedule
+-from model.phase0_5_charencoder import TinyCharEncoder
+-
+-def get_distill_parser():
+-    parser = argparse.ArgumentParser(description="Standalone Embedding Distillation (Teacher -> Student)")
+-    parser.add_argument("--batch_size", type=int, default=256)
+-    parser.add_argument("--epochs", type=int, default=3)
+-    parser.add_argument("--lr", type=float, default=5e-4) # Slightly higher for small student
+-    parser.add_argument("--warmup_steps", type=int, default=5000)
+-    parser.add_argument("--max_seq_len", type=int, default=512)
+-    parser.add_argument("--save_steps", type=int, default=10000)
+-    parser.add_argument("--out_dir", type=str, default="checkpoints/distilled")
+-    parser.add_argument("--ckpt_prefix", type=str, default="tinybert_v1")
+-    parser.add_argument("--p0_ckpt", type=str, required=True, help="Frozen Phase 0 weights to distill from")
+-    parser.add_argument("--config_file", type=str, default=None, help="Optional dataset config (e.g. HollyShit dataset_config.json)")
+-    parser.add_argument("--emb_paths", nargs="*", default=None, help="Explicit embedding .npy paths for MultiEmbDataLoader")
+-    parser.add_argument("--emb_dir", type=str, default="data/Basic_ZH/embs/hy-tmp", help="Auto-discovery dir for *embeddings*.npy")
+-    parser.add_argument("--parquet_path", type=str, default=None, help="Parquet path override; falls back to config or legacy default")
+-    parser.add_argument("--data_dir", type=str, default="./embs", help="Local read directory for chunked npz files")
+-    parser.add_argument("--download_cache_dir", type=str, default=None, help="Temporary download cache dir for chunked npz; defaults to --data_dir")
+-    parser.add_argument("--chunk_size", type=int, default=500000, help="Chunk size used by ChunkedNpzDataLoader")
+-    parser.add_argument("--strict_route_check", action=argparse.BooleanOptionalAction, default=True, help="Require checkpoint routes and data routes to match exactly")
+-    parser.add_argument("--student_d_model", type=int, default=1024, help="Student hidden size")
+-    parser.add_argument("--student_n_heads", type=int, default=8, help="Student attention heads")
+-    parser.add_argument("--student_n_layers", type=int, default=6, help="Student transformer layers")
+-    return parser
+-
+-
+-def load_optional_config(config_file: str):
+-    if not config_file:
+-        return {}
+-    if not os.path.exists(config_file):
+-        raise FileNotFoundError(f"Config file not found: {config_file}")
+-    with open(config_file, "r", encoding="utf-8") as f:
+-        return json.load(f)
+-
+-
+-def resolve_path_maybe_relative(path_value: str, base_dir: str):
+-    if not path_value:
+-        return path_value
+-    if os.path.isabs(path_value):
+-        return path_value
+-    candidate = os.path.join(base_dir, path_value)
+-    if os.path.exists(candidate):
+-        return candidate
+-    return path_value
+-
+-
+-def infer_teacher_arch_from_ckpt(p0_ckpt: str):
+-    from safetensors import safe_open
+-
+-    fuser_path = os.path.join(p0_ckpt, "sense_fuser.safetensors")
+-    if not os.path.exists(fuser_path):
+-        fuser_path = os.path.join(p0_ckpt, "sense_adapter.safetensors")
+-    if not os.path.exists(fuser_path):
+-        raise FileNotFoundError(f"Missing sense_fuser/sense_adapter checkpoint under: {p0_ckpt}")
+-
+-    god_path = os.path.join(p0_ckpt, "god_encoder.safetensors")
+-    if not os.path.exists(god_path):
+-        raise FileNotFoundError(f"Missing god_encoder.safetensors under: {p0_ckpt}")
+-
+-    route_dims = {}
+-    d_model = None
+-    with safe_open(fuser_path, framework="np") as sf:
+-        for key in sf.keys():
+-            m = re.match(r"adapters\.(\d+)\.(?:net\.layers\.0|fc1)\.weight$", key)
+-            if m:
+-                idx = int(m.group(1))
+-                tensor = sf.get_tensor(key)
+-                route_dims[idx] = int(tensor.shape[1])
+-                d_model = int(tensor.shape[0])
+-
+-    if not route_dims:
+-        raise RuntimeError(f"Could not infer adapter routes from {fuser_path}")
+-    emb_dims = [route_dims[i] for i in sorted(route_dims.keys())]
+-
+-    z_dim = None
+-    with safe_open(god_path, framework="np") as sf:
+-        for key in sf.keys():
+-            if key in {"net.layers.2.weight", "fc2.weight"}:
+-                tensor = sf.get_tensor(key)
+-                z_dim = int(tensor.shape[0])
+-                if d_model is None:
+-                    d_model = int(tensor.shape[1])
+-                break
+-
+-    if z_dim is None:
+-        raise RuntimeError(f"Could not infer z_dim from {god_path}")
+-    if d_model is None:
+-        raise RuntimeError(f"Could not infer d_model from {fuser_path}/{god_path}")
+-
+-    return fuser_path, god_path, emb_dims, d_model, z_dim
+-
+-
+-def resolve_emb_paths(args, ds_config: dict, expected_routes: int):
+-    if args.emb_paths:
+-        emb_paths = args.emb_paths
+-    elif ds_config.get("emb_paths"):
+-        emb_paths = ds_config["emb_paths"]
+-    else:
+-        emb_paths = sorted(glob.glob(os.path.join(args.emb_dir, "*embeddings*.npy")))
+-
+-    if len(emb_paths) != expected_routes:
+-        msg = (
+-            f"Embedding route mismatch: expected {expected_routes} from checkpoint, "
+-            f"but got {len(emb_paths)} embedding files. paths={emb_paths}"
+-        )
+-        if args.strict_route_check:
+-            raise ValueError(msg)
+-        if len(emb_paths) < expected_routes:
+-            raise ValueError(msg + " | Non-strict cannot recover from fewer routes.")
+-        print(f"[Warn] {msg} | Non-strict mode: truncating to first {expected_routes} paths.")
+-        emb_paths = emb_paths[:expected_routes]
+-    return emb_paths
+-
+-
+-def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
+-    has_chunked_conf = bool(ds_config.get("base_models") and ds_config.get("chunk_name_patterns"))
+-    config_base_dir = os.path.dirname(os.path.abspath(args.config_file)) if args.config_file else os.getcwd()
+-    parquet_path = args.parquet_path or ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_wiki.parquet")
+-    parquet_path = resolve_path_maybe_relative(parquet_path, config_base_dir)
+-
+-    if has_chunked_conf:
+-        models = ds_config["base_models"]
+-        chunk_patterns = ds_config["chunk_name_patterns"]
+-        ms_repo_id = ds_config.get("modelscope_repo_id")
+-        if len(models) != expected_routes:
+-            msg = (
+-                f"Model route mismatch: checkpoint expects {expected_routes}, "
+-                f"but config has {len(models)} base_models={models}"
+-            )
+-            if args.strict_route_check:
+-                raise ValueError(msg)
+-            if len(models) < expected_routes:
+-                raise ValueError(msg + " | Non-strict cannot recover from fewer routes.")
+-            print(f"[Warn] {msg} | Non-strict mode: truncating to first {expected_routes} models.")
+-            models = models[:expected_routes]
+-            chunk_patterns = {k: v for k, v in chunk_patterns.items() if k in models}
+-        print(f"[Data] Using ChunkedNpzDataLoader ({len(models)} routes, dynamic ModelScope/local chunks).")
+-        return ChunkedNpzDataLoader(
+-            parquet_path=parquet_path,
+-            models=models,
+-            chunk_patterns=chunk_patterns,
+-            tokenizer=tokenizer,
+-            ms_repo_id=ms_repo_id,
+-            chunk_size=args.chunk_size,
+-            local_npz_dir=args.data_dir,
+-            cache_dir=args.download_cache_dir,
+-            batch_size=args.batch_size,
+-            max_seq_len=args.max_seq_len,
+-            shuffle=True,
+-            lazy_start=True,
+-            backend='mlx'
+-        )
+-
+-    emb_paths = resolve_emb_paths(args, ds_config, expected_routes)
+-    print(f"[Data] Using MultiEmbDataLoader ({len(emb_paths)} routes): {emb_paths}")
+-    return MultiEmbDataLoader(
+-        parquet_path=parquet_path,
+-        emb_paths=emb_paths,
+-        tokenizer=tokenizer,
+-        batch_size=args.batch_size,
+-        max_seq_len=args.max_seq_len,
+-        backend='mlx'
+-    )
+-
+-
+-def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir: str):
+-    if not hasattr(loader, "models") or not hasattr(loader, "chunk_patterns"):
+-        return loader
+-
+-    local_data_dir = os.path.abspath(local_data_dir)
+-    download_cache_dir = os.path.abspath(download_cache_dir)
+-    loader.npz_dir = local_data_dir
+-    loader.cache_dir = download_cache_dir
+-    _cand_locks = {}
+-    _cand_locks_guard = threading.Lock()
+-    _last_temp_cleanup_at = 0.0
+-
+-    def _cleanup_stale_temp_artifacts(now_ts: float = None, stale_seconds: int = 600):
+-        nonlocal _last_temp_cleanup_at
+-        if now_ts is None:
+-            now_ts = time.time()
+-        if now_ts - _last_temp_cleanup_at < 30:
+-            return
+-        _last_temp_cleanup_at = now_ts
+-
+-        roots = {
+-            os.path.join(local_data_dir, "._____temp"),
+-            os.path.join(download_cache_dir, "._____temp"),
+-            local_data_dir,
+-            download_cache_dir,
+-        }
+-        deleted_files = 0
+-        deleted_dirs = 0
+-        for root in roots:
+-            if not root or not os.path.exists(root):
+-                continue
+-            for dp, _, fs in os.walk(root, topdown=False):
+-                for fn in fs:
+-                    fp = os.path.join(dp, fn)
+-                    try:
+-                        age = now_ts - os.path.getmtime(fp)
+-                    except OSError:
+-                        continue
+-                    if age < stale_seconds:
+-                        continue
+-                    is_temp = (
+-                        fn.endswith(".incomplete")
+-                        or fn.endswith(".tmp")
+-                        or fn.endswith(".partial")
+-                        or ".tmp." in fn
+-                    )
+-                    if is_temp:
+-                        try:
+-                            os.remove(fp)
+-                            deleted_files += 1
+-                        except OSError:
+-                            pass
+-                try:
+-                    if dp.startswith(os.path.join(local_data_dir, "._____temp")) or dp.startswith(
+-                        os.path.join(download_cache_dir, "._____temp")
+-                    ):
+-                        if not os.listdir(dp):
+-                            os.rmdir(dp)
+-                            deleted_dirs += 1
+-                except OSError:
+-                    pass
+-        if deleted_files or deleted_dirs:
+-            print(f"[DataLoader] 🧹 清理临时残留: files={deleted_files}, dirs={deleted_dirs}")
+-
+-    def _get_cand_lock(cand_name: str):
+-        with _cand_locks_guard:
+-            if cand_name not in _cand_locks:
+-                _cand_locks[cand_name] = threading.Lock()
+-            return _cand_locks[cand_name]
+-
+-    if local_data_dir == download_cache_dir:
+-        print(f"[Data] Download+read directory unified at: {local_data_dir}")
+-    else:
+-        print(
+-            f"[Data] Download cache: {download_cache_dir} | Read directory: {local_data_dir} "
+-            f"(download then stage into read dir)"
+-        )
+-
+-    def _resolve_npz_path(cand_name: str):
+-        _cleanup_stale_temp_artifacts()
+-        local_path = os.path.join(local_data_dir, cand_name)
+-        cand_lock = _get_cand_lock(cand_name)
+-        with cand_lock:
+-            if os.path.exists(local_path):
+-                return local_path
+-
+-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+-            if loader.ms_repo_id:
+-                from modelscope.hub.file_download import dataset_file_download
+-                last_err = None
+-                downloaded_path = None
+-                for retry in range(3):
+-                    try:
+-                        downloaded_path = dataset_file_download(
+-                            loader.ms_repo_id, cand_name, cache_dir=download_cache_dir
+-                        )
+-                        break
+-                    except FileNotFoundError as e:
+-                        last_err = e
+-                        time.sleep(0.5)
+-                if downloaded_path is None:
+-                    raise last_err
+-                downloaded_path = os.path.abspath(downloaded_path)
+-            else:
+-                downloaded_path = os.path.join(local_data_dir, cand_name)
+-                if not os.path.exists(downloaded_path):
+-                    raise FileNotFoundError(f"本地目标块缺失：{downloaded_path}")
+-
+-            if downloaded_path != os.path.abspath(local_path):
+-                try:
+-                    os.replace(downloaded_path, local_path)
+-                except OSError:
+-                    shutil.copy2(downloaded_path, local_path)
+-                    try:
+-                        os.remove(downloaded_path)
+-                    except OSError:
+-                        pass
+-            return local_path
+-
+-    loader._resolve_npz_path = _resolve_npz_path
+-
+-    def _prefetch_worker_routed(start_macro_ptr):
+-        worker_macro_ptr = start_macro_ptr
+-        while not loader.stop_event.is_set():
+-            if worker_macro_ptr >= len(loader.macro_chunk_indices):
+-                loader.prefetch_queue.put(None)
+-                return
+-
+-            chunk_idx = loader.macro_chunk_indices[worker_macro_ptr]
+-            start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+-
+-            try:
+-                active_chunk_embs = []
+-                cached_paths = []
+-                for model_name in loader.models:
+-                    pattern = loader.chunk_patterns.get(model_name, f"{model_name}_chunk_{{start:07d}}_{{end:07d}}.npz")
+-                    model_end = loader._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+-                    cand_name = pattern.format(start=start_idx, end=model_end)
+-
+-                    path = loader._resolve_npz_path(cand_name)
+-                    arr = np.load(path)["features"]
+-                    active_chunk_embs.append(arr)
+-                    cached_paths.append(path)
+-
+-                cur_chunk_size = end_idx - start_idx
+-                active_micro_indices = np.arange(cur_chunk_size)
+-                if loader.shuffle:
+-                    rng = np.random.default_rng(loader.seed + worker_macro_ptr + loader.current_epoch)
+-                    rng.shuffle(active_micro_indices)
+-
+-                payload = {
+-                    "embs": active_chunk_embs,
+-                    "micro_indices": active_micro_indices,
+-                    "global_start": start_idx,
+-                    "macro_idx_ptr": worker_macro_ptr,
+-                    "cached_paths": cached_paths,
+-                }
+-                loader.prefetch_queue.put(payload)
+-                worker_macro_ptr += 1
+-            except Exception as e:
+-                print(f"\n[DataLoader] 后台打工仔抓取/加载失败 (网络可能断开了？): {e}")
+-                print(f"[DataLoader] 这不是致命错误！打工仔将在 10 秒后原地重新尝试拉取 Chunk {chunk_idx}...")
+-                import time
+-                time.sleep(10)
+-                continue
+-
+-    loader._prefetch_worker = _prefetch_worker_routed
+-    return loader
+-
+-
+-def extract_prefix_from_checkpoint_name(folder_name: str):
+-    if folder_name == "latest_emergency" or folder_name.startswith("step_"):
+-        return ""
+-    if folder_name.endswith("_latest_emergency"):
+-        return folder_name[: -len("_latest_emergency")]
+-    m = re.match(r"(.+)_step_\d+$", folder_name)
+-    if m:
+-        return m.group(1)
+-    return ""
+-
+-
+-def infer_checkpoint_step(ckpt_dir: str, folder_name: str):
+-    state_file = os.path.join(ckpt_dir, "dataloader.json")
+-    if os.path.exists(state_file):
+-        try:
+-            with open(state_file, "r", encoding="utf-8") as f:
+-                state = json.load(f)
+-            return int(state.get("global_step", -1))
+-        except Exception:
+-            pass
+-    m = re.search(r"_step_(\d+)$", folder_name)
+-    if m:
+-        return int(m.group(1))
+-    m = re.match(r"step_(\d+)$", folder_name)
+-    if m:
+-        return int(m.group(1))
+-    return -1
+-
+-
+-def has_student_weights(ckpt_dir: str):
+-    return (
+-        os.path.exists(os.path.join(ckpt_dir, "student.safetensors"))
+-        or os.path.exists(os.path.join(ckpt_dir, "student.pt"))
+-    )
+-
+-
+-def _is_checkpoint_dir_name(folder_name: str):
+-    if folder_name == "latest_emergency" or folder_name.startswith("step_"):
+-        return True
+-    if folder_name.endswith("_latest_emergency"):
+-        return True
+-    return bool(re.match(r".+_step_\d+$", folder_name))
+-
+-
+-def is_resume_checkpoint_valid(ckpt_dir: str):
+-    if not has_student_weights(ckpt_dir):
+-        return False, "missing student weights"
+-
+-    state_file = os.path.join(ckpt_dir, "dataloader.json")
+-    if not os.path.exists(state_file):
+-        return False, "missing dataloader.json"
+-    try:
+-        with open(state_file, "r", encoding="utf-8") as f:
+-            state = json.load(f)
+-        _ = int(state.get("global_step", -1))
+-    except Exception as e:
+-        return False, f"broken dataloader.json ({e})"
+-
+-    opt_path = os.path.join(ckpt_dir, "optimizer.safetensors")
+-    if not os.path.exists(opt_path):
+-        return False, "missing optimizer.safetensors"
+-    try:
+-        mx.load(opt_path)
+-    except Exception as e:
+-        return False, f"broken optimizer.safetensors ({e})"
+-
+-    return True, ""
+-
+-
+-def find_latest_checkpoint_across_all(out_dir: str, preferred_prefix: str = None):
+-    if not os.path.isdir(out_dir):
+-        return None, preferred_prefix or ""
+-
+-    candidates = []
+-    for d in os.listdir(out_dir):
+-        full = os.path.join(out_dir, d)
+-        if not os.path.isdir(full):
+-            continue
+-        if not has_student_weights(full):
+-            continue
+-        step = infer_checkpoint_step(full, d)
+-        prefix = extract_prefix_from_checkpoint_name(d)
+-        mtime = os.path.getmtime(full)
+-        prefix_rank = 1 if (preferred_prefix is not None and prefix == preferred_prefix) else 0
+-        candidates.append((step, prefix_rank, mtime, full, prefix, d))
+-
+-    if not candidates:
+-        return None, preferred_prefix or ""
+-
+-    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+-    for _, _, _, ckpt_dir, prefix, folder_name in candidates:
+-        ok, reason = is_resume_checkpoint_valid(ckpt_dir)
+-        if ok:
+-            return ckpt_dir, prefix
+-        print(f"[Resume] Dropping invalid checkpoint: {ckpt_dir} | reason: {reason}")
+-        if _is_checkpoint_dir_name(folder_name):
+-            try:
+-                shutil.rmtree(ckpt_dir)
+-                print(f"[Resume] Removed broken checkpoint folder: {ckpt_dir}")
+-            except Exception as e:
+-                print(f"[Resume] Failed to remove broken checkpoint folder: {ckpt_dir} ({e})")
+-    return None, preferred_prefix or ""
+-
+-def main():
+-    parser = get_distill_parser()
+-    args = parser.parse_args()
+-
+-    ds_config = load_optional_config(args.config_file)
+-    if args.download_cache_dir is None:
+-        args.download_cache_dir = args.data_dir
+-
+-    config = ModelConfig()
+-    config.max_seq_len = args.max_seq_len
+-
+-    tokenizer = CharTokenizer()
+-
+-    fuser_path, god_path, emb_dims, d_model, z_dim = infer_teacher_arch_from_ckpt(args.p0_ckpt)
+-    print(
+-        f"[Teacher Arch] routes={len(emb_dims)} emb_dims={emb_dims} "
+-        f"d_model={d_model} z_dim={z_dim}"
+-    )
+-
+-    dataloader = build_dataloader(args, tokenizer, ds_config, expected_routes=len(emb_dims))
+-    dataloader = attach_chunk_download_router(dataloader, args.data_dir, args.download_cache_dir)
+-
+-    # 1. Load the frozen Super-Teacher Target (GodEncoder)
+-    fuser = SensoryFuser(emb_dims, d_model)
+-    god_encoder = GodEncoder(d_model, z_dim)
+-
+-    print(f"Loading Frozen Teacher weights from {args.p0_ckpt}...")
+-    fuser.load_weights(fuser_path)
+-    god_encoder.load_weights(god_path)
+-
+-    fuser.freeze()
+-    god_encoder.freeze()
+-    print("Teacher modules frozen.")
+-
+-    # 2. Instantiate the Tiny Student Encoder
+-    print("Initializing Student NativeCharEncoder (6 layers, 1024 dimensions)...")
+-    student = TinyCharEncoder(
+-        vocab_size=config.vocab_size,
+-        d_model=args.student_d_model,
+-        n_heads=args.student_n_heads,
+-        n_layers=args.student_n_layers,
+-        max_seq_len=config.max_seq_len,
+-        z_dim=z_dim
+-    )
+-    mx.eval(student.parameters())
+-
+-    # 3. Optimizer
+-    optimizer = optim.AdamW(learning_rate=args.lr)
+-
+-    # 4. Checkpointer
+-    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
+-    checkpointer.register_model("student", student)
+-    checkpointer.register_optimizer("optimizer", optimizer)
+-    checkpointer.register_dataloader("dataloader", dataloader)
+-    checkpointer.register_args(args)
+-
+-    resume_dir, resume_prefix = find_latest_checkpoint_across_all(
+-        args.out_dir, preferred_prefix=args.ckpt_prefix
+-    )
+-    if resume_dir:
+-        checkpointer.prefix = resume_prefix
+-        print(f"[Resume] Auto-selected latest checkpoint across all: {resume_dir}")
+-        start_step = checkpointer.load(resume_dir)
+-    else:
+-        print(f"[Resume] No valid checkpoint found under {args.out_dir}. Starting from step 0.")
+-        start_step = 0
+-
+-    # 5. Loss Definition (MSE)
+-    def loss_fn(model, token_inputs, attention_mask, z_target_truth):
+-        z_pred = model(token_inputs, attention_mask)
+-        # Pure MSE against GodEncoder's space perfectly aligns direction and magnitude
+-        loss = mx.mean(mx.square(z_pred - z_target_truth))
+-        return loss
+-
+-    loss_and_grad_fn = nn.value_and_grad(student, loss_fn)
+-
+-    @mx.compile
+-    def step_fn(token_inputs, attention_mask, z_target_truth):
+-        loss, grads = loss_and_grad_fn(student, token_inputs, attention_mask, z_target_truth)
+-        clipped_grads, _ = optim.clip_grad_norm(grads, 1.0)
+-        return loss, clipped_grads
+-
+-    # 6. Training Loop
+-    global_step = start_step
+-
+-    print(f"\n========================================================")
+-    print(f"Starting Distillation Epochs: {args.epochs} | Batch: {args.batch_size}")
+-    print(f"Target Pure Semantic Space: {args.p0_ckpt}")
+-    print(f"========================================================\n")
+-
+-    try:
+-        for epoch in range(dataloader.current_epoch, args.epochs):
+-            for token_inputs, batch_embs, attention_mask in dataloader:
+-                global_step += 1
+-                if len(batch_embs) != len(emb_dims):
+-                    msg = (
+-                        f"Runtime embedding route mismatch: got {len(batch_embs)} routes, "
+-                        f"expected {len(emb_dims)} from teacher checkpoint"
+-                    )
+-                    if args.strict_route_check:
+-                        raise ValueError(msg)
+-                    if len(batch_embs) < len(emb_dims):
+-                        raise ValueError(msg + " | Non-strict cannot recover from fewer routes.")
+-                    print(f"[Warn] {msg} | Non-strict mode: truncating runtime routes.")
+-                    batch_embs = batch_embs[:len(emb_dims)]
+-
+-                # 8a. Get Absolute Truth from GodEncoder (Frozen, computed on the fly via RAM)
+-                # Ensure None weights correctly hit Centroid Fusion
+-                f_t = fuser(batch_embs, weights=None)
+-                z_target_truth = god_encoder(f_t) # Shape: (B, 1, z_dim) or (B, z_dim)
+-
+-                if len(z_target_truth.shape) == 3:
+-                     z_target_truth = mx.squeeze(z_target_truth, axis=1)
+-
+-                # Sync LR natively
+-                optimizer.learning_rate = linear_warmup_schedule(global_step, args.lr, args.warmup_steps)
+-
+-                # 8b. Train Student (JIT Compiled Fwd+Bwd, Python Opt Update)
+-                loss, grads = step_fn(token_inputs, attention_mask, z_target_truth)
+-                optimizer.update(student, grads)
+-                mx.eval(student.parameters(), optimizer.state, loss)
+-
+-                if global_step % 10 == 0:
+-                     print(f"Epoch {epoch+1} | Step {global_step} | Distill MSE: {loss.item():.4f}")
+-
+-                if global_step % args.save_steps == 0:
+-                     checkpointer.save(global_step)
+-
+-    except KeyboardInterrupt:
+-        print(f"\n[Interrupt] Caught kill signal at step {global_step}! Emergency save triggered.")
+-        checkpointer.save(global_step, is_emergency=True)
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/training/train_phase0_5_charencoder_cuda.py b/training/train_phase0_5_charencoder_cuda.py
+deleted file mode 100644
+index 3736f09..0000000
+--- a/training/train_phase0_5_charencoder_cuda.py
++++ /dev/null
+@@ -1,1039 +0,0 @@
+-import torch
+-import torch.nn as nn
+-import torch.optim as optim
+-import torch.nn.functional as F
+-import numpy as np
+-import math
+-import os
+-import sys
+-import re
+-import json
+-import glob
+-import shutil
+-import threading
+-import time
+-import zipfile
+-# Auto-resolve the parent workspace root and force it to the FRONT of the import path
+-# This prevents the local `model.py` file from aggressively shadowing the parent `model/` package
+-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+-script_dir = os.path.dirname(os.path.abspath(__file__))
+-if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py")):
+-    # Move script dir to the end so package-style `model.*` can be resolved first.
+-    sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
+-import argparse
+-
+-from training.core.dataloader import MultiEmbDataLoader, ChunkedNpzDataLoader
+-from training.core.char_tokenizer import CharTokenizer
+-from training.core.checkpoint import Checkpointer
+-from model.config import WeakDecoderConfig
+-from model.phase0_5_charencoder_cuda import TinyCharEncoderCUDA, load_mlx_safetensors_into_torch
+-from model.god_encoder_cuda import GodEncoderCUDA
+-from model.adapter_cuda import SensoryFuserCUDA
+-from model.decoder_cuda import WeakDecoderCUDA
+-
+-def custom_lr_schedule(global_step: int, max_lr: float, warmup_steps: int):
+-    # Absolute linear warmup from 0
+-    if global_step < warmup_steps:
+-        return max_lr * (global_step / warmup_steps)
+-    return max_lr
+-
+-
+-def load_optional_config(config_file: str):
+-    if not config_file:
+-        return {}
+-    if not os.path.exists(config_file):
+-        raise FileNotFoundError(f"Config file not found: {config_file}")
+-    with open(config_file, "r", encoding="utf-8") as f:
+-        return json.load(f)
+-
+-
+-def resolve_path_maybe_relative(path_value: str, base_dir: str):
+-    if not path_value:
+-        return path_value
+-    if os.path.isabs(path_value):
+-        return path_value
+-    candidate = os.path.join(base_dir, path_value)
+-    if os.path.exists(candidate):
+-        return candidate
+-    return path_value
+-
+-
+-def infer_teacher_arch_from_ckpt(p0_ckpt: str):
+-    from safetensors.torch import load_file
+-
+-    fuser_path = os.path.join(p0_ckpt, "sense_fuser.safetensors")
+-    if not os.path.exists(fuser_path):
+-        fuser_path = os.path.join(p0_ckpt, "sense_adapter.safetensors")
+-    if not os.path.exists(fuser_path):
+-        raise FileNotFoundError(f"Missing sense_fuser/sense_adapter checkpoint under: {p0_ckpt}")
+-
+-    god_path = os.path.join(p0_ckpt, "god_encoder.safetensors")
+-    if not os.path.exists(god_path):
+-        raise FileNotFoundError(f"Missing god_encoder.safetensors under: {p0_ckpt}")
+-
+-    fuser_state = load_file(fuser_path)
+-    god_state = load_file(god_path)
+-
+-    route_dims = {}
+-    d_model = None
+-    for key, tensor in fuser_state.items():
+-        m = re.match(r"adapters\.(\d+)\.(?:net\.layers\.0|fc1)\.weight$", key)
+-        if m:
+-            idx = int(m.group(1))
+-            route_dims[idx] = int(tensor.shape[1])
+-            d_model = int(tensor.shape[0])
+-
+-    if not route_dims:
+-        raise RuntimeError(f"Could not infer adapter routes from {fuser_path}")
+-
+-    emb_dims = [route_dims[i] for i in sorted(route_dims.keys())]
+-
+-    z_dim = None
+-    for key, tensor in god_state.items():
+-        if key in {"net.layers.2.weight", "fc2.weight"}:
+-            z_dim = int(tensor.shape[0])
+-            if d_model is None:
+-                d_model = int(tensor.shape[1])
+-            break
+-
+-    if z_dim is None:
+-        raise RuntimeError(f"Could not infer z_dim from {god_path}")
+-    if d_model is None:
+-        raise RuntimeError(f"Could not infer d_model from {fuser_path}/{god_path}")
+-
+-    return fuser_path, god_path, emb_dims, d_model, z_dim
+-
+-
+-def resolve_emb_paths(args, ds_config: dict, expected_routes: int):
+-    if args.emb_paths:
+-        emb_paths = args.emb_paths
+-    elif ds_config.get("emb_paths"):
+-        emb_paths = ds_config["emb_paths"]
+-    else:
+-        emb_paths = sorted(glob.glob(os.path.join(args.emb_dir, "*embeddings*.npy")))
+-
+-    if len(emb_paths) != expected_routes:
+-        msg = (
+-            f"Embedding route mismatch: expected {expected_routes} from checkpoint, "
+-            f"but got {len(emb_paths)} embedding files. paths={emb_paths}"
+-        )
+-        if args.strict_route_check:
+-            raise ValueError(msg)
+-        if len(emb_paths) < expected_routes:
+-            raise ValueError(msg + " | Non-strict cannot recover from fewer routes.")
+-        print(f"[Warn] {msg} | Non-strict mode: truncating to first {expected_routes} paths.")
+-        emb_paths = emb_paths[:expected_routes]
+-    return emb_paths
+-
+-
+-def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
+-    has_chunked_conf = bool(ds_config.get("base_models") and ds_config.get("chunk_name_patterns"))
+-    config_base_dir = os.path.dirname(os.path.abspath(args.config_file)) if args.config_file else os.getcwd()
+-    parquet_path = args.parquet_path or ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_wiki.parquet")
+-    parquet_path = resolve_path_maybe_relative(parquet_path, config_base_dir)
+-
+-    if has_chunked_conf:
+-        models = ds_config["base_models"]
+-        chunk_patterns = ds_config["chunk_name_patterns"]
+-        ms_repo_id = ds_config.get("modelscope_repo_id")
+-        if len(models) != expected_routes:
+-            msg = (
+-                f"Model route mismatch: checkpoint expects {expected_routes}, "
+-                f"but config has {len(models)} base_models={models}"
+-            )
+-            if args.strict_route_check:
+-                raise ValueError(msg)
+-            if len(models) < expected_routes:
+-                raise ValueError(msg + " | Non-strict cannot recover from fewer routes.")
+-            print(f"[Warn] {msg} | Non-strict mode: truncating to first {expected_routes} models.")
+-            models = models[:expected_routes]
+-            chunk_patterns = {k: v for k, v in chunk_patterns.items() if k in models}
+-        print(f"[Data] Using ChunkedNpzDataLoader ({len(models)} routes, dynamic ModelScope/local chunks).")
+-        return ChunkedNpzDataLoader(
+-            parquet_path=parquet_path,
+-            models=models,
+-            chunk_patterns=chunk_patterns,
+-            tokenizer=tokenizer,
+-            ms_repo_id=ms_repo_id,
+-            chunk_size=args.chunk_size,
+-            local_npz_dir=args.data_dir,
+-            cache_dir=args.download_cache_dir,
+-            batch_size=args.batch_size,
+-            max_seq_len=args.max_seq_len,
+-            shuffle=True,
+-            lazy_start=True,
+-            backend='torch'
+-        )
+-
+-    emb_paths = resolve_emb_paths(args, ds_config, expected_routes)
+-    print(f"[Data] Using MultiEmbDataLoader ({len(emb_paths)} routes): {emb_paths}")
+-    return MultiEmbDataLoader(
+-        parquet_path=parquet_path,
+-        emb_paths=emb_paths,
+-        tokenizer=tokenizer,
+-        batch_size=args.batch_size,
+-        max_seq_len=args.max_seq_len,
+-        backend='torch'
+-    )
+-
+-
+-def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir: str):
+-    # Only patch ChunkedNpzDataLoader-like objects.
+-    if not hasattr(loader, "models") or not hasattr(loader, "chunk_patterns"):
+-        return loader
+-
+-    local_data_dir = os.path.abspath(local_data_dir)
+-    download_cache_dir = os.path.abspath(download_cache_dir)
+-    loader.npz_dir = local_data_dir
+-    loader.cache_dir = download_cache_dir
+-    _cand_locks = {}
+-    _cand_locks_guard = threading.Lock()
+-    _last_temp_cleanup_at = 0.0
+-
+-    def _cleanup_stale_temp_artifacts(now_ts: float = None, stale_seconds: int = 600):
+-        """
+-        Best-effort cleanup for leftover temp artifacts from interrupted downloads.
+-        We only delete stale files to avoid racing with active downloads.
+-        """
+-        nonlocal _last_temp_cleanup_at
+-        if now_ts is None:
+-            now_ts = time.time()
+-        # Avoid scanning too frequently.
+-        if now_ts - _last_temp_cleanup_at < 30:
+-            return
+-        _last_temp_cleanup_at = now_ts
+-
+-        roots = {
+-            os.path.join(local_data_dir, "._____temp"),
+-            os.path.join(download_cache_dir, "._____temp"),
+-            local_data_dir,
+-            download_cache_dir,
+-        }
+-        deleted_files = 0
+-        deleted_dirs = 0
+-        for root in roots:
+-            if not root or not os.path.exists(root):
+-                continue
+-            for dp, _, fs in os.walk(root, topdown=False):
+-                for fn in fs:
+-                    fp = os.path.join(dp, fn)
+-                    try:
+-                        age = now_ts - os.path.getmtime(fp)
+-                    except OSError:
+-                        continue
+-                    if age < stale_seconds:
+-                        continue
+-                    # Temp naming patterns observed in HF/ModelScope caches.
+-                    is_temp = (
+-                        fn.endswith(".incomplete")
+-                        or fn.endswith(".tmp")
+-                        or fn.endswith(".partial")
+-                        or ".tmp." in fn
+-                    )
+-                    if is_temp:
+-                        try:
+-                            os.remove(fp)
+-                            deleted_files += 1
+-                        except OSError:
+-                            pass
+-                # Remove empty leaf dirs under temp roots.
+-                try:
+-                    if dp.startswith(os.path.join(local_data_dir, "._____temp")) or dp.startswith(
+-                        os.path.join(download_cache_dir, "._____temp")
+-                    ):
+-                        if not os.listdir(dp):
+-                            os.rmdir(dp)
+-                            deleted_dirs += 1
+-                except OSError:
+-                    pass
+-        if deleted_files or deleted_dirs:
+-            print(f"[DataLoader] 🧹 清理临时残留: files={deleted_files}, dirs={deleted_dirs}")
+-
+-    def _get_cand_lock(cand_name: str):
+-        with _cand_locks_guard:
+-            if cand_name not in _cand_locks:
+-                _cand_locks[cand_name] = threading.Lock()
+-            return _cand_locks[cand_name]
+-
+-    if local_data_dir == download_cache_dir:
+-        print(f"[Data] Download+read directory unified at: {local_data_dir}")
+-    else:
+-        print(
+-            f"[Data] Download cache: {download_cache_dir} | Read directory: {local_data_dir} "
+-            f"(download then stage into read dir)"
+-        )
+-
+-    def _resolve_npz_path(cand_name: str):
+-        _cleanup_stale_temp_artifacts()
+-        local_path = os.path.join(local_data_dir, cand_name)
+-        cand_lock = _get_cand_lock(cand_name)
+-        with cand_lock:
+-            if os.path.exists(local_path):
+-                return local_path
+-
+-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+-            if loader.ms_repo_id:
+-                from modelscope.hub.file_download import dataset_file_download
+-                last_err = None
+-                downloaded_path = None
+-                for retry in range(3):
+-                    try:
+-                        downloaded_path = dataset_file_download(
+-                            loader.ms_repo_id, cand_name, cache_dir=download_cache_dir
+-                        )
+-                        break
+-                    except FileNotFoundError as e:
+-                        # ModelScope temp-file race under concurrent access; retry is safe.
+-                        last_err = e
+-                        time.sleep(0.5)
+-                if downloaded_path is None:
+-                    raise last_err
+-                downloaded_path = os.path.abspath(downloaded_path)
+-            else:
+-                downloaded_path = os.path.join(local_data_dir, cand_name)
+-                if not os.path.exists(downloaded_path):
+-                    raise FileNotFoundError(f"本地目标块缺失：{downloaded_path}")
+-
+-            if downloaded_path != os.path.abspath(local_path):
+-                try:
+-                    os.replace(downloaded_path, local_path)
+-                except OSError:
+-                    shutil.copy2(downloaded_path, local_path)
+-                    try:
+-                        os.remove(downloaded_path)
+-                    except OSError:
+-                        pass
+-            return local_path
+-
+-    loader._resolve_npz_path = _resolve_npz_path
+-
+-    # Keep async prefetch behavior, but make it always read from local_data_dir.
+-    def _prefetch_worker_routed(start_macro_ptr):
+-        worker_macro_ptr = start_macro_ptr
+-        while not loader.stop_event.is_set():
+-            if worker_macro_ptr >= len(loader.macro_chunk_indices):
+-                loader.prefetch_queue.put(None)
+-                return
+-
+-            chunk_idx = loader.macro_chunk_indices[worker_macro_ptr]
+-            start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+-
+-            try:
+-                active_chunk_embs = []
+-                cached_paths = []
+-                for model_name in loader.models:
+-                    pattern = loader.chunk_patterns.get(model_name, f"{model_name}_chunk_{{start:07d}}_{{end:07d}}.npz")
+-                    model_end = loader._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+-                    cand_name = pattern.format(start=start_idx, end=model_end)
+-
+-                    path = loader._resolve_npz_path(cand_name)
+-                    arr = load_npz_features_with_repair(loader, path, cand_name=cand_name)
+-                    active_chunk_embs.append(arr)
+-                    cached_paths.append(path)
+-
+-                cur_chunk_size = end_idx - start_idx
+-                active_micro_indices = np.arange(cur_chunk_size)
+-                if loader.shuffle:
+-                    rng = np.random.default_rng(loader.seed + worker_macro_ptr + loader.current_epoch)
+-                    rng.shuffle(active_micro_indices)
+-
+-                payload = {
+-                    "embs": active_chunk_embs,
+-                    "micro_indices": active_micro_indices,
+-                    "global_start": start_idx,
+-                    "macro_idx_ptr": worker_macro_ptr,
+-                    "cached_paths": cached_paths,
+-                }
+-                loader.prefetch_queue.put(payload)
+-                worker_macro_ptr += 1
+-            except Exception as e:
+-                print(f"\n[DataLoader] 后台打工仔抓取/加载失败 (网络可能断开了？): {e}")
+-                print(f"[DataLoader] 这不是致命错误！打工仔将在 10 秒后原地重新尝试拉取 Chunk {chunk_idx}...")
+-                import time
+-                time.sleep(10)
+-                continue
+-
+-    loader._prefetch_worker = _prefetch_worker_routed
+-    return loader
+-
+-
+-def load_npz_features_with_repair(loader, path: str, cand_name: str = None, max_retries: int = 2):
+-    attempt = 0
+-    last_err = None
+-    while attempt <= max_retries:
+-        try:
+-            return np.load(path)["features"]
+-        except (zipfile.BadZipFile, OSError, ValueError) as e:
+-            last_err = e
+-            attempt += 1
+-            if attempt > max_retries:
+-                break
+-            print(f"[Warn] Corrupted npz detected: {path} ({e}). retry {attempt}/{max_retries}")
+-            try:
+-                if os.path.exists(path):
+-                    os.remove(path)
+-            except OSError:
+-                pass
+-
+-            if cand_name and hasattr(loader, "_resolve_npz_path"):
+-                path = loader._resolve_npz_path(cand_name)
+-            elif cand_name and loader.ms_repo_id:
+-                from modelscope.hub.file_download import dataset_file_download
+-                path = dataset_file_download(loader.ms_repo_id, cand_name, cache_dir=loader.cache_dir)
+-            else:
+-                raise
+-    raise RuntimeError(f"Failed to load npz after retries: {path} | last_error={last_err}")
+-
+-
+-def disable_chunk_prefetch(loader):
+-    # Only patch ChunkedNpzDataLoader-like objects.
+-    if not hasattr(loader, "chunk_bounds") or not hasattr(loader, "macro_chunk_indices"):
+-        return loader
+-
+-    # Stop any existing worker thread if it has been started.
+-    try:
+-        if hasattr(loader, "stop_event"):
+-            loader.stop_event.set()
+-        if hasattr(loader, "prefetch_thread") and loader.prefetch_thread.is_alive():
+-            loader.prefetch_thread.join(timeout=1.0)
+-    except Exception:
+-        pass
+-
+-    def _load_payload_sync(macro_ptr):
+-        if macro_ptr >= len(loader.macro_chunk_indices):
+-            return None
+-
+-        chunk_idx = loader.macro_chunk_indices[macro_ptr]
+-        start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+-        active_chunk_embs = []
+-        cached_paths = []
+-
+-        for model_name in loader.models:
+-            pattern = loader.chunk_patterns.get(
+-                model_name, f"{model_name}_chunk_{{start:07d}}_{{end:07d}}.npz"
+-            )
+-            model_end = loader._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+-            cand_name = pattern.format(start=start_idx, end=model_end)
+-
+-            if hasattr(loader, "_resolve_npz_path"):
+-                path = loader._resolve_npz_path(cand_name)
+-            elif loader.ms_repo_id:
+-                from modelscope.hub.file_download import dataset_file_download
+-                path = dataset_file_download(loader.ms_repo_id, cand_name, cache_dir=loader.cache_dir)
+-            else:
+-                path = os.path.join(loader.npz_dir, cand_name)
+-                if not os.path.exists(path):
+-                    raise FileNotFoundError(f"本地目标块缺失：{path}")
+-
+-            arr = load_npz_features_with_repair(loader, path, cand_name=cand_name)
+-            active_chunk_embs.append(arr)
+-            cached_paths.append(path)
+-
+-        cur_chunk_size = end_idx - start_idx
+-        active_micro_indices = np.arange(cur_chunk_size)
+-        if loader.shuffle:
+-            rng = np.random.default_rng(loader.seed + macro_ptr + loader.current_epoch)
+-            rng.shuffle(active_micro_indices)
+-
+-        return {
+-            "embs": active_chunk_embs,
+-            "micro_indices": active_micro_indices,
+-            "global_start": start_idx,
+-            "macro_idx_ptr": macro_ptr,
+-            "cached_paths": cached_paths,
+-        }
+-
+-    def _start_prefetching_sync(start_macro_ptr):
+-        loader._sync_next_macro_ptr = start_macro_ptr
+-
+-    def _pop_next_chunk_sync():
+-        if loader.auto_cleanup and getattr(loader, "_prev_chunk_paths", []):
+-            loader._cleanup_cached_files(loader._prev_chunk_paths)
+-            loader._prev_chunk_paths = []
+-
+-        if not hasattr(loader, "_sync_next_macro_ptr"):
+-            if getattr(loader, "active_chunk_embs", None) is None:
+-                loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0)
+-            else:
+-                loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0) + 1
+-
+-        payload = _load_payload_sync(loader._sync_next_macro_ptr)
+-        if payload is None:
+-            raise StopIteration
+-
+-        loader.active_chunk_embs = payload["embs"]
+-        loader.active_micro_indices = payload["micro_indices"]
+-        loader.active_global_start = payload["global_start"]
+-        loader.active_macro_idx_ptr = payload["macro_idx_ptr"]
+-        loader.active_micro_ptr = 0
+-        loader._prev_chunk_paths = payload.get("cached_paths", [])
+-        loader._sync_next_macro_ptr += 1
+-
+-        if not hasattr(loader, "emb_dims"):
+-            loader.emb_dims = [arr.shape[-1] for arr in loader.active_chunk_embs]
+-            print(f"[DataLoader] 自动侦测到多路特征维度: {loader.emb_dims}")
+-
+-        print(f"\n[DataLoader] 🐢 同步按需加载新块 (全局起点: {loader.active_global_start})")
+-
+-    loader._start_prefetching = _start_prefetching_sync
+-    loader._pop_next_chunk = _pop_next_chunk_sync
+-    if getattr(loader, "active_chunk_embs", None) is None:
+-        loader._started = False
+-    else:
+-        loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0) + 1
+-    return loader
+-
+-
+-def enable_download_only_prefetch(loader):
+-    # Download chunks ahead in background, but load npz arrays only on demand.
+-    if not hasattr(loader, "chunk_bounds") or not hasattr(loader, "macro_chunk_indices"):
+-        return loader
+-
+-    # Stop any existing prefetch worker first.
+-    try:
+-        if hasattr(loader, "stop_event"):
+-            loader.stop_event.set()
+-        if hasattr(loader, "prefetch_thread") and loader.prefetch_thread.is_alive():
+-            loader.prefetch_thread.join(timeout=1.0)
+-    except Exception:
+-        pass
+-
+-    def _download_chunk_only(macro_ptr):
+-        if macro_ptr >= len(loader.macro_chunk_indices):
+-            return False
+-        chunk_idx = loader.macro_chunk_indices[macro_ptr]
+-        start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+-        for model_name in loader.models:
+-            pattern = loader.chunk_patterns.get(
+-                model_name, f"{model_name}_chunk_{{start:07d}}_{{end:07d}}.npz"
+-            )
+-            model_end = loader._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+-            cand_name = pattern.format(start=start_idx, end=model_end)
+-            if hasattr(loader, "_resolve_npz_path"):
+-                loader._resolve_npz_path(cand_name)
+-            elif loader.ms_repo_id:
+-                from modelscope.hub.file_download import dataset_file_download
+-                dataset_file_download(loader.ms_repo_id, cand_name, cache_dir=loader.cache_dir)
+-            else:
+-                path = os.path.join(loader.npz_dir, cand_name)
+-                if not os.path.exists(path):
+-                    raise FileNotFoundError(f"本地目标块缺失：{path}")
+-        return True
+-
+-    def _download_worker(start_macro_ptr, stop_event):
+-        macro_ptr = start_macro_ptr
+-        while not stop_event.is_set():
+-            if macro_ptr >= len(loader.macro_chunk_indices):
+-                return
+-            chunk_idx = loader.macro_chunk_indices[macro_ptr]
+-            try:
+-                _download_chunk_only(macro_ptr)
+-                macro_ptr += 1
+-            except Exception as e:
+-                print(f"\n[DataLoader] 后台下载失败: {e}")
+-                print(f"[DataLoader] 10 秒后重试 Chunk {chunk_idx}（仅下载模式）...")
+-                time.sleep(10)
+-
+-    def _start_prefetching_download_only(start_macro_ptr):
+-        # Stop previous background downloader.
+-        if hasattr(loader, "_dl_stop_event") and loader._dl_stop_event is not None:
+-            loader._dl_stop_event.set()
+-        if hasattr(loader, "_dl_thread") and loader._dl_thread is not None and loader._dl_thread.is_alive():
+-            loader._dl_thread.join(timeout=1.0)
+-
+-        loader._dl_stop_event = threading.Event()
+-        loader._dl_thread = threading.Thread(
+-            target=_download_worker, args=(start_macro_ptr, loader._dl_stop_event), daemon=True
+-        )
+-        loader._dl_thread.start()
+-        loader._sync_next_macro_ptr = start_macro_ptr
+-
+-    def _pop_next_chunk_sync():
+-        if loader.auto_cleanup and getattr(loader, "_prev_chunk_paths", []):
+-            loader._cleanup_cached_files(loader._prev_chunk_paths)
+-            loader._prev_chunk_paths = []
+-
+-        if not hasattr(loader, "_sync_next_macro_ptr"):
+-            if getattr(loader, "active_chunk_embs", None) is None:
+-                loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0)
+-            else:
+-                loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0) + 1
+-
+-        macro_ptr = loader._sync_next_macro_ptr
+-        if macro_ptr >= len(loader.macro_chunk_indices):
+-            raise StopIteration
+-
+-        chunk_idx = loader.macro_chunk_indices[macro_ptr]
+-        start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+-        active_chunk_embs = []
+-        cached_paths = []
+-
+-        for model_name in loader.models:
+-            pattern = loader.chunk_patterns.get(
+-                model_name, f"{model_name}_chunk_{{start:07d}}_{{end:07d}}.npz"
+-            )
+-            model_end = loader._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+-            cand_name = pattern.format(start=start_idx, end=model_end)
+-
+-            if hasattr(loader, "_resolve_npz_path"):
+-                path = loader._resolve_npz_path(cand_name)
+-            elif loader.ms_repo_id:
+-                from modelscope.hub.file_download import dataset_file_download
+-                path = dataset_file_download(loader.ms_repo_id, cand_name, cache_dir=loader.cache_dir)
+-            else:
+-                path = os.path.join(loader.npz_dir, cand_name)
+-                if not os.path.exists(path):
+-                    raise FileNotFoundError(f"本地目标块缺失：{path}")
+-
+-            arr = load_npz_features_with_repair(loader, path, cand_name=cand_name)
+-            active_chunk_embs.append(arr)
+-            cached_paths.append(path)
+-
+-        cur_chunk_size = end_idx - start_idx
+-        active_micro_indices = np.arange(cur_chunk_size)
+-        if loader.shuffle:
+-            rng = np.random.default_rng(loader.seed + macro_ptr + loader.current_epoch)
+-            rng.shuffle(active_micro_indices)
+-
+-        loader.active_chunk_embs = active_chunk_embs
+-        loader.active_micro_indices = active_micro_indices
+-        loader.active_global_start = start_idx
+-        loader.active_macro_idx_ptr = macro_ptr
+-        loader.active_micro_ptr = 0
+-        loader._prev_chunk_paths = cached_paths
+-        loader._sync_next_macro_ptr += 1
+-
+-        if not hasattr(loader, "emb_dims"):
+-            loader.emb_dims = [arr.shape[-1] for arr in loader.active_chunk_embs]
+-            print(f"[DataLoader] 自动侦测到多路特征维度: {loader.emb_dims}")
+-
+-        print(f"\n[DataLoader] 📦 仅下载预取模式：同步装载块 (全局起点: {loader.active_global_start})")
+-
+-    loader._start_prefetching = _start_prefetching_download_only
+-    loader._pop_next_chunk = _pop_next_chunk_sync
+-    if getattr(loader, "active_chunk_embs", None) is None:
+-        loader._started = False
+-    else:
+-        loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0) + 1
+-    return loader
+-
+-
+-def expected_checkpoint_dir(out_dir: str, prefix: str, step: int, is_emergency: bool = False):
+-    base_name = "latest_emergency" if is_emergency else f"step_{step}"
+-    folder_name = f"{prefix}_{base_name}" if prefix else base_name
+-    return os.path.join(out_dir, folder_name)
+-
+-
+-def extract_prefix_from_checkpoint_name(folder_name: str):
+-    if folder_name == "latest_emergency" or folder_name.startswith("step_"):
+-        return ""
+-    if folder_name.endswith("_latest_emergency"):
+-        return folder_name[: -len("_latest_emergency")]
+-    m = re.match(r"(.+)_step_\d+$", folder_name)
+-    if m:
+-        return m.group(1)
+-    return ""
+-
+-
+-def infer_checkpoint_step(ckpt_dir: str, folder_name: str):
+-    state_file = os.path.join(ckpt_dir, "dataloader.json")
+-    if os.path.exists(state_file):
+-        try:
+-            with open(state_file, "r", encoding="utf-8") as f:
+-                state = json.load(f)
+-            return int(state.get("global_step", -1))
+-        except Exception:
+-            pass
+-    m = re.search(r"_step_(\d+)$", folder_name)
+-    if m:
+-        return int(m.group(1))
+-    m = re.match(r"step_(\d+)$", folder_name)
+-    if m:
+-        return int(m.group(1))
+-    return -1
+-
+-
+-def has_student_weights(ckpt_dir: str):
+-    return (
+-        os.path.exists(os.path.join(ckpt_dir, "student.pt"))
+-        or os.path.exists(os.path.join(ckpt_dir, "student.safetensors"))
+-    )
+-
+-
+-def _is_checkpoint_dir_name(folder_name: str):
+-    if folder_name == "latest_emergency" or folder_name.startswith("step_"):
+-        return True
+-    if folder_name.endswith("_latest_emergency"):
+-        return True
+-    return bool(re.match(r".+_step_\d+$", folder_name))
+-
+-
+-def is_resume_checkpoint_valid(ckpt_dir: str):
+-    """
+-    A checkpoint is resumable only when critical files exist and are readable.
+-    """
+-    student_ok = has_student_weights(ckpt_dir)
+-    if not student_ok:
+-        return False, "missing student weights"
+-
+-    state_file = os.path.join(ckpt_dir, "dataloader.json")
+-    if not os.path.exists(state_file):
+-        return False, "missing dataloader.json"
+-    try:
+-        with open(state_file, "r", encoding="utf-8") as f:
+-            state = json.load(f)
+-        _ = int(state.get("global_step", -1))
+-    except Exception as e:
+-        return False, f"broken dataloader.json ({e})"
+-
+-    opt_path = os.path.join(ckpt_dir, "optimizer.pt")
+-    if not os.path.exists(opt_path):
+-        return False, "missing optimizer.pt"
+-    try:
+-        torch.load(opt_path, map_location="cpu")
+-    except Exception as e:
+-        return False, f"broken optimizer.pt ({e})"
+-
+-    return True, ""
+-
+-
+-def find_latest_checkpoint_across_all(out_dir: str, preferred_prefix: str = None):
+-    if not os.path.isdir(out_dir):
+-        return None, 0, preferred_prefix or ""
+-
+-    candidates = []
+-    for d in os.listdir(out_dir):
+-        full = os.path.join(out_dir, d)
+-        if not os.path.isdir(full):
+-            continue
+-        # Only treat true training checkpoints as resume candidates.
+-        if not has_student_weights(full):
+-            continue
+-        step = infer_checkpoint_step(full, d)
+-        prefix = extract_prefix_from_checkpoint_name(d)
+-        mtime = os.path.getmtime(full)
+-        prefix_rank = 1 if (preferred_prefix is not None and prefix == preferred_prefix) else 0
+-        candidates.append((step, prefix_rank, mtime, full, prefix, d))
+-
+-    if not candidates:
+-        return None, 0, preferred_prefix or ""
+-
+-    # Highest global_step wins; if tied, prefer preferred_prefix; if still tied, newer mtime.
+-    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+-    for step, _, _, ckpt_dir, prefix, folder_name in candidates:
+-        ok, reason = is_resume_checkpoint_valid(ckpt_dir)
+-        if ok:
+-            return ckpt_dir, max(step, 0), prefix
+-        print(f"[Resume] Dropping invalid checkpoint: {ckpt_dir} | reason: {reason}")
+-        # Auto-remove obviously broken checkpoint folders so next run won't pick them again.
+-        if _is_checkpoint_dir_name(folder_name):
+-            try:
+-                shutil.rmtree(ckpt_dir)
+-                print(f"[Resume] Removed broken checkpoint folder: {ckpt_dir}")
+-            except Exception as e:
+-                print(f"[Resume] Failed to remove broken checkpoint folder: {ckpt_dir} ({e})")
+-    return None, 0, preferred_prefix or ""
+-
+-
+-def find_checkpoint_dir_by_step(out_dir: str, prefix: str, step: int):
+-    if not os.path.isdir(out_dir):
+-        return None
+-    candidates = []
+-    for d in os.listdir(out_dir):
+-        full = os.path.join(out_dir, d)
+-        if not os.path.isdir(full):
+-            continue
+-        if prefix:
+-            if not (d.startswith(f"{prefix}_step_") or d == f"{prefix}_latest_emergency"):
+-                continue
+-        elif not (d.startswith("step_") or d == "latest_emergency"):
+-            continue
+-        state_file = os.path.join(full, "dataloader.json")
+-        if not os.path.exists(state_file):
+-            continue
+-        try:
+-            with open(state_file, "r", encoding="utf-8") as f:
+-                state = json.load(f)
+-            if int(state.get("global_step", -1)) == int(step):
+-                candidates.append(full)
+-        except Exception:
+-            continue
+-    if not candidates:
+-        return None
+-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+-    return candidates[0]
+-
+-
+-def load_torch_optimizer_state(optimizer, out_dir: str, prefix: str, step: int):
+-    if step <= 0:
+-        return False
+-    ckpt_dir = find_checkpoint_dir_by_step(out_dir, prefix, step)
+-    if not ckpt_dir:
+-        return False
+-    opt_path = os.path.join(ckpt_dir, "optimizer.pt")
+-    if not os.path.exists(opt_path):
+-        return False
+-    state = torch.load(opt_path, map_location="cpu")
+-    optimizer.load_state_dict(state)
+-    print(f"[Resume] Loaded optimizer state from: {opt_path}")
+-    return True
+-
+-
+-def load_torch_optimizer_state_from_dir(optimizer, ckpt_dir: str):
+-    if not ckpt_dir:
+-        return False
+-    opt_path = os.path.join(ckpt_dir, "optimizer.pt")
+-    if not os.path.exists(opt_path):
+-        return False
+-    state = torch.load(opt_path, map_location="cpu")
+-    optimizer.load_state_dict(state)
+-    print(f"[Resume] Loaded optimizer state from: {opt_path}")
+-    return True
+-
+-
+-def save_torch_optimizer_state(optimizer, out_dir: str, prefix: str, step: int, is_emergency: bool = False):
+-    ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
+-    os.makedirs(ckpt_dir, exist_ok=True)
+-    opt_path = os.path.join(ckpt_dir, "optimizer.pt")
+-    torch.save(optimizer.state_dict(), opt_path)
+-    print(f"[Checkpoint] Saved optimizer state to {opt_path}")
+-
+-
+-def get_distill_parser():
+-    parser = argparse.ArgumentParser(description="PyTorch Standalone Embedding Distillation (Teacher -> Student)")
+-    parser.add_argument("--batch_size", type=int, default=256)
+-    parser.add_argument("--epochs", type=int, default=3)
+-    parser.add_argument("--lr", type=float, default=1e-4) # Safe default LR for deep networks
+-    parser.add_argument("--warmup_steps", type=int, default=5000)
+-    parser.add_argument("--ce_start_step", type=int, default=10000, help="Step to start fading in CE loss")
+-    parser.add_argument("--ce_full_step", type=int, default=20000, help="Step where CE loss reaches full weight")
+-    parser.add_argument("--ce_max_weight", type=float, default=1.0, help="Maximum weight for the Cross Entropy loss")
+-    parser.add_argument("--max_seq_len", type=int, default=256)
+-    parser.add_argument("--save_steps", type=int, default=10000)
+-    parser.add_argument("--out_dir", type=str, default="checkpoints/distilled")
+-    parser.add_argument("--ckpt_prefix", type=str, default="tinybert_pt_v1")
+-    parser.add_argument("--p0_ckpt", type=str, required=True, help="Frozen Phase 0 MLX weights to distill from")
+-    parser.add_argument("--config_file", type=str, default=None, help="Optional dataset config (e.g. HollyShit dataset_config.json)")
+-    parser.add_argument("--emb_paths", nargs="*", default=None, help="Explicit embedding .npy paths for MultiEmbDataLoader")
+-    parser.add_argument("--emb_dir", type=str, default="data/Basic_ZH/embs/hy-tmp", help="Auto-discovery dir for *embeddings*.npy")
+-    parser.add_argument("--parquet_path", type=str, default=None, help="Parquet path override; falls back to config or legacy default")
+-    parser.add_argument("--data_dir", type=str, default="./embs", help="Local read directory for chunked npz files")
+-    parser.add_argument("--download_cache_dir", type=str, default=None, help="Temporary download cache dir for chunked npz; defaults to --data_dir")
+-    parser.add_argument("--chunk_size", type=int, default=500000, help="Chunk size used by ChunkedNpzDataLoader")
+-    parser.add_argument("--strict_route_check", action=argparse.BooleanOptionalAction, default=True, help="Require checkpoint routes and data routes to match exactly")
+-    parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True, help="Enable async chunk prefetch for ChunkedNpzDataLoader")
+-    parser.add_argument("--download_only_prefetch", action="store_true", help="Background download ahead but do not preload npz arrays into memory")
+-    parser.add_argument("--student_d_model", type=int, default=1024, help="Student hidden size")
+-    parser.add_argument("--student_n_heads", type=int, default=8, help="Student attention heads")
+-    parser.add_argument("--student_n_layers", type=int, default=6, help="Student transformer layers")
+-    return parser
+-
+-def main():
+-    parser = get_distill_parser()
+-    args = parser.parse_args()
+-    
+-    # Dual-Backend Hardward Detector
+-    if torch.cuda.is_available():
+-        device = torch.device("cuda")
+-        print("\n🔥 [Hardware] CUDA cluster detected. Booting NVIDIA PyTorch Amp Backend...")
+-    elif torch.backends.mps.is_available():
+-        device = torch.device("mps")
+-        print("\n🍏 [Hardware] Apple Silicon detected. Booting PyTorch MPS Accelerated Backend...")
+-    else:
+-        device = torch.device("cpu")
+-        print("\n🐢 [Hardware] CPU only detected.")
+-        
+-    ds_config = load_optional_config(args.config_file)
+-    if args.download_cache_dir is None:
+-        args.download_cache_dir = args.data_dir
+-
+-    config = WeakDecoderConfig()
+-    config.max_seq_len = args.max_seq_len
+-
+-    tokenizer = CharTokenizer()
+-
+-    fuser_path, god_path, emb_dims, d_model, z_dim = infer_teacher_arch_from_ckpt(args.p0_ckpt)
+-    print(
+-        f"\n[Teacher Arch] routes={len(emb_dims)} emb_dims={emb_dims} "
+-        f"d_model={d_model} z_dim={z_dim}"
+-    )
+-
+-    dataloader = build_dataloader(args, tokenizer, ds_config, expected_routes=len(emb_dims))
+-    dataloader = attach_chunk_download_router(dataloader, args.data_dir, args.download_cache_dir)
+-    if args.download_only_prefetch:
+-        dataloader = enable_download_only_prefetch(dataloader)
+-        print("[Data] Download-only prefetch enabled: async download ahead, sync npz load on demand.")
+-    elif not args.prefetch:
+-        dataloader = disable_chunk_prefetch(dataloader)
+-        print("[Data] Async prefetch disabled: running in synchronous on-demand chunk loading mode.")
+-
+-    # 1. Instantiate the Frozen PyTorch Teacher Replicas
+-    fuser = SensoryFuserCUDA(emb_dims, d_model).to(device)
+-    god_encoder = GodEncoderCUDA(d_model, z_dim).to(device)
+-
+-    print(f"\n[Bridging MLX -> PyTorch] Loading Frozen Teacher Safetensors from {args.p0_ckpt}...")
+-    load_mlx_safetensors_into_torch(fuser, fuser_path)
+-    load_mlx_safetensors_into_torch(god_encoder, god_path)
+-    
+-    # 1.5 Load Frozen WeakDecoder for Reconstruction Guidance
+-    print(f"[Bridging MLX -> PyTorch] Loading Frozen WeakDecoder from {args.p0_ckpt}...")
+-    decoder = WeakDecoderCUDA(z_dim=z_dim, vocab_size=config.vocab_size, d_model=256, n_layers=4).to(device)
+-    decoder_path = os.path.join(args.p0_ckpt, "decoder.safetensors")
+-    if not os.path.exists(decoder_path):
+-        decoder_path = os.path.join(args.p0_ckpt, "weak_decoder.safetensors")
+-    load_mlx_safetensors_into_torch(decoder, decoder_path)
+-    decoder.eval()
+-    for param in decoder.parameters():
+-        param.requires_grad = False
+-
+-    # 2. Instantiate the Tiny Student Encoder
+-    print("[Student] Initializing PyTorch TinyCharEncoder (FlashAttention-2 + RoPE enabled)...")
+-    student = TinyCharEncoderCUDA(
+-        vocab_size=config.vocab_size,
+-        d_model=args.student_d_model,
+-        n_heads=args.student_n_heads,
+-        n_layers=args.student_n_layers,
+-        max_seq_len=config.max_seq_len,
+-        z_dim=z_dim
+-    ).to(device)
+-
+-    # 3. Optimizer & AMP Scaler
+-    optimizer = optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
+-    use_amp = (device.type == "cuda")
+-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+-
+-    # 4. Universal Checkpointer
+-    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
+-    checkpointer.register_model("student", student)
+-    checkpointer.register_dataloader("dataloader", dataloader)
+-    checkpointer.register_args(args)
+-
+-    resume_dir, _, resume_prefix = find_latest_checkpoint_across_all(
+-        args.out_dir, preferred_prefix=args.ckpt_prefix
+-    )
+-    if resume_dir:
+-        checkpointer.prefix = resume_prefix
+-        print(f"[Resume] Auto-selected latest checkpoint across all: {resume_dir}")
+-        start_step = checkpointer.load(resume_dir)
+-        if not load_torch_optimizer_state_from_dir(optimizer, resume_dir):
+-            # Fallback keeps backward compatibility with older folders.
+-            load_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, start_step)
+-    else:
+-        print(f"[Resume] No checkpoint found under {args.out_dir}. Starting from step 0.")
+-        start_step = 0
+-
+-    # 5. Training Loop
+-    global_step = start_step
+-    
+-    print(f"\n========================================================")
+-    print(f"🚀 PyTorch Main Engine Ignited! Target Epochs: {args.epochs}")
+-    print(f"⚙️  Batch: {args.batch_size} | Configured AMP: {use_amp} | Peak LR: {args.lr}")
+-    print(f"========================================================\n")
+-    
+-    try:
+-        for epoch in range(dataloader.current_epoch, args.epochs):
+-            for token_inputs, batch_embs, attention_mask in dataloader:
+-                global_step += 1
+-                if len(batch_embs) != len(emb_dims):
+-                    msg = (
+-                        f"Runtime embedding route mismatch: got {len(batch_embs)} routes, "
+-                        f"expected {len(emb_dims)} from teacher checkpoint"
+-                    )
+-                    if args.strict_route_check:
+-                        raise ValueError(msg)
+-                    if len(batch_embs) < len(emb_dims):
+-                        raise ValueError(msg + " | Non-strict cannot recover from fewer routes.")
+-                    print(f"[Warn] {msg} | Non-strict mode: truncating runtime routes.")
+-                    batch_embs = batch_embs[:len(emb_dims)]
+-                
+-                # A: Manual LR Schedule injection
+-                lr = custom_lr_schedule(global_step, args.lr, args.warmup_steps)
+-                for param_group in optimizer.param_groups:
+-                    param_group['lr'] = lr
+-                
+-                # B: Async Non-Blocking Tensor Memory Transfer
+-                token_inputs = token_inputs.to(device, non_blocking=True)
+-                attention_mask = attention_mask.to(device, non_blocking=True)
+-                batch_embs = [emb.to(device, non_blocking=True) for emb in batch_embs]
+-                
+-                # C: Zero the Grads
+-                optimizer.zero_grad(set_to_none=True)
+-                
+-                # D: Forward Pass (Using Dynamic AMP casting)
+-                # Note: No custom compilation closure necessary in PyTorch natively
+-                with torch.autocast(device_type='cuda', enabled=use_amp):
+-                    # Ground Truth Target Logic
+-                    with torch.no_grad():
+-                        f_t = fuser(batch_embs, weights=None) 
+-                        z_target_truth = god_encoder(f_t)
+-                        if len(z_target_truth.shape) == 3:
+-                             z_target_truth = z_target_truth.squeeze(1)
+-                             
+-                    # Student Logic (The heavy lifting graph)
+-                    z_pred = student(token_inputs, attention_mask)
+-                    
+-                    # 1. MSE Loss (Topology Anchoring)
+-                    # FIX: Use reduction='none', sum over features, mean over batch to prevent 1/1024 gradient dilution
+-                    loss_mse = F.mse_loss(z_pred, z_target_truth, reduction='none').sum(dim=1).mean()
+-                    
+-                    # --- 2. InfoNCE Loss (Spatial Repulsion) ---
+-                    z_pred_norm = F.normalize(z_pred, p=2, dim=1)
+-                    z_target_norm = F.normalize(z_target_truth, p=2, dim=1)
+-                    similarity_matrix = torch.matmul(z_pred_norm, z_target_norm.T)
+-                    tau = 0.1
+-                    logits = similarity_matrix / tau
+-                    labels = torch.arange(token_inputs.size(0), device=device)
+-                    loss_infonce = F.cross_entropy(logits, labels)
+-                    
+-                    # --- 3. WeakDecoder CE Loss (Semantic Anchoring) ---
+-                    decoder_inputs = token_inputs[:, :-1]
+-                    decoder_targets = token_inputs[:, 1:]
+-                    decoder_logits = decoder(z_pred, decoder_inputs)
+-                    
+-                    pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0
+-                    loss_ce = F.cross_entropy(
+-                        decoder_logits.reshape(-1, config.vocab_size), 
+-                        decoder_targets.reshape(-1), 
+-                        ignore_index=pad_token_id
+-                    )
+-                    
+-                    # Dynamic Curriculum Learning Weights
+-                    if global_step <= args.ce_start_step:
+-                        ce_weight = 0.0
+-                        infonce_weight = 0.1 # ALWAYS ON to prevent mean collapse!
+-                    elif global_step <= args.ce_full_step:
+-                        alpha = (global_step - args.ce_start_step) / float(args.ce_full_step - args.ce_start_step)
+-                        ce_weight = alpha * args.ce_max_weight
+-                        infonce_weight = 0.1 # ALWAYS ON
+-                    else:
+-                        ce_weight = args.ce_max_weight
+-                        infonce_weight = 0.1
+-                    
+-                    # --- Ultimate Fusion ---
+-                    loss = loss_mse + infonce_weight * loss_infonce + ce_weight * loss_ce
+-                    
+-                # E: Backward execution with AMP Loss Scaling
+-                scaler.scale(loss).backward()
+-                
+-                # F: Crucial Global Infinity Prevention Gradient Clipping (Airbag Mechanism)
+-                scaler.unscale_(optimizer)
+-                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+-                
+-                # G: Opt Execute
+-                scaler.step(optimizer)
+-                scaler.update()
+-                
+-                if global_step % 10 == 0:
+-                     print(f"Epoch {epoch+1} | Step {global_step} | Total: {loss.item():.4f} (MSE: {loss_mse.item():.4f} | InfoNCE: {loss_infonce.item():.4f} * {infonce_weight:.2f} | CE: {loss_ce.item():.4f} * {ce_weight:.2f})")
+-                     
+-                if global_step % args.save_steps == 0:
+-                     checkpointer.save(global_step)
+-                     save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step)
+-                     
+-    except KeyboardInterrupt:
+-        print(f"\n[Interrupt] Caught PyTorch kill signal at step {global_step}! Emergency save triggered.")
+-        checkpointer.save(global_step, is_emergency=True)
+-        save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step, is_emergency=True)
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/training/train_pre_phase1_dit_cuda.py b/training/train_pre_phase1_dit_cuda.py
+deleted file mode 100644
+index d8cc8a3..0000000
+--- a/training/train_pre_phase1_dit_cuda.py
++++ /dev/null
+@@ -1,265 +0,0 @@
+-import os
+-import sys
+-
+-# [BUG FIX]
+-# (1) Specific Problem: Running this training script on servers via python command raises 
+-#     "ModuleNotFoundError: No module named 'training'" because the workspace root is not in Python path.
+-# (2) Method to Resolve: Explicitly insert the parent directory of this script (workspace root) 
+-#     into the beginning of sys.path before importing local project packages (model, training).
+-# (3) Caveats: Ensure any other newly created root-level script or nested script imports 
+-#     local packages using absolute workspace imports by executing this path resolution first.
+-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+-
+-# [BUG FIX]
+-# (1) Specific Problem: The training loss plateaus early and evaluation yields random noise. 
+-#     This occurs because Flow Matching uses X_0 ~ N(0, 1), but the target embeddings X_1 
+-#     have a very small standard deviation (e.g., 0.032). This scale mismatch causes the velocity 
+-#     field to be dominated by noise, preventing the model from learning the target data distribution.
+-# (2) Method to Resolve: Dynamically calculate the standard deviation of the target embeddings (X_1) 
+-#     and compute a `scale_factor` to upscale X_1 to have a variance of ~1.0 during training.
+-#     This factor must be saved to `training_args.json` and applied inversely during inference/evaluation.
+-# (3) Caveats: NEVER attempt Flow Matching or Diffusion without matching the scale of the target 
+-#     data to the scale of the initial noise distribution! Failure to do so mathematically 
+-#     dooms the model to predict pure noise reduction.
+-
+-import argparse
+-import time
+-import math
+-import numpy as np
+-import pandas as pd
+-import torch
+-import torch.nn as nn
+-import torch.optim as optim
+-import torch.nn.functional as F
+-from torch.utils.data import DataLoader, Dataset
+-from training.core.char_tokenizer import CharTokenizer
+-from training.core.args import get_training_parser
+-from training.core.checkpoint import Checkpointer
+-
+-from distilled_emb.model_cuda import TinyCharEncoderCUDA
+-from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
+-
+-class ChunkTextDataset(Dataset):
+-    def __init__(self, parquet_path):
+-        print(f"Loading parquet from {parquet_path}")
+-        df = pd.read_parquet(parquet_path)
+-        self.chunks = df['chunks'].explode().dropna().tolist()
+-        print(f"Loaded {len(self.chunks)} text chunks.")
+-        
+-    def __len__(self):
+-        return len(self.chunks)
+-        
+-    def __getitem__(self, idx):
+-        return self.chunks[idx]
+-
+-def get_args():
+-    # 1. Inherit from the unified training arguments template
+-    parser = get_training_parser(description="Sequence Flow Matcher Training")
+-    
+-    # 2. Append flow-matcher specific arguments
+-    parser.add_argument("--parquet_path", type=str, default="data/Basic_ZH/chunked_mixed_wiki.parquet", help="Path to chunked text dataset")
+-    parser.add_argument("--tinybert_ckpt", type=str, required=True, help="Path to frozen TinyCharEncoder pt/safetensors file")
+-    parser.add_argument("--max_seq_len", type=int, default=64, help="Max length of target sequence")
+-    parser.add_argument("--d_model", type=int, default=512, help="Hidden dimension of Flow Matcher")
+-    parser.add_argument("--n_layers", type=int, default=6, help="Number of Transformer layers")
+-    parser.add_argument("--n_heads", type=int, default=8, help="Number of attention heads")
+-    parser.add_argument("--log_steps", type=int, default=50, help="Log step interval")
+-    parser.add_argument("--max_steps", type=int, default=-1, help="Max training steps (for quick testing)")
+-    
+-    # 3. Override default settings for flow-matcher training
+-    parser.set_defaults(
+-        out_dir="checkpoints/flow_matcher",
+-        batch_size=256,
+-        epochs=10,
+-        lr=1e-4
+-    )
+-    
+-    return parser.parse_args()
+-
+-def main():
+-    args = get_args()
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+-    os.makedirs(args.out_dir, exist_ok=True)
+-    
+-    tokenizer = CharTokenizer()
+-
+-    # 1. Load Dataset
+-    dataset = ChunkTextDataset(args.parquet_path)
+-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+-    
+-    # 2. Load Frozen TinyCharEncoder
+-    print(f"Loading Frozen TinyCharEncoder from {args.tinybert_ckpt}")
+-    if args.tinybert_ckpt.endswith(".safetensors"):
+-        from safetensors.torch import load_file
+-        weights = load_file(args.tinybert_ckpt)
+-    else:
+-        weights = torch.load(args.tinybert_ckpt, map_location='cpu', weights_only=True)
+-    
+-    sniffed_z_dim = weights['out_proj.weight'].shape[0]
+-    sniffed_x_dim = weights['tok_emb.weight'].shape[1] # e.g. 1024
+-    
+-    tiny_encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size, d_model=sniffed_x_dim, z_dim=sniffed_z_dim)
+-    tiny_encoder.load_state_dict(weights, strict=False)
+-    for param in tiny_encoder.parameters():
+-        param.requires_grad = False
+-    tiny_encoder.eval()
+-    tiny_encoder.to(device)
+-    
+-    # Calculate scale factor for Flow Matching
+-    std_x = tiny_encoder.tok_emb.weight.std().item()
+-    scale_factor = 1.0 / max(std_x, 1e-5)
+-    args.emb_scale_factor = scale_factor
+-    print(f"Calculated target embedding std: {std_x:.6f}, using scale_factor: {scale_factor:.2f}")
+-    
+-    # 3. Initialize Sequence Flow Matcher
+-    print(f"Initializing NARFlowMatcherCUDA: layers={args.n_layers}, d_model={args.d_model}, z_dim={sniffed_z_dim}, x_dim={sniffed_x_dim}")
+-    decoder = NARFlowMatcherCUDA(
+-        z_dim=sniffed_z_dim,
+-        x_dim=sniffed_x_dim,
+-        d_model=args.d_model,
+-        n_layers=args.n_layers,
+-        n_heads=args.n_heads,
+-        max_seq_len=args.max_seq_len
+-    ).to(device)
+-    
+-    optimizer = optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=1e-2)
+-    scaler = torch.cuda.amp.GradScaler()
+-    
+-    # 4. Initialize Unified Checkpointer
+-    checkpointer = Checkpointer(
+-        out_dir=args.out_dir,
+-        prefix=args.ckpt_prefix,
+-        keep_last_k=args.keep_last_k
+-    )
+-    checkpointer.register_model("flow_matcher", decoder)
+-    checkpointer.register_args(args)
+-    
+-    global_step = 0
+-    start_epoch = 0
+-    load_dir = None
+-    
+-    # Handle Resume logic via Checkpointer
+-    if args.resume_from:
+-        global_step = checkpointer.load(args.resume_from)
+-        load_dir = args.resume_from
+-    elif args.auto_resume:
+-        global_step = checkpointer.load_latest()
+-        if global_step > 0:
+-            base_name = f"step_{global_step}"
+-            folder_name = f"{checkpointer.prefix}_{base_name}" if checkpointer.prefix else base_name
+-            load_dir = os.path.join(args.out_dir, folder_name)
+-            
+-    # Load PyTorch specific optimizer/scaler states if resumed
+-    if global_step > 0 and load_dir is not None:
+-        opt_path = os.path.join(load_dir, "optimizer.pt")
+-        scaler_path = os.path.join(load_dir, "scaler.pt")
+-        if os.path.exists(opt_path):
+-            optimizer.load_state_dict(torch.load(opt_path, map_location='cpu', weights_only=True))
+-            print(f"Resumed PyTorch optimizer state from {opt_path}")
+-        if os.path.exists(scaler_path):
+-            scaler.load_state_dict(torch.load(scaler_path, map_location='cpu'))
+-            print(f"Resumed PyTorch scaler state from {scaler_path}")
+-            
+-        start_epoch = global_step // len(dataloader)
+-        print(f"Resumed training at Epoch {start_epoch + 1}, Step {global_step}")
+-    
+-    print("Starting Sequence Flow Matcher Training...")
+-    
+-    for epoch in range(start_epoch, args.epochs):
+-        decoder.train()
+-        for batch_idx, texts in enumerate(dataloader):
+-            global_step += 1
+-            
+-            # --- Prepare text IDs & Masks ---
+-            enc_ids_list = [tokenizer.encode(t, add_special_tokens=True) for t in texts]
+-            
+-            e_ids_t, e_mask_t, d_ids_t = [], [], []
+-            for seq in enc_ids_list:
+-                # Sequence with BOS and EOS
+-                seq_trunc = seq[:args.max_seq_len]
+-                pad_len = args.max_seq_len - len(seq_trunc)
+-                
+-                padded_seq = seq_trunc + [tokenizer.pad_token_id] * pad_len
+-                mask = [1] * len(seq_trunc) + [0] * pad_len
+-                
+-                e_ids_t.append(padded_seq)
+-                e_mask_t.append(mask)
+-                d_ids_t.append(padded_seq)
+-                
+-            enc_ids = torch.tensor(e_ids_t, dtype=torch.long, device=device)
+-            enc_mask = torch.tensor(e_mask_t, dtype=torch.long, device=device)
+-            target_ids = torch.tensor(d_ids_t, dtype=torch.long, device=device)
+-            
+-            # Create target mask (1 for valid/EOS, 0 for PAD)
+-            target_mask = (target_ids != tokenizer.pad_token_id).float().to(device)
+-            
+-            # 1. Forward frozen encoder to get conditions
+-            with torch.no_grad():
+-                with torch.cuda.amp.autocast():
+-                    z_truth = tiny_encoder(enc_ids, attention_mask=enc_mask) # (B, z_dim)
+-                    # Get ground truth static word embeddings as target X_1
+-                    X_1 = tiny_encoder.tok_emb(target_ids) # (B, L, x_dim)
+-                    X_1 = X_1 * scale_factor # Scale target to match noise variance
+-                    
+-            # 2. Sample flow matching variables
+-            B, L, D = X_1.shape
+-            t = torch.rand((B,), device=device)
+-            X_0 = torch.randn_like(X_1) # High-gaussian noise shape (B, L, D)
+-            
+-            # Interpolated flow state: X_t = t * X_1 + (1 - t) * X_0
+-            t_expand = t.view(B, 1, 1)
+-            X_t = t_expand * X_1 + (1.0 - t_expand) * X_0
+-            
+-            # Ground truth velocity vector field: U_t = X_1 - X_0
+-            U_t = X_1 - X_0
+-            
+-            optimizer.zero_grad()
+-            with torch.cuda.amp.autocast():
+-                # Predict velocity field
+-                V_t = decoder(X_t, t, z_truth) # (B, L, x_dim)
+-                
+-                # Compute MSE loss for ALL tokens (including PAD)
+-                # If we don't train the model to denoise PAD tokens, the unconstrained noise 
+-                # in the padded regions will corrupt the valid tokens via self-attention during inference!
+-                loss = F.mse_loss(V_t, U_t)
+-                
+-            scaler.scale(loss).backward()
+-            scaler.unscale_(optimizer)
+-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+-            scaler.step(optimizer)
+-            scaler.update()
+-            
+-            if global_step % args.log_steps == 0:
+-                print(f"Epoch {epoch+1}/{args.epochs} | Step {global_step} | Loss: {loss.item():.4f}")
+-                
+-            if global_step % args.save_steps == 0:
+-                checkpointer.save(global_step)
+-                
+-                base_name = f"step_{global_step}"
+-                folder_name = f"{checkpointer.prefix}_{base_name}" if checkpointer.prefix else base_name
+-                save_dir = os.path.join(args.out_dir, folder_name)
+-                
+-                torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+-                torch.save(scaler.state_dict(), os.path.join(save_dir, "scaler.pt"))
+-                print(f"Saved PyTorch optimizer & scaler states to {save_dir}")
+- 
+-            if args.max_steps > 0 and global_step >= args.max_steps:
+-                print(f"Reached max_steps ({args.max_steps}). Stopping training early.")
+-                break
+-                
+-        if args.max_steps > 0 and global_step >= args.max_steps:
+-            break
+-
+-        # Save epoch checkpoint via Checkpointer
+-        checkpointer.save(global_step)
+-        
+-        base_name = f"step_{global_step}"
+-        folder_name = f"{checkpointer.prefix}_{base_name}" if checkpointer.prefix else base_name
+-        save_dir = os.path.join(args.out_dir, folder_name)
+-        
+-        torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+-        torch.save(scaler.state_dict(), os.path.join(save_dir, "scaler.pt"))
+-        print(f"Saved Epoch {epoch+1} checkpoint to {save_dir}")
+-
+-if __name__ == "__main__":
+-    main()

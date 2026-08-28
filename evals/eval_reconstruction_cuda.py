@@ -11,8 +11,8 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from training.core.char_tokenizer import CharTokenizer
-from distilled_emb.model_cuda import TinyCharEncoderCUDA
-from model.pre_phase1_dit_cuda import NARFlowMatcherCUDA
+from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
+from model.phase2_dit_cuda import NARFlowMatcherCUDA
 
 def load_training_args(flow_ckpt_path):
     ckpt_dir = os.path.dirname(flow_ckpt_path)
@@ -48,12 +48,15 @@ def evaluate(args):
     
     # 2. Load Flow Matcher Configuration
     config = load_training_args(args.flow_ckpt)
-    d_model = config.get("d_model", args.d_model)
-    n_layers = config.get("n_layers", args.n_layers)
-    n_heads = config.get("n_heads", args.n_heads)
-    max_seq_len = config.get("max_seq_len", args.max_seq_len)
+    if not config:
+        print("Warning: training_args.json not found! Using fallback defaults (d_model=512, n_layers=6, n_heads=8, max_seq_len=64)")
+    
+    d_model = config.get("d_model", 512)
+    n_layers = config.get("n_layers", 6)
+    n_heads = config.get("n_heads", 8)
+    max_seq_len = config.get("max_seq_len", 64)
     emb_scale_factor = config.get("emb_scale_factor", 1.0)
-    print(f"Model parameters: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
+    print(f"Model parameters loaded from config: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, max_seq_len={max_seq_len}, scale_factor={emb_scale_factor:.2f}")
     
     # 3. Instantiate and Load Flow Matcher
     flow_matcher = NARFlowMatcherCUDA(
@@ -85,6 +88,9 @@ def evaluate(args):
     correct_chars = 0
     total_sentences = 0
     exact_match_sentences = 0
+    good_match_sentences = 0
+    perfect_match_strings = []
+    good_match_examples = []
     total_cosine_sim = 0.0
     cosine_count = 0
     
@@ -121,15 +127,33 @@ def evaluate(args):
                 # Get ground truth embedding X_1
                 X_1 = encoder.tok_emb(target_ids)
                 
-            # 2. ODE Solver (Euler Integration)
+            # 2. ODE Solver (Spherical Euler Integration)
+            # Sample initial gaussian noise sequence X_0 and project to hypersphere
             x_t = torch.randn((B, max_seq_len, sniffed_x_dim), device=device)
+            import torch.nn.functional as F
+            x_t = F.normalize(x_t, p=2, dim=-1) * emb_scale_factor
+            
             dt = 1.0 / args.steps
             for i in range(args.steps):
                 t_val = float(i) / args.steps
                 t_tensor = torch.tensor([t_val] * B, device=device, dtype=torch.float32)
                 with torch.cuda.amp.autocast():
-                    v_pred = flow_matcher(x_t, t_tensor, z_macro)
+                    if args.cfg_scale == 1.0:
+                        v_pred = flow_matcher(x_t, t_tensor, z_macro)
+                    else:
+                        # Classifier-Free Guidance (CFG)
+                        # 1. Compute conditional velocity
+                        v_cond = flow_matcher(x_t, t_tensor, z_macro)
+                        # 2. Compute unconditional velocity (z_macro = 0)
+                        z_uncond = torch.zeros_like(z_macro)
+                        v_uncond = flow_matcher(x_t, t_tensor, z_uncond)
+                        # 3. Extrapolate
+                        v_pred = v_uncond + args.cfg_scale * (v_cond - v_uncond)
+                
+                # Euler Step along the tangent
                 x_t = x_t + v_pred * dt
+                # Re-project to stay strictly on the hypersphere
+                x_t = F.normalize(x_t, p=2, dim=-1) * emb_scale_factor
                 
             # 3. Project to vocab and compute accuracy
             emb_weights = encoder.tok_emb.weight
@@ -155,8 +179,19 @@ def evaluate(args):
                 sent_len = sent_mask.sum().item()
                 sent_correct = correct_mask[b].sum().item()
                 total_sentences += 1
+                if sent_len > 0 and (sent_correct / sent_len) >= 0.60:
+                    good_match_sentences += 1
+                    if sent_correct < sent_len and len(good_match_examples) < 10:
+                        token_list = predicted_tokens[b][:int(sent_len)].tolist()
+                        decoded_str = tokenizer.decode(token_list)
+                        original_str = texts[b]
+                        good_match_examples.append((original_str, decoded_str, (sent_correct / sent_len) * 100))
                 if sent_correct == sent_len:
                     exact_match_sentences += 1
+                    # Decode to string (skip special tokens if you want, but they are exactly matched)
+                    token_list = predicted_tokens[b][:int(sent_len)].tolist()
+                    decoded_str = tokenizer.decode(token_list)
+                    perfect_match_strings.append(decoded_str)
                     
             # Compute cosine similarity between generated representation and X_1
             dot_product = (x_t * X_1).sum(dim=-1) # (B, L)
@@ -170,6 +205,7 @@ def evaluate(args):
             
     char_acc = (correct_chars / total_chars) * 100 if total_chars > 0 else 0
     em_rate = (exact_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
+    good_rate = (good_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
     avg_cos = (total_cosine_sim / cosine_count) if cosine_count > 0 else 0
     
     print("\n" + "="*50)
@@ -182,11 +218,32 @@ def evaluate(args):
     print(f"Avg Cosine Sim:   {avg_cos:.4f} (Closer to 1.0 is better)")
     print(f"Char Accuracy:    {char_acc:.2f}% (Token-level matching)")
     print(f"Sentence EM:      {em_rate:.2f}% (Entire sentence matching)")
+    print(f"Sentences (>=60%):{good_rate:.2f}% (Sentences with >= 60% char acc)")
     print("="*50)
-    print("\nStopping Criterion Reference:")
-    print(" - Char Accuracy > 90% and Sentence EM > 50%: Model is fully converged and ready to stop.")
-    print(" - If Char Accuracy plateaus for 1 Epoch: Can stop and proceed to Phase 2.")
+    print("="*50)
+    print("\n[Phase 2] Stopping Criterion Reference:")
+    print(" - Char Accuracy > 90% and Sentence EM > 50%: Flow Matcher is fully converged.")
+    print(" - Model is ready for downstream latent generation (Phase 3).")
     print("="*50 + "\n")
+    
+    if perfect_match_strings:
+        print("\n" + "*"*50)
+        print("  🎉 Perfectly Reconstructed Sentences (Examples) ")
+        print("*"*50)
+        # Show up to 20 exact matches
+        for i, s in enumerate(perfect_match_strings[:20]):
+            print(f" {i+1}. {s}")
+        print("*"*50 + "\n")
+        
+    if good_match_examples:
+        print("\n" + "*"*50)
+        print("  🤔 Good Reconstructions (>=60% but <100%) ")
+        print("*"*50)
+        for i, (orig, recon, acc) in enumerate(good_match_examples):
+            print(f"--- Example {i+1} (Acc: {acc:.1f}%) ---")
+            print(f"Original: {orig}")
+            print(f"Reconstr: {recon}\n")
+        print("*"*50 + "\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Flow Matcher Reconstruction Accuracy (CUDA)")
@@ -194,11 +251,8 @@ if __name__ == "__main__":
     parser.add_argument("--flow_ckpt", type=str, required=True, help="Path to trained flow matcher PyTorch checkpoint")
     parser.add_argument("--parquet_path", type=str, required=True, help="Path to evaluation dataset")
     parser.add_argument("--num_samples", type=int, default=200, help="Number of samples to evaluate on")
-    parser.add_argument("--steps", type=int, default=20, help="Integration steps")
-    parser.add_argument("--max_seq_len", type=int, default=64)
-    parser.add_argument("--d_model", type=int, default=512)
-    parser.add_argument("--n_layers", type=int, default=6)
-    parser.add_argument("--n_heads", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=50, help="Integration steps")
+    parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-Free Guidance scale (1.0 means no guidance)")
     
     args = parser.parse_args()
     evaluate(args)

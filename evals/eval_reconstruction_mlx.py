@@ -9,8 +9,8 @@ import mlx.core as mx
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from training.core.char_tokenizer import CharTokenizer
-from distilled_emb.model import TinyCharEncoder
-from model.pre_phase1_dit import NARFlowMatcher
+from model.phase1_charencoder import TinyCharEncoder
+from model.phase2_dit import NARFlowMatcher
 
 def load_pt_checkpoint(pt_path):
     import torch
@@ -124,6 +124,9 @@ def evaluate(args):
     correct_chars = 0
     total_sentences = 0
     exact_match_sentences = 0
+    good_match_sentences = 0
+    perfect_match_strings = []
+    good_match_examples = []
     total_cosine_sim = 0.0
     cosine_count = 0
     
@@ -155,14 +158,26 @@ def evaluate(args):
         z_macro = encoder(enc_ids, attention_mask=enc_mask)
         X_1 = encoder.tok_emb(target_ids)
         
-        # 2. ODE Solver (Euler Integration)
+        # 2. ODE Solver (Spherical Euler Integration)
         x_t = mx.random.normal((B, max_seq_len, sniffed_x_dim))
+        x_t = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8) * emb_scale_factor
+        
         dt = 1.0 / args.steps
         for i in range(args.steps):
             t_val = float(i) / args.steps
             t_tensor = mx.array([t_val] * B)
-            v_pred = flow_matcher(x_t, t_tensor, z_macro)
+            if args.cfg_scale == 1.0:
+                v_pred = flow_matcher(x_t, t_tensor, z_macro)
+            else:
+                v_cond = flow_matcher(x_t, t_tensor, z_macro)
+                z_uncond = mx.zeros_like(z_macro)
+                v_uncond = flow_matcher(x_t, t_tensor, z_uncond)
+                v_pred = v_uncond + args.cfg_scale * (v_cond - v_uncond)
+            
+            # Euler step
             x_t = x_t + v_pred * dt
+            # Re-project to hypersphere
+            x_t = x_t / (mx.linalg.norm(x_t, axis=-1, keepdims=True) + 1e-8) * emb_scale_factor
             
         # 3. Project to vocab and compute accuracy
         emb_weights = encoder.tok_emb.weight
@@ -193,8 +208,16 @@ def evaluate(args):
             correct_chars += s_corr
             total_chars += s_len
             total_sentences += 1
+            if s_len > 0 and (s_corr / s_len) >= 0.60:
+                good_match_sentences += 1
+                if s_corr < s_len and len(good_match_examples) < 10:
+                    token_list = predicted_tokens[b][:s_len].tolist()
+                    decoded_str = tokenizer.decode(token_list)
+                    original_str = texts[b]
+                    good_match_examples.append((original_str, decoded_str, (s_corr / s_len) * 100))
             if s_corr == s_len:
                 exact_match_sentences += 1
+                perfect_match_strings.append(texts[b])
                 
         # Compute cosine similarity
         dot_product = (x_t * X_1).sum(axis=-1)
@@ -212,6 +235,7 @@ def evaluate(args):
 
     char_acc = (correct_chars / total_chars) * 100 if total_chars > 0 else 0
     em_rate = (exact_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
+    good_rate = (good_match_sentences / total_sentences) * 100 if total_sentences > 0 else 0
     avg_cos = (total_cosine_sim / cosine_count) if cosine_count > 0 else 0
     
     print("\n" + "="*50)
@@ -224,7 +248,31 @@ def evaluate(args):
     print(f"Avg Cosine Sim:   {avg_cos:.4f} (Closer to 1.0 is better)")
     print(f"Char Accuracy:    {char_acc:.2f}% (Token-level matching)")
     print(f"Sentence EM:      {em_rate:.2f}% (Entire sentence matching)")
+    print(f"Sentences (>=60%):{good_rate:.2f}% (Sentences with >= 60% char acc)")
     print("="*50)
+    
+    if perfect_match_strings:
+        print("\n" + "*"*50)
+        print("  🎉 Perfectly Reconstructed Sentences (Examples) ")
+        print("*"*50)
+        for i, s in enumerate(perfect_match_strings[:20]):
+            print(f" {i+1}. {s}")
+        print("*"*50 + "\n")
+        
+    if good_match_examples:
+        print("\n" + "*"*50)
+        print("  🤔 Good Reconstructions (>=60% but <100%) ")
+        print("*"*50)
+        for i, (orig, recon, acc) in enumerate(good_match_examples):
+            print(f"--- Example {i+1} (Acc: {acc:.1f}%) ---")
+            print(f"Original: {orig}")
+            print(f"Reconstr: {recon}\n")
+        print("*"*50 + "\n")
+        
+    print("\n[Phase 2] Stopping Criterion Reference:")
+    print(" - Char Accuracy > 90% and Sentence EM > 50%: Flow Matcher is fully converged.")
+    print(" - Model is ready for downstream latent generation (Phase 3).")
+    print("="*50 + "\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Flow Matcher Reconstruction Accuracy (MLX)")
@@ -233,6 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--parquet_path", type=str, required=True, help="Path to evaluation dataset")
     parser.add_argument("--num_samples", type=int, default=200, help="Number of samples to evaluate on")
     parser.add_argument("--steps", type=int, default=20, help="Integration steps")
+    parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-Free Guidance scale")
     parser.add_argument("--max_seq_len", type=int, default=64)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_layers", type=int, default=6)

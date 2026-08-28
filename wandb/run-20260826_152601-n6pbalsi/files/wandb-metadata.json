@@ -1,0 +1,56 @@
+{
+  "os":  "macOS-26.5.2-arm64-arm-64bit",
+  "python":  "CPython 3.12.12",
+  "startedAt":  "2026-08-26T07:26:01.453695Z",
+  "args":  [
+    "--epochs",
+    "5",
+    "--batch_size",
+    "32",
+    "--lr",
+    "5e-4",
+    "--num_layers",
+    "4",
+    "--kernel_size",
+    "7",
+    "--out_dir",
+    "checkpoints/phase2_2_conv",
+    "--ckpt_prefix",
+    "depthwise",
+    "--save_steps",
+    "5000"
+  ],
+  "program":  "/Users/kael/workbench/HollyShit/training/train_phase2_2_2_depthwise_convdecoder.py",
+  "codePath":  "training/train_phase2_2_2_depthwise_convdecoder.py",
+  "codePathLocal":  "training/train_phase2_2_2_depthwise_convdecoder.py",
+  "git":  {
+    "remote":  "https://github.com/catclever/HollyShit.git",
+    "commit":  "610f305c5c655cf1dcd78598ef6d5a634de3c2ab"
+  },
+  "email":  "saint.archangel.satan@gmail.com",
+  "root":  "/Users/kael/workbench/HollyShit",
+  "host":  "KaelsMagic.local",
+  "executable":  "/Users/kael/workbench/HollyShit/.venv/bin/python3",
+  "cpu_count":  12,
+  "cpu_count_logical":  12,
+  "disk":  {
+    "/":  {
+      "total":  "994662584320",
+      "used":  "897545850880"
+    }
+  },
+  "memory":  {
+    "total":  "68719476736"
+  },
+  "apple":  {
+    "name":  "Apple M2 Max",
+    "ecpuCores":  4,
+    "pcpuCores":  8,
+    "gpuCores":  38,
+    "memoryGb":  64,
+    "swapTotalBytes":  "7516192768",
+    "ramTotalBytes":  "68719476736",
+    "macModel":  "Mac14,6"
+  },
+  "writerId":  "ksbfm1c4qzdgepkes8cx289uqdrnxns8"
+}
