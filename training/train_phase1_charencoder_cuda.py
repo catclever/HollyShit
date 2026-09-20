@@ -22,7 +22,7 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
     sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
 import argparse
 
-from training.data.phase1_alignment_dataloader import Phase1_MultiEmbDataLoader, Phase1_ChunkedNpzDataLoader
+from training.data.alignment_dataloader import Phase1_MultiEmbDataLoader, Phase1_ChunkedNpzDataLoader
 from training.core.char_tokenizer import CharTokenizer
 from training.core.checkpoint import Checkpointer
 from model.config import WeakDecoderConfig

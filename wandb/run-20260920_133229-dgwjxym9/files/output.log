@@ -1,0 +1,9 @@
+Loading Omni data from data/Basic_ZH/chunked_mixed_omni.parquet...
+Loaded 551502 Omni documents.
+Building Omni aligned indices (max_len=512)...
+Index built! Total aligned sequences: 854859
+[WeightUtils] Successfully loaded PyTorch weights into MLX model from checkpoints/basencoder_step_115000/student.pt
+Loaded encoder from checkpoints/basencoder_step_115000/student.pt
+No seed provided. Auto-generated fresh random seed: 359202
+Set epoch deterministic seed to 359202
+Epoch 1 | Step 100 | Loss: 5.0986 | Time/100steps: 247.20s

@@ -80,9 +80,9 @@ def train():
         
     tokenizer = CharTokenizer()
     config.vocab_size = tokenizer.vocab_size
-    from data.phase1_5_omni_dataset import Phase1_5_OmniDataset
+    from data.omni_dataset import OmniDataset
     
-    dataset = Phase1_5_OmniDataset(
+    dataset = OmniDataset(
         omni_parquet_path="data/Basic_ZH/chunked_mixed_omni.parquet",
         tokenizer=tokenizer,
         seq_len=args.seq_len

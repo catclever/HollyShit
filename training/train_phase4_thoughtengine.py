@@ -8,9 +8,9 @@ import sys
 import json
 import torch
 from training.core.char_tokenizer import CharTokenizer
-from training.data.phase2_mixed_dataset import Phase2_MixedDataset
-from model.phase2_mamba_mlx import MambaReaderMLX
-from model.phase2_dit_mlx import ConceptDiTMLX
+from training.data.mixed_dataset import MixedDataset
+from model.phase4_mamba_mlx import MambaReaderMLX
+from model.phase4_dit_mlx import ConceptDiTMLX
 from model.concept_chunker import ConceptChunker
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from training.core.args import get_training_parser
@@ -61,7 +61,7 @@ def train():
     args = parser.parse_args()
     
     tokenizer = CharTokenizer()
-    dataset = Phase2_MixedDataset(
+    dataset = MixedDataset(
         wiki_parquet_path="data/Basic_ZH/wiki_filtered.parquet",
         dialogues_jsonl_path="data/Basic_ZH/dialogues_254k.jsonl",
         tokenizer=tokenizer,

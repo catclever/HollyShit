@@ -13,7 +13,7 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
     sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
     
 from training.core.char_tokenizer import CharTokenizer
-from training.data.phase2_mixed_dataset import Phase2_MixedDataset
+from training.data.mixed_dataset import MixedDataset
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.concept_chunker import ConceptChunker
 from model.phase2_mamba import MambaReader
@@ -24,7 +24,7 @@ def train():
     print(f"Using device: {device}")
     
     tokenizer = CharTokenizer()
-    dataset = Phase2_MixedDataset(
+    dataset = MixedDataset(
         wiki_parquet_path="data/Basic_ZH/wiki_filtered.parquet",
         dialogues_jsonl_path="data/Basic_ZH/dialogues_254k.jsonl",
         tokenizer=tokenizer,

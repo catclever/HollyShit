@@ -14,7 +14,7 @@ import mlx.optimizers as optim
 from model.config import ModelConfig
 from model.adapter import SensoryFuser
 from model.god_encoder import GodEncoder
-from training.data.phase1_alignment_dataloader import Phase1_MultiEmbDataLoader, Phase1_ChunkedNpzDataLoader
+from training.data.alignment_dataloader import Phase1_MultiEmbDataLoader, Phase1_ChunkedNpzDataLoader
 from training.core.char_tokenizer import CharTokenizer
 from training.core.checkpoint import Checkpointer
 from training.core.schedule import linear_warmup_schedule

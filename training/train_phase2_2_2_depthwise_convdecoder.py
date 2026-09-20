@@ -73,16 +73,24 @@ def train():
         args = checkpointer.load_args(resume_ckpt_path, args)
         config = load_config(resume_ckpt_path, DepthwiseConvDecoderConfig, filename="decoder_config.json")
         if config:
+            # Check for conflict: Trying to resume a non-dilated checkpoint with --use_dilation flag
+            if args.use_dilation != config.use_dilation:
+                raise ValueError(f"[Config Conflict] You are trying to resume a checkpoint with use_dilation={config.use_dilation}, but your CLI arguments have use_dilation={args.use_dilation}. The semantic receptive fields are incompatible. You must start a new training run from scratch if you change the dilation topology.")
             print(f"Loaded DepthwiseConvDecoderConfig from {resume_ckpt_path}/decoder_config.json")
     
     if config is None:
         config = extract_config_from_args(args, DepthwiseConvDecoderConfig)
+
+    # --- Hardware & Topology Validation ---
+    if config.kernel_size % 2 == 0:
+        raise ValueError(f"[Topology Error] kernel_size ({config.kernel_size}) MUST be an odd number. Even kernel sizes break symmetric padding, which will corrupt the fixed sequence length constraint required by Flow Matching.")
+
         
     tokenizer = CharTokenizer()
     config.vocab_size = tokenizer.vocab_size
-    from data.phase1_5_omni_dataset import Phase1_5_OmniDataset
+    from data.omni_dataset import OmniDataset
     
-    dataset = Phase1_5_OmniDataset(
+    dataset = OmniDataset(
         omni_parquet_path="data/Basic_ZH/chunked_mixed_omni.parquet",
         tokenizer=tokenizer,
         seq_len=args.seq_len

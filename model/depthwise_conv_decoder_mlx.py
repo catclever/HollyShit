@@ -3,16 +3,19 @@ import mlx.nn as nn
 from dataclasses import dataclass
 
 class DepthwiseConv1DBlock(nn.Module):
-    def __init__(self, channels: int, kernel_size: int = 5):
+    def __init__(self, channels: int, kernel_size: int = 5, dilation: int = 1):
         super().__init__()
         
         # 1. Depthwise Convolution: Each dimension only mixes with itself across time
         # MLX Conv1d expects input shape [N, L, C]
+        padding = ((kernel_size - 1) * dilation) // 2
         self.depthwise_conv = nn.Conv1d(
             in_channels=channels,
             out_channels=channels,
             kernel_size=kernel_size,
-            padding=kernel_size // 2, # Same padding
+            padding=padding, # Same padding, accounts for dilation
+            stride=1,
+            dilation=dilation,
             groups=channels,          # <--- The magic that isolates dimensions!
             bias=False
         )
@@ -52,6 +55,7 @@ class DepthwiseConvDecoderConfig:
     hidden_dim: int = 1024
     num_layers: int = 4
     kernel_size: int = 5
+    use_dilation: bool = False
 
 class ParallelDepthwiseConvDecoder(nn.Module):
     """
@@ -68,8 +72,11 @@ class ParallelDepthwiseConvDecoder(nn.Module):
         
         self.concept_proj = nn.Linear(config.embed_dim, config.hidden_dim) if config.embed_dim != config.hidden_dim else None
         
-        # Stack of Depthwise Separable 1D convolutions
-        self.blocks = [DepthwiseConv1DBlock(config.hidden_dim, config.kernel_size) for _ in range(config.num_layers)]
+        # Stack of Depthwise Separable 1D convolutions (Exponential Dilation)
+        self.blocks = []
+        for i in range(config.num_layers):
+            dilation = (2 ** i) if config.use_dilation else 1
+            self.blocks.append(DepthwiseConv1DBlock(config.hidden_dim, config.kernel_size, dilation=dilation))
         
         self.final_ln = nn.LayerNorm(config.hidden_dim, affine=False)
         self.fc = nn.Linear(config.hidden_dim, config.vocab_size)

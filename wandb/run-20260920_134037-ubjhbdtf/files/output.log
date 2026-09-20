@@ -1,0 +1,33 @@
+Loading Omni data from data/Basic_ZH/chunked_mixed_omni.parquet...
+Loaded 551502 Omni documents.
+Building Omni aligned indices (max_len=512)...
+Index built! Total aligned sequences: 854859
+[WeightUtils] Successfully loaded PyTorch weights into MLX model from checkpoints/basencoder_step_115000/student.pt
+Loaded encoder from checkpoints/basencoder_step_115000/student.pt
+No seed provided. Auto-generated fresh random seed: 844838
+Set epoch deterministic seed to 844838
+Epoch 1 | Step 100 | Loss: 5.7469 | Time/100steps: 58.29s
+Epoch 1 | Step 200 | Loss: 3.9715 | Time/100steps: 56.74s
+Epoch 1 | Step 300 | Loss: 4.1290 | Time/100steps: 63.46s
+Epoch 1 | Step 400 | Loss: 3.7292 | Time/100steps: 74.99s
+Epoch 1 | Step 500 | Loss: 3.9340 | Time/100steps: 81.63s
+Epoch 1 | Step 600 | Loss: 3.8546 | Time/100steps: 90.55s
+Epoch 1 | Step 700 | Loss: 3.5838 | Time/100steps: 85.28s
+Epoch 1 | Step 800 | Loss: 3.5711 | Time/100steps: 79.57s
+Epoch 1 | Step 900 | Loss: 3.3557 | Time/100steps: 76.91s
+Epoch 1 | Step 1000 | Loss: 2.8354 | Time/100steps: 81.59s
+
+--- EVAL STEP 1000 ---
+Target: 你的成绩出来了吗?是的，我的整个GPA现在被搞砸了为什么？发生了什么事？好吧，我炸了我的经济学期末考试，最后只得了1. 7分。哎哟！你一定很失望吧好吧，这是我的错，因为我没有学习那么多，因为我应该有。你为什么不在明年重考这门课呢？这就是我打算做的，除非我继续搞砸了。你这学期表现如何？我也没有做得那么好。我这学期的成绩是3.2分。这使我的总GPA下降到3.45。我的GPA和你的很相似。我现在只有3.1分，因为我上了愚蠢的经济课。这学期之前你的GPA是多少？我对3.4分很满意。
+Generated: 你你我我你我了我我我了，我了我我我我我我我我我我了我我我我你我了我我你我好的，我我了我我我我我我我我我，我我你我了。我我。。。我我我我我我我我你我了的，我是我好的，我们我我我我我我你我，我我我我我。。我我我我我我我我我我我我我我我我我我我我我你的，我是我我我你我了。我我我我我我我我我我我我我我我你我了。我。我我的我我我。我我。。我我我的我我我我我我我我我。。。。。我我我我我我我我我。我我我我我我我我的，我我我我了我我的我你。。。你我我我我我我我我我我我我我我我我我了吗吗吗。
+-------------------------
+
+Epoch 1 | Step 1100 | Loss: 3.5324 | Time/100steps: 77.81s
+Epoch 1 | Step 1200 | Loss: 3.1976 | Time/100steps: 83.21s
+Epoch 1 | Step 1300 | Loss: 3.8422 | Time/100steps: 80.70s
+Epoch 1 | Step 1400 | Loss: 3.3801 | Time/100steps: 78.50s
+
+[Checkpointer] Caught kill signal! Taking over to perform emergency save...
+
+[Interrupt] Caught kill signal at step 0! Saving emergency checkpoint to checkpoints/phase2_3_dilated_conv/dilated_step_0_emergency...
+[Checkpoint] Emergency save completed at checkpoints/phase2_3_dilated_conv/dilated_step_0_emergency. Safely exiting process.
