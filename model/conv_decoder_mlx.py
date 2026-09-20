@@ -57,12 +57,12 @@ class ParallelConvDecoder(nn.Module):
         import dataclasses
         return dataclasses.asdict(self.config)
 
-    def __call__(self, concept_sequence_zoh: mx.array) -> mx.array:
-        # concept_sequence_zoh: [B, L, embed_dim]
+    def __call__(self, concept_sequence: mx.array) -> mx.array:
+        # concept_sequence: [B, L, embed_dim]
         if self.concept_proj is not None:
-            x = self.concept_proj(concept_sequence_zoh)
+            x = self.concept_proj(concept_sequence)
         else:
-            x = concept_sequence_zoh
+            x = concept_sequence
             
         for block in self.blocks:
             x = block(x)
@@ -71,11 +71,11 @@ class ParallelConvDecoder(nn.Module):
         logits = self.fc(x_final) # [B, L, V]
         return logits
 
-    def generate(self, concept_sequence_zoh: mx.array, temperature: float = 0.0) -> mx.array:
+    def generate(self, concept_sequence: mx.array, temperature: float = 0.0) -> mx.array:
         """
         Parallel generation! No autoregressive loop.
         """
-        logits = self(concept_sequence_zoh) # [B, L, V]
+        logits = self(concept_sequence) # [B, L, V]
         
         if temperature > 0:
             logits = logits / temperature

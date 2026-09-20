@@ -15,13 +15,10 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 from training.core.char_tokenizer import CharTokenizer
 
 from model.phase1_charencoder_mlx import TinyCharEncoderMLX
-from model.concept_chunker_mlx import ConceptChunkerMLX
 from model.crossattn_decoder import StrongConceptDecoder
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 from tools.weight_utils import load_torch_weights_into_mlx
-
-# Removed pad_chunks as it is no longer needed.
 
 
 def loss_fn(model, c, targets, pad_id):
@@ -73,9 +70,6 @@ def train():
         args = checkpointer.load_args(resume_ckpt_path, args)
         config = load_config(resume_ckpt_path, DepthwiseConvDecoderConfig, filename="decoder_config.json")
         if config:
-            # Check for conflict: Trying to resume a non-dilated checkpoint with --use_dilation flag
-            if args.use_dilation != config.use_dilation:
-                raise ValueError(f"[Config Conflict] You are trying to resume a checkpoint with use_dilation={config.use_dilation}, but your CLI arguments have use_dilation={args.use_dilation}. The semantic receptive fields are incompatible. You must start a new training run from scratch if you change the dilation topology.")
             print(f"Loaded DepthwiseConvDecoderConfig from {resume_ckpt_path}/decoder_config.json")
     
     if config is None:
