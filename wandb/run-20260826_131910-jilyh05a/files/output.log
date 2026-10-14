@@ -1,9 +1,0 @@
-Traceback (most recent call last):
-  File "/Users/kael/workbench/HollyShit/training/train_phase2_2_convdecoder.py", line 208, in <module>
-    train()
-  File "/Users/kael/workbench/HollyShit/training/train_phase2_2_convdecoder.py", line 34, in train
-    from training.core.config_utils import build_parser_from_config, extract_config_from_args, save_config, load_config
-  File "/Users/kael/workbench/HollyShit/training/core/config_utils.py", line 18
-    arg_name = f\"--{field.name}\"
-                 ^
-SyntaxError: unexpected character after line continuation character

@@ -1,9 +1,0 @@
-Traceback (most recent call last):
-  File "/Users/kael/workbench/HollyShit/training/train_phase2_2_2_depthwise_convdecoder.py", line 229, in <module>
-    train()
-  File "/Users/kael/workbench/HollyShit/training/train_phase2_2_2_depthwise_convdecoder.py", line 54, in train
-    from model.depthwise_conv_decoder_mlx import DepthwiseConvDecoderConfig
-  File "/Users/kael/workbench/HollyShit/model/depthwise_conv_decoder_mlx.py", line 57
-    \"\"\"
-     ^
-SyntaxError: unexpected character after line continuation character

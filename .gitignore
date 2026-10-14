@@ -6,6 +6,7 @@ venv/
 ENV/
 __pycache__/
 .vscode
+wandb/
 
 # Python
 __pycache__/
