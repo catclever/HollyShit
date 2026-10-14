@@ -12,8 +12,9 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 
 from training.core.char_tokenizer import CharTokenizer
 from training.data.mixed_dataset import MixedDataset
-from model.phase4_mamba import MambaReader
-from model.phase4_flow_unet_cuda import FlowMatching1DUnet, ot_cfm_loss
+from model.flow_mamba import MambaReader
+from model.flow_unet_cuda import FlowMatching1DUnet
+from model.loss_legacy_joint import ot_cfm_loss_legacy
 from model.concept_chunker import ConceptChunker
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from training.core.args import get_training_parser
@@ -98,7 +99,7 @@ def train():
             
             # Forward and Loss
             optimizer.zero_grad()
-            loss = ot_cfm_loss(unet, mamba, x_in, x_tgt)
+            loss = ot_cfm_loss_legacy(unet, mamba, x_in, x_tgt)
             
             # Backward
             loss.backward()
