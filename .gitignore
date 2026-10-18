@@ -37,7 +37,8 @@ wheels/
 .antigravitycli/
 
 # Datasets & Weights
-data
+/data
+/data/
 embs/
 dataset_config.json
 checkpoints/
