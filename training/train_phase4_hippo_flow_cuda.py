@@ -1,9 +1,10 @@
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import sys
+import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import os
-import sys
-import glob
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +51,7 @@ def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=256, device=
     """
     B = x_prompt.shape[0]
     D = x_prompt.shape[-1]
-    x = torch.randn((B, seq_len, D), device=device)
+    x = torch.randn((B, seq_len, D), device=device, dtype=x_prompt.dtype)
     dt = 1.0 / steps
     for i in range(steps):
         t_val = i / float(steps)
@@ -69,11 +70,38 @@ def train():
     parser.add_argument("--translator_ckpt", type=str, default=None, help="Path to frozen translator checkpoint (defaults to auto-discovering latest)")
     parser.add_argument("--eval_interval", type=int, default=200, help="Print qualitative generation test every N steps")
     parser.add_argument("--euler_steps", type=int, default=10, help="Euler ODE integration steps for qualitative evaluation")
-    parser.set_defaults(ckpt_prefix="phase4_hippo_flow")
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["bf16", "fp16", "no"], help="Mixed precision mode (bf16, fp16, no)")
+    parser.add_argument("--accum_steps", type=int, default=1, help="Number of gradient accumulation steps")
+    parser.set_defaults(ckpt_prefix="phase4_hippo_flow", batch_size=64)
 
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # Mixed Precision Setup
+    amp_enabled = False
+    amp_dtype = torch.float32
+    scaler = None
+
+    if device.type == 'cuda' and args.mixed_precision != "no":
+        if args.mixed_precision == "bf16":
+            if torch.cuda.is_bf16_supported():
+                amp_enabled = True
+                amp_dtype = torch.bfloat16
+                print("⚡ Mixed Precision: Enabled (Native BFloat16)")
+            else:
+                print("⚠️ BFloat16 not supported on this GPU, falling back to Float16")
+                amp_enabled = True
+                amp_dtype = torch.float16
+                scaler = torch.cuda.amp.GradScaler()
+                print("⚡ Mixed Precision: Enabled (Float16 + GradScaler)")
+        elif args.mixed_precision == "fp16":
+            amp_enabled = True
+            amp_dtype = torch.float16
+            scaler = torch.cuda.amp.GradScaler()
+            print("⚡ Mixed Precision: Enabled (Float16 + GradScaler)")
+    else:
+        print("⚡ Mixed Precision: Disabled (FP32)")
 
     tokenizer = CharTokenizer()
 
@@ -133,6 +161,7 @@ def train():
     print("🚀 Starting Phase 4 HiPPO + Flow Match Training (Curriculum Learning)...")
 
     max_steps = args.epochs * len(dataloader) if len(dataloader) > 0 else 1
+    optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, args.epochs):
         resumed_loader = checkpointer.wrap_dataloader(dataloader, epoch, global_step)
@@ -161,15 +190,28 @@ def train():
                     if abs(std_val - 1.0) > 0.5:
                         print(f"⚠️ Warning: Target std ({std_val:.4f}) deviates significantly from 1.0.")
 
-            optimizer.zero_grad()
-
             # Curriculum Schedule: Attractor probability increases smoothly from 0 to 0.5
             p_attractor = min(0.5, (global_step / max_steps) * 1.0)
             use_attractor = torch.rand(1).item() < p_attractor
 
-            loss = hippo_cfm_loss(unet, hippo_oracle, x_prompt, x_target, use_knowledge_attractor=use_attractor)
-            loss.backward()
-            optimizer.step()
+            # Forward + Loss under autocast
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                loss = hippo_cfm_loss(unet, hippo_oracle, x_prompt, x_target, use_knowledge_attractor=use_attractor)
+                loss_scaled = loss / args.accum_steps
+
+            if scaler is not None:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
+
+            # Gradient accumulation step
+            if (batch_idx + 1) % args.accum_steps == 0 or (batch_idx + 1) == len(resumed_loader):
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
             if global_step % 50 == 0:
@@ -185,21 +227,22 @@ def train():
                     h_potential = hippo_oracle(tgt_sample)
 
                     # 10 步 Euler ODE 从高斯白噪声中积分生成连续曲线
-                    x_gen = sample_euler_ode(
-                        unet=unet,
-                        x_prompt=p_sample,
-                        h_potential=h_potential,
-                        steps=args.euler_steps,
-                        seq_len=args.seq_len,
-                        device=device
-                    )
+                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                        x_gen = sample_euler_ode(
+                            unet=unet,
+                            x_prompt=p_sample,
+                            h_potential=h_potential,
+                            steps=args.euler_steps,
+                            seq_len=args.seq_len,
+                            device=device
+                        )
 
-                    # 解码生成轨迹
-                    gen_tokens = translator.decode_greedy(x_gen)[0].tolist()
+                    # 解码生成轨迹 (转为 float32 传给 translator)
+                    gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
                     gen_text = tokenizer.decode(gen_tokens)
 
                     # 真实 Target 解码 (Sanity Check)
-                    ref_tokens = translator.decode_greedy(tgt_sample)[0].tolist()
+                    ref_tokens = translator.decode_greedy(tgt_sample.float())[0].tolist()
                     ref_text = tokenizer.decode(ref_tokens)
 
                     prompt_text = tokenizer.decode(w_t[0].tolist())
@@ -212,8 +255,12 @@ def train():
                     print("="*50 + "\n")
 
                 unet.train()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         checkpointer.save(global_step)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     train()
