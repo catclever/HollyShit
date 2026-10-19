@@ -10,7 +10,7 @@ def mamba_cfm_loss(mamba, hippo_oracle, x_context, x_target):
     """
     # 1. Oracle: What should the potential energy be for this target?
     with torch.no_grad():
-        h_target = hippo_oracle(x_target) # (B, D)
+        h_target = hippo_oracle(x_target, return_sequence=False) # (B, D)
         
     # 2. Mamba Prediction: What does Mamba think the potential energy will be?
     # Based strictly on the context, without seeing the future.

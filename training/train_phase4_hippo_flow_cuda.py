@@ -46,19 +46,20 @@ def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
 def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=256, device='cuda'):
     """
     Euler ODE Integrator:
-    dX_t = v(X_t, t, h_potential, k_attractors=x_prompt) * dt
-    Integrates from white noise X_0 ~ N(0, I) -> X_1
+    dX_t = v(X_t, t, h_potential, k_attractors=x_prompt_norm) * dt
+    Integrates from white noise X_0 ~ N(0, I) -> X_1_norm, then auto-denormalizes back to encoder manifold.
     """
     B = x_prompt.shape[0]
     D = x_prompt.shape[-1]
+    x_prompt_norm = unet.normalize(x_prompt)
     x = torch.randn((B, seq_len, D), device=device, dtype=x_prompt.dtype)
     dt = 1.0 / steps
     for i in range(steps):
         t_val = i / float(steps)
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.float32)
-        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=x_prompt)
+        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=x_prompt_norm)
         x = x + v_pred * dt
-    return x
+    return unet.denormalize(x)
 
 def train():
     parser = get_training_parser("Phase 4 HiPPO Oracle + Flow Match Engine (CUDA)")
@@ -182,13 +183,15 @@ def train():
                     h_tgt = layer(h_tgt, None)
                 x_target = encoder.final_ln(h_tgt)
 
-                # 初次前向时做尺度方差体检
+                # 初次前向时做尺度方差体检并启动自适应尺度标定
                 if global_step == 0 and batch_idx == 0:
                     std_val = x_target.std().item()
                     mean_val = x_target.mean().item()
-                    print(f"📊 Manifold Geometry Check -> Target Mean: {mean_val:.4f}, Std: {std_val:.4f}")
-                    if abs(std_val - 1.0) > 0.5:
-                        print(f"⚠️ Warning: Target std ({std_val:.4f}) deviates significantly from 1.0.")
+                    unet.calibrate_manifold(x_target)
+                    norm_std = unet.normalize(x_target).std().item()
+                    scale_factor = 1.0 / unet.manifold_std.item()
+                    print(f"📊 Manifold Geometry Check -> Raw Mean: {mean_val:.4f}, Raw Std: {std_val:.4f}")
+                    print(f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | Normalized Std: {norm_std:.4f}")
 
             # Curriculum Schedule: Attractor probability increases smoothly from 0 to 0.5
             p_attractor = min(0.5, (global_step / max_steps) * 1.0)
@@ -215,16 +218,18 @@ def train():
 
             global_step += 1
             if global_step % 50 == 0:
-                print(f"Epoch {epoch+1} | Step {global_step} | Phase 4 Loss: {loss.item():.4f} | Attractor Prob: {p_attractor:.2f}")
+                scale_factor = 1.0 / unet.manifold_std.item()
+                print(f"Epoch {epoch+1} | Step {global_step} | Phase 4 Loss: {loss.item():.4f} | Attractor Prob: {p_attractor:.2f} | Scale: {scale_factor:.2f}x")
 
             # 定期进行 Euler ODE 真实文本生成测试
             if translator is not None and (global_step == 50 or global_step % args.eval_interval == 0):
                 unet.eval()
                 with torch.no_grad():
-                    # 提取第一条样本进行生成评估
+                    # 提取第一条样本进行生成评估 (在归一化流形空间提取 HiPPO 势能曲线)
                     p_sample = x_prompt[:1]
                     tgt_sample = x_target[:1]
-                    h_potential = hippo_oracle(tgt_sample)
+                    tgt_sample_norm = unet.normalize(tgt_sample)
+                    h_potential = hippo_oracle(tgt_sample_norm)
 
                     # 10 步 Euler ODE 从高斯白噪声中积分生成连续曲线
                     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):

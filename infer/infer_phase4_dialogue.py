@@ -74,9 +74,10 @@ def generate_response(
     for layer in encoder.layers:
         h_t = layer(h_t, None)
     x_prompt = encoder.final_ln(h_t) # (1, L, 1024)
+    x_prompt_norm = unet.normalize(x_prompt)
     
-    # Extract prompt potential via HiPPO as initial conditioning
-    h_potential = hippo_oracle(x_prompt) # (1, 1024)
+    # Extract prompt potential curve via HiPPO in normalized space
+    h_potential = hippo_oracle(x_prompt_norm) # (1, L, 1024)
     
     # 2. Sample from Gaussian White Noise via Euler ODE
     x = torch.randn((1, seq_len, 1024), device=device)
@@ -85,11 +86,12 @@ def generate_response(
     for i in range(steps):
         t_val = i / float(steps)
         t_tensor = torch.tensor([t_val], device=device, dtype=torch.float32)
-        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=x_prompt)
+        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=x_prompt_norm)
         x = x + v_pred * dt
         
-    # 3. Decode continuous curve to text
-    token_ids = translator.decode_greedy(x)[0].tolist()
+    # 3. Auto-denormalize back to encoder manifold and decode continuous curve to text
+    x_denorm = unet.denormalize(x)
+    token_ids = translator.decode_greedy(x_denorm.float())[0].tolist()
     text = tokenizer.decode(token_ids)
     
     # Cut off at <eom> or <eos> if present
