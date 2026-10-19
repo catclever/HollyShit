@@ -29,6 +29,9 @@ class AdaLN(nn.Module):
         self.linear = nn.Linear(cond_dim, 2 * hidden_dim)
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
+        if cond_dim == hidden_dim:
+            with torch.no_grad():
+                self.linear.weight[:hidden_dim, :].copy_(0.1 * torch.eye(hidden_dim))
 
     def forward(self, x: torch.Tensor, h_potential: torch.Tensor) -> torch.Tensor:
         # x: (B, L, D), h_potential: (B, L, cond_dim) or (B, cond_dim)
@@ -215,12 +218,12 @@ class FlowMatching1DUnet(nn.Module):
         t_emb = self.t_embedder(t)
         
         pos_x = self._get_pos_emb(L, x_t.device, x_t.dtype)
-        x = x_t + pos_x
+        x = x_t + 0.1 * pos_x
 
         k_pos = None
         if k_attractors is not None:
             pos_k = self._get_pos_emb(k_attractors.shape[1], k_attractors.device, k_attractors.dtype)
-            k_pos = k_attractors + pos_k
+            k_pos = k_attractors + 0.1 * pos_k
         
         for block in self.blocks:
             x = block(x, t_emb, h_potential, k_pos)

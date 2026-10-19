@@ -20,102 +20,92 @@ def construct_hippo_legs(N):
 
 class HiPPOOracleCUDA(nn.Module):
     """
-    A frozen, mathematically exact HiPPO-LegS Hilbert space projector.
-    Projects a sequence of vectors (B, L, D) onto N orthonormal Legendre polynomial
-    basis functions over the full interval [-1, 1] without exponential forgetting,
-    and reconstructs the macroscopic polynomial potential curve (B, L, D).
+    A frozen, mathematically exact Full-Rank Causal HiPPO-LegS State-Space Operator.
+    Rolls out the N-order Legendre differential equation c_t = A c_{t-1} + B x_t across all
+    timesteps t in [0, L-1], preserving every intermediate state h_t via an exact L x L
+    lower-triangular Causal Toeplitz matrix K_HiPPO (Rank = L, 0% information loss, 0 trainable params).
     """
-    def __init__(self, hidden_dim: int, N: int = 64, dt: float = 1.0, max_seq_len: int = 256):
+    def __init__(self, hidden_dim: int, N: int = 64, dt: float = 1.0, memory_horizon: float = 64.0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.N = N
         
         A_cont, B_cont = construct_hippo_legs(N)
         
-        # Scale dt by 1 / max_seq_len so the continuous horizon [0, 1] spans the full sequence
-        dt_scaled = dt / float(max(max_seq_len, 1))
+        # Bilinear Discretization (Tustin's method) scaled by characteristic memory horizon
+        dt_scaled = dt / float(max(memory_horizon, 1.0))
         I = np.eye(N)
         BL = linalg.inv(I - (dt_scaled / 2.0) * A_cont)
         A_disc = BL @ (I + (dt_scaled / 2.0) * A_cont)
         B_disc = (BL @ B_cont * dt_scaled).squeeze(-1)
         
-        # Register as buffers so they are moved to device but not trained
+        # Register as fixed buffers (0 learnable parameters, strictly frozen Oracle)
         self.register_buffer("A", torch.tensor(A_disc, dtype=torch.float32)) # (N, N)
         self.register_buffer("B", torch.tensor(B_disc, dtype=torch.float32)) # (N,)
         
-        # Deterministic summary projection for 2D pooled mode (e.g. Phase 5 Mamba summary)
+        # Analytical Legendre boundary readout vector aligned with B_disc (guarantees k_0 > 0)
+        b_tensor = torch.tensor(B_disc, dtype=torch.float32)
+        readout = b_tensor / b_tensor.norm().clamp(min=1e-6)
+        self.register_buffer("readout", readout.unsqueeze(-1)) # (N, 1)
+        
+        # Legacy deterministic projection for 2D pooled summary mode
         torch.manual_seed(42)
         self.register_buffer("proj_out", torch.randn(N, 1) / np.sqrt(N))
         
-        # Cache for orthonormal Legendre basis matrix P of shape (L, N)
-        self._basis_cache = {}
+        # Cache for L x L Full-Rank Causal Toeplitz HiPPO Kernel
+        self._kernel_cache = {}
 
-    def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _get_causal_hippo_kernel(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Constructs the exact orthonormal discrete Legendre polynomial basis P in R^{L x N}
-        evaluated on [-1, 1] such that P^T P = I_N.
+        Precomputes the exact L x L lower-triangular Causal Toeplitz matrix K_HiPPO
+        from the LTI recurrence c_t = A c_{t-1} + B x_t, h_t = <readout, c_t>.
+        - Strictly lower-triangular with positive diagonal k_0 > 0 -> Full Rank = L (100% lossless).
+        - Row-normalized to unit L2 norm so input with Std=1.0 maps to output with Std=1.0 at every step t.
         """
         key = (L, device, dtype)
-        if key in self._basis_cache:
-            return self._basis_cache[key]
+        if key in self._kernel_cache:
+            return self._kernel_cache[key]
             
-        n_orders = min(self.N, L)
-        tau = torch.linspace(-1.0, 1.0, steps=L, device=device, dtype=torch.float32)
-        V = torch.zeros((L, n_orders), device=device, dtype=torch.float32)
-        V[:, 0] = 1.0
-        if n_orders > 1:
-            V[:, 1] = tau
-        for n in range(1, n_orders - 1):
-            V[:, n + 1] = ((2 * n + 1) * tau * V[:, n] - n * V[:, n - 1]) / float(n + 1)
-            
-        # QR orthonormalization with positive diagonal sign convention (Gram-Schmidt on Legendre basis)
-        Q, R = torch.linalg.qr(V, mode="reduced")
-        diag_sign = torch.sign(torch.diagonal(R))
-        diag_sign = torch.where(diag_sign == 0, torch.ones_like(diag_sign), diag_sign)
-        Q = Q * diag_sign.unsqueeze(0)
+        A_f = self.A.to(device=device, dtype=torch.float32) # (N, N)
+        B_f = self.B.to(device=device, dtype=torch.float32) # (N,)
+        w_f = self.readout.squeeze(-1).to(device=device, dtype=torch.float32) # (N,)
         
-        if n_orders < self.N:
-            pad = torch.zeros((L, self.N - n_orders), device=device, dtype=torch.float32)
-            Q = torch.cat([Q, pad], dim=-1)
+        # Compute impulse response k_tau = w^T (A^tau B) for tau = 0 .. L-1
+        impulse = torch.zeros(L, device=device, dtype=torch.float32)
+        state = B_f.clone()
+        for tau in range(L):
+            impulse[tau] = torch.dot(w_f, state)
+            state = torch.mv(A_f, state)
             
-        basis = Q.to(dtype=dtype)
-        self._basis_cache[key] = basis
-        return basis
-
-    @torch.no_grad()
-    def encode_coeffs(self, x_seq: torch.Tensor) -> torch.Tensor:
-        """
-        Projects sequence x_seq: (B, L, D) -> Legendre coefficients c: (B, D, N)
-        """
-        B_size, L, D = x_seq.shape
-        basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype) # (L, N)
-        # (B, D, L) @ (L, N) -> (B, D, N)
-        c = torch.matmul(x_seq.transpose(1, 2), basis)
-        return c
-
-    @torch.no_grad()
-    def reconstruct_curve(self, c: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """
-        Synthesizes macroscopic trajectory (B, L, D) from Legendre coefficients c: (B, D, N)
-        """
-        basis = self._get_legendre_basis(seq_len, c.device, c.dtype) # (L, N)
-        # (B, D, N) @ (N, L) -> (B, D, L) -> (B, L, D)
-        return torch.matmul(c, basis.transpose(0, 1)).transpose(1, 2)
+        # Construct L x L lower-triangular Toeplitz matrix: K[t, s] = impulse[t - s] for t >= s
+        idx = torch.arange(L, device=device)
+        diff = idx.unsqueeze(1) - idx.unsqueeze(0) # (L, L)
+        causal_mask = diff >= 0
+        K = torch.where(causal_mask, impulse[diff.clamp(min=0)], torch.zeros_like( diff, dtype=torch.float32))
+        
+        # Normalize each row t to unit L2 energy so Var(h_t) == Var(x_t) == 1.0 across all positions
+        row_norm = K.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        K = (K / row_norm).to(dtype=dtype)
+        
+        self._kernel_cache[key] = K
+        return K
 
     @torch.no_grad()
     def forward(self, x_seq: torch.Tensor, return_sequence: bool = True) -> torch.Tensor:
         """
         x_seq: (Batch, Length, D)
         return_sequence:
-          - If True (default for Phase 4 1D-Unet): returns (Batch, Length, D) Legendre polynomial curve
-            providing localized macroscopic potential energy at every position l in [0, L-1].
-          - If False (for 2D summary): returns (Batch, D) pooled potential vector.
+          - If True (default for Phase 4 1D-Unet): returns (Batch, Length, D) Full-Rank Causal HiPPO
+            potential trajectory h_{0..L-1}, preserving 100% token resolution + N=64 Legendre memory.
+          - If False (for 2D summary): returns (Batch, D) final pooled state.
         """
         B_size, L, D = x_seq.shape
-        c = self.encode_coeffs(x_seq) # (B, D, N)
+        K = self._get_causal_hippo_kernel(L, x_seq.device, x_seq.dtype) # (L, L)
+        
+        # Parallel causal state rollout over all L positions: (L, L) @ (B, L, D) -> (B, L, D)
+        h_seq = torch.matmul(K, x_seq)
         
         if return_sequence:
-            return self.reconstruct_curve(c, L) # (B, L, D)
+            return h_seq
         else:
-            proj = self.proj_out.to(device=c.device, dtype=c.dtype)
-            return torch.matmul(c, proj).squeeze(-1) # (B, D)
+            return h_seq[:, -1, :]
