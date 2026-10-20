@@ -4,17 +4,18 @@ scripts/build_omni_corpus.py
 ============================
 Multi-Domain Omni-Corpus Builder for Phase 4 Continuous Flow Matching & 1D Translator.
 
-Downloads/streams high-quality data across 7 major domains (2-3 sources per domain),
-extracting up to ~100k samples per source to build an omni-domain training corpus (~1.5M - 2M pairs).
+Downloads/streams high-quality data across 8 major domains (2-3 sources per domain),
+extracting up to ~100k samples per source to build an omni-domain training corpus (~1.6M - 2.0M pairs).
 
-Domains:
-  1. Chat & Instruct (对话与指令)
-  2. Encyclopedia & Factual (百科与严肃说明文)
+The 8 Core Domains:
+  1. Chat & Instruct (真实对话与多轮指令)
+  2. Encyclopedia & Factual (百科知识与深度科普)
   3. Literature & Fiction (严肃文学与小说叙事)
   4. Code & Structured Data (代码工程与结构化数据)
   5. Math & Step-by-Step Logic (数学推导与严谨逻辑)
   6. Classical Chinese & Poetry (文言文与古典诗词)
-  7. Bilingual & Translation (中英双语平行语料)
+  7. News & Real-World Reporting (新闻资讯与现代纪实)
+  8. Bilingual & Translation (中英双语平行语料与翻译)
 
 Usage:
   python scripts/build_omni_corpus.py --samples_per_source 100000 --output /content/omni_corpus.jsonl
@@ -32,26 +33,25 @@ def clean_text(text: Optional[str]) -> str:
     if not text or not isinstance(text, str):
         return ""
     text = text.strip()
-    # Normalize multiple consecutive spaces/newlines
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
 def chunk_long_text(text: str, max_target_len: int = 250) -> Optional[Tuple[str, str]]:
     """
-    For non-dialogue continuous texts (like Wikipedia, articles, literature),
+    For non-dialogue continuous texts (like Wikipedia, literature, news articles),
     splits text into a natural (Prompt/Prefix -> Target/Continuation) pair.
     """
     text = clean_text(text)
     if len(text) < 40:
         return None
     
-    # Try finding sentence delimiter around first 30-80 chars
+    # Try finding sentence delimiter around first 30-100 chars
     delimiters = ["\n\n", "\n", "。", "！", "？", "；", "...", "…"]
     split_idx = -1
     for d in delimiters:
         pos = text.find(d, 20)
-        if 20 <= pos <= 100:
+        if 20 <= pos <= 120:
             split_idx = pos + len(d)
             break
             
@@ -67,13 +67,13 @@ def chunk_long_text(text: str, max_target_len: int = 250) -> Optional[Tuple[str,
 
 
 # =========================================================================
-# Domain Extractors (Streaming from HuggingFace Datasets)
+# Domain 1: Chat & Instruct (真实对话与多轮指令)
 # =========================================================================
 
 def extract_belle_instruct(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Chat & Instruct | Source: BelleGroup/train_1M_CN"""
+    """Domain 1: Chat & Instruct | Source: BelleGroup/train_1M_CN"""
     from datasets import load_dataset
-    print(">>> [Chat] Streaming BelleGroup/train_1M_CN...")
+    print(">>> [1/8 Chat] Streaming BelleGroup/train_1M_CN...")
     count = 0
     try:
         ds = load_dataset("BelleGroup/train_1M_CN", split="train", streaming=True)
@@ -81,7 +81,6 @@ def extract_belle_instruct(max_samples: int) -> Iterator[Dict[str, str]]:
             instr = clean_text(item.get("instruction", ""))
             inp = clean_text(item.get("input", ""))
             out = clean_text(item.get("output", ""))
-            
             prompt = f"{instr}\n{inp}".strip() if inp else instr
             if len(prompt) >= 5 and len(out) >= 10:
                 yield {"prompt": prompt, "target": out, "domain": "chat_instruct", "source": "belle_1m"}
@@ -94,9 +93,9 @@ def extract_belle_instruct(max_samples: int) -> Iterator[Dict[str, str]]:
 
 
 def extract_gpt4_alpaca_zh(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Chat & Instruct | Source: silk-road/alpaca-data-gpt4-chinese"""
+    """Domain 1: Chat & Instruct | Source: silk-road/alpaca-data-gpt4-chinese"""
     from datasets import load_dataset
-    print(">>> [Chat] Streaming silk-road/alpaca-data-gpt4-chinese...")
+    print(">>> [1/8 Chat] Streaming silk-road/alpaca-data-gpt4-chinese...")
     count = 0
     try:
         ds = load_dataset("silk-road/alpaca-data-gpt4-chinese", split="train", streaming=True)
@@ -116,8 +115,8 @@ def extract_gpt4_alpaca_zh(max_samples: int) -> Iterator[Dict[str, str]]:
 
 
 def extract_local_moss(local_path: str, max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Chat & Instruct | Source: Existing MOSS dialogues"""
-    print(f">>> [Chat] Reading local MOSS dialogues from {local_path}...")
+    """Domain 1: Chat & Instruct | Source: Local MOSS dialogues"""
+    print(f">>> [1/8 Chat] Reading local MOSS dialogues from {local_path}...")
     if not os.path.isfile(local_path):
         print(f"  -> {local_path} not found, skipping local MOSS.")
         return
@@ -140,21 +139,22 @@ def extract_local_moss(local_path: str, max_samples: int) -> Iterator[Dict[str, 
     print(f"  -> Extracted {count} samples from local MOSS")
 
 
+# =========================================================================
+# Domain 2: Encyclopedia & Factual (百科知识与深度科普)
+# =========================================================================
+
 def extract_wiki_chinese(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Encyclopedia | Source: pleisto/wikipedia-cn-20230720-filtered"""
+    """Domain 2: Encyclopedia | Source: pleisto/wikipedia-cn-20230720-filtered"""
     from datasets import load_dataset
-    print(">>> [Encyclopedia] Streaming pleisto/wikipedia-cn-20230720-filtered...")
+    print(">>> [2/8 Encyclopedia] Streaming pleisto/wikipedia-cn-20230720-filtered...")
     count = 0
     try:
         ds = load_dataset("pleisto/wikipedia-cn-20230720-filtered", split="train", streaming=True)
         for item in ds:
             title = clean_text(item.get("title", ""))
-            completion = clean_text(item.get("completion", ""))
-            if not completion and "text" in item:
-                completion = clean_text(item["text"])
-                
+            completion = clean_text(item.get("completion", item.get("text", "")))
             if title and completion:
-                prompt = f"关于【{title}】的百科词条："
+                prompt = f"关于【{title}】的百科说明："
                 target = completion[:300].strip()
                 yield {"prompt": prompt, "target": target, "domain": "encyclopedia", "source": "wiki_cn"}
                 count += 1
@@ -173,12 +173,11 @@ def extract_wiki_chinese(max_samples: int) -> Iterator[Dict[str, str]]:
 
 
 def extract_zhihu_qa(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Encyclopedia / Q&A | Source: wangrui6/Zhihu-KOL or zirui3/zhihu_qa"""
+    """Domain 2: Encyclopedia / Knowledge | Source: wangrui6/Zhihu-KOL or zirui3/zhihu_qa"""
     from datasets import load_dataset
-    print(">>> [Encyclopedia/Knowledge] Streaming Zhihu Q&A...")
+    print(">>> [2/8 Encyclopedia] Streaming Zhihu Q&A & Essays...")
     count = 0
-    dataset_candidates = ["wangrui6/Zhihu-KOL", "zirui3/zhihu_qa"]
-    for dname in dataset_candidates:
+    for dname in ["wangrui6/Zhihu-KOL", "zirui3/zhihu_qa"]:
         if count >= max_samples:
             break
         try:
@@ -193,16 +192,49 @@ def extract_zhihu_qa(max_samples: int) -> Iterator[Dict[str, str]]:
                         break
         except Exception as e:
             print(f"⚠️ Warning during {dname} stream: {e}")
-    print(f"  -> Extracted {count} samples from Zhihu Q&A")
+    print(f"  -> Extracted {count} samples from Zhihu")
 
+
+# =========================================================================
+# Domain 3: Literature & Fiction (严肃文学与小说叙事)
+# =========================================================================
+
+def extract_webnovel_literature(max_samples: int) -> Iterator[Dict[str, str]]:
+    """Domain 3: Literature & Fiction | Source: wdndev/webnovel-chinese or jetaudio/chinese_web_novels"""
+    from datasets import load_dataset
+    print(">>> [3/8 Literature] Streaming Chinese novels & narrative text...")
+    count = 0
+    candidates = ["wdndev/webnovel-chinese", "jetaudio/chinese_web_novels"]
+    for cname in candidates:
+        if count >= max_samples:
+            break
+        try:
+            ds = load_dataset(cname, split="train", streaming=True)
+            for item in ds:
+                text = clean_text(item.get("text", item.get("content", "")))
+                if not text or len(text) < 60:
+                    continue
+                pair = chunk_long_text(text)
+                if pair:
+                    yield {"prompt": pair[0], "target": pair[1], "domain": "literature", "source": cname}
+                    count += 1
+                    if count >= max_samples:
+                        break
+        except Exception as e:
+            print(f"⚠️ Warning during novel stream {cname}: {e}")
+    print(f"  -> Extracted {count} samples from Literature & Novels")
+
+
+# =========================================================================
+# Domain 4: Code & Structured Data (代码工程与结构化数据)
+# =========================================================================
 
 def extract_code_alpaca(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Code & Structured | Source: sahil2801/CodeAlpaca-20k or theblackcat102/evol-codealpaca-v1"""
+    """Domain 4: Code | Source: sahil2801/CodeAlpaca-20k or theblackcat102/evol-codealpaca-v1"""
     from datasets import load_dataset
-    print(">>> [Code] Streaming CodeAlpaca...")
+    print(">>> [4/8 Code] Streaming CodeAlpaca...")
     count = 0
-    sources = ["sahil2801/CodeAlpaca-20k", "theblackcat102/evol-codealpaca-v1"]
-    for sname in sources:
+    for sname in ["sahil2801/CodeAlpaca-20k", "theblackcat102/evol-codealpaca-v1"]:
         if count >= max_samples:
             break
         try:
@@ -223,9 +255,9 @@ def extract_code_alpaca(max_samples: int) -> Iterator[Dict[str, str]]:
 
 
 def extract_sql_structured(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Code & Structured | Source: b-mc2/sql-create-context"""
+    """Domain 4: Code & Structured | Source: b-mc2/sql-create-context"""
     from datasets import load_dataset
-    print(">>> [Code/SQL] Streaming b-mc2/sql-create-context...")
+    print(">>> [4/8 Code/SQL] Streaming b-mc2/sql-create-context...")
     count = 0
     try:
         ds = load_dataset("b-mc2/sql-create-context", split="train", streaming=True)
@@ -244,10 +276,14 @@ def extract_sql_structured(max_samples: int) -> Iterator[Dict[str, str]]:
     print(f"  -> Extracted {count} samples from SQL Context")
 
 
+# =========================================================================
+# Domain 5: Math & Step-by-Step Logic (数学推导与严谨逻辑)
+# =========================================================================
+
 def extract_math_gsm8k_zh(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Math & Logic | Source: meta-math/GSM8K_zh"""
+    """Domain 5: Math & Logic | Source: meta-math/GSM8K_zh"""
     from datasets import load_dataset
-    print(">>> [Math] Streaming meta-math/GSM8K_zh...")
+    print(">>> [5/8 Math] Streaming meta-math/GSM8K_zh...")
     count = 0
     try:
         ds = load_dataset("meta-math/GSM8K_zh", split="train", streaming=True)
@@ -265,9 +301,9 @@ def extract_math_gsm8k_zh(max_samples: int) -> Iterator[Dict[str, str]]:
 
 
 def extract_math_ape210k(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Math & Logic | Source: MU-NLPC/calc-ape210k"""
+    """Domain 5: Math & Logic | Source: MU-NLPC/calc-ape210k"""
     from datasets import load_dataset
-    print(">>> [Math] Streaming MU-NLPC/calc-ape210k...")
+    print(">>> [5/8 Math] Streaming MU-NLPC/calc-ape210k...")
     count = 0
     try:
         ds = load_dataset("MU-NLPC/calc-ape210k", split="train", streaming=True)
@@ -284,10 +320,14 @@ def extract_math_ape210k(max_samples: int) -> Iterator[Dict[str, str]]:
     print(f"  -> Extracted {count} samples from Ape210K")
 
 
+# =========================================================================
+# Domain 6: Classical Chinese & Poetry (文言文与古典诗词)
+# =========================================================================
+
 def extract_classical_chinese(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Classical Chinese | Source: gujilab/chinese-classical-corpus (translate)"""
+    """Domain 6: Classical Chinese | Source: gujilab/chinese-classical-corpus (translate)"""
     from datasets import load_dataset
-    print(">>> [Classical Chinese] Streaming gujilab/chinese-classical-corpus (translate)...")
+    print(">>> [6/8 Classical Chinese] Streaming gujilab/chinese-classical-corpus (translate)...")
     count = 0
     try:
         ds = load_dataset("gujilab/chinese-classical-corpus", "translate", split="train", streaming=True)
@@ -307,12 +347,11 @@ def extract_classical_chinese(max_samples: int) -> Iterator[Dict[str, str]]:
 
 
 def extract_classical_poetry(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Classical Chinese & Poetry | Source: erhwenkuo/poetry-chinese-zhtw or Lifan-Z/Chinese-poetries-txt"""
+    """Domain 6: Classical Poetry | Source: Lifan-Z/Chinese-poetries-txt or erhwenkuo/poetry-chinese-zhtw"""
     from datasets import load_dataset
-    print(">>> [Poetry] Streaming classical poetry...")
+    print(">>> [6/8 Poetry] Streaming classical poetry...")
     count = 0
-    candidates = ["Lifan-Z/Chinese-poetries-txt", "erhwenkuo/poetry-chinese-zhtw"]
-    for cname in candidates:
+    for cname in ["Lifan-Z/Chinese-poetries-txt", "erhwenkuo/poetry-chinese-zhtw"]:
         if count >= max_samples:
             break
         try:
@@ -336,10 +375,45 @@ def extract_classical_poetry(max_samples: int) -> Iterator[Dict[str, str]]:
     print(f"  -> Extracted {count} samples from Classical Poetry")
 
 
-def extract_opus_bilingual(max_samples: int) -> Iterator[Dict[str, str]]:
-    """Domain: Bilingual & Translation | Source: Helsinki-NLP/opus-100 (en-zh)"""
+# =========================================================================
+# Domain 7: News & Real-World Reporting (新闻资讯与现代纪实)
+# =========================================================================
+
+def extract_news_reporting(max_samples: int) -> Iterator[Dict[str, str]]:
+    """Domain 7: News & Real-World Reporting | Source: SirlyDreamer/THUCNews or seamew/THUCNews"""
     from datasets import load_dataset
-    print(">>> [Bilingual/Translation] Streaming Helsinki-NLP/opus-100 (en-zh)...")
+    print(">>> [7/8 News & Reporting] Streaming THUCNews Chinese news...")
+    count = 0
+    for dname in ["SirlyDreamer/THUCNews", "seamew/THUCNews"]:
+        if count >= max_samples:
+            break
+        try:
+            ds = load_dataset(dname, split="train", streaming=True)
+            for item in ds:
+                text = clean_text(item.get("text", item.get("content", "")))
+                label = clean_text(item.get("label", ""))
+                if not text or len(text) < 50:
+                    continue
+                prefix = f"【新闻报道·{label}】：\n" if label else "【新闻报道】：\n"
+                pair = chunk_long_text(f"{prefix}{text}")
+                if pair:
+                    yield {"prompt": pair[0], "target": pair[1], "domain": "news_reporting", "source": dname}
+                    count += 1
+                    if count >= max_samples:
+                        break
+        except Exception as e:
+            print(f"⚠️ Warning during news stream {dname}: {e}")
+    print(f"  -> Extracted {count} samples from News & Reporting")
+
+
+# =========================================================================
+# Domain 8: Bilingual & Translation (中英双语平行语料与翻译)
+# =========================================================================
+
+def extract_opus_bilingual(max_samples: int) -> Iterator[Dict[str, str]]:
+    """Domain 8: Bilingual & Translation | Source: Helsinki-NLP/opus-100 (en-zh)"""
+    from datasets import load_dataset
+    print(">>> [8/8 Bilingual/Translation] Streaming Helsinki-NLP/opus-100 (en-zh)...")
     count = 0
     try:
         ds = load_dataset("Helsinki-NLP/opus-100", "en-zh", split="train", streaming=True)
@@ -348,7 +422,7 @@ def extract_opus_bilingual(max_samples: int) -> Iterator[Dict[str, str]]:
             en = clean_text(trans.get("en", ""))
             zh = clean_text(trans.get("zh", ""))
             if len(en) >= 8 and len(zh) >= 4:
-                # Randomly alternate en->zh and zh->en to teach bidirectional alignment
+                # Randomly alternate en->zh and zh->en for bidirectional training
                 if random.random() < 0.5:
                     prompt = f"Translate English to Chinese: {en}"
                     target = zh
@@ -376,45 +450,51 @@ def build_omni_corpus(
 ):
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     
-    # List of generator functions
+    # 8 Core Domains - Full Spectrum
     extractors = [
         # Domain 1: Chat & Instruct
-        lambda: extract_belle_instruct(samples_per_source),
-        lambda: extract_gpt4_alpaca_zh(samples_per_source),
-        lambda: extract_local_moss(local_moss_path, samples_per_source),
+        ("1. Chat (Belle)", lambda: extract_belle_instruct(samples_per_source)),
+        ("1. Chat (Alpaca-GPT4)", lambda: extract_gpt4_alpaca_zh(samples_per_source)),
+        ("1. Chat (Local MOSS)", lambda: extract_local_moss(local_moss_path, samples_per_source)),
         
         # Domain 2: Encyclopedia & Factual
-        lambda: extract_wiki_chinese(samples_per_source),
-        lambda: extract_zhihu_qa(samples_per_source),
+        ("2. Encyclopedia (Wiki-CN)", lambda: extract_wiki_chinese(samples_per_source)),
+        ("2. Encyclopedia (Zhihu)", lambda: extract_zhihu_qa(samples_per_source)),
         
-        # Domain 3: Code & Structured
-        lambda: extract_code_alpaca(samples_per_source),
-        lambda: extract_sql_structured(samples_per_source),
+        # Domain 3: Literature & Fiction
+        ("3. Literature (Novels & Fiction)", lambda: extract_webnovel_literature(samples_per_source)),
         
-        # Domain 4: Math & Logic
-        lambda: extract_math_gsm8k_zh(samples_per_source),
-        lambda: extract_math_ape210k(samples_per_source),
+        # Domain 4: Code & Structured
+        ("4. Code (CodeAlpaca)", lambda: extract_code_alpaca(samples_per_source)),
+        ("4. Code (SQL Context)", lambda: extract_sql_structured(samples_per_source)),
         
-        # Domain 5: Classical Chinese & Poetry
-        lambda: extract_classical_chinese(samples_per_source),
-        lambda: extract_classical_poetry(samples_per_source),
+        # Domain 5: Math & Logic
+        ("5. Math (GSM8K-ZH)", lambda: extract_math_gsm8k_zh(samples_per_source)),
+        ("5. Math (Ape210K)", lambda: extract_math_ape210k(samples_per_source)),
         
-        # Domain 6: Bilingual & Translation
-        lambda: extract_opus_bilingual(samples_per_source),
+        # Domain 6: Classical Chinese & Poetry
+        ("6. Classical (Corpus Translate)", lambda: extract_classical_chinese(samples_per_source)),
+        ("6. Poetry (Tang/Song)", lambda: extract_classical_poetry(samples_per_source)),
+        
+        # Domain 7: News & Real-World Reporting
+        ("7. News (THUCNews Reporting)", lambda: extract_news_reporting(samples_per_source)),
+        
+        # Domain 8: Bilingual & Translation
+        ("8. Bilingual (OPUS-100 EN-ZH)", lambda: extract_opus_bilingual(samples_per_source)),
     ]
 
     print("==================================================================")
-    print(f"🚀 Starting Omni-Corpus Assembly -> {output_path}")
+    print(f"🚀 Starting 8-Domain Omni-Corpus Assembly -> {output_path}")
     print(f"🎯 Target Samples per Source: {samples_per_source}")
-    print(f"📚 Total Candidate Extractors: {len(extractors)}")
+    print(f"📚 Total Data Streams: {len(extractors)}")
     print("==================================================================")
 
     total_written = 0
     buffer = []
     
     with open(output_path, "w", encoding="utf-8") as out_f:
-        for idx, ext_fn in enumerate(extractors, 1):
-            print(f"\n[{idx}/{len(extractors)}] Executing source extractor...")
+        for idx, (label, ext_fn) in enumerate(extractors, 1):
+            print(f"\n[{idx}/{len(extractors)}] Executing: {label}...")
             source_count = 0
             for item in ext_fn():
                 buffer.append(item)
@@ -429,7 +509,7 @@ def build_omni_corpus(
                     print(f"  💾 Flushed {len(buffer)} samples (Total written: {total_written})...")
                     buffer.clear()
                     out_f.flush()
-            print(f"  -> Extractor [{idx}] collected {source_count} samples.")
+            print(f"  -> Stream [{idx}] collected {source_count} samples.")
 
         # Flush remaining buffer
         if buffer:
@@ -441,15 +521,15 @@ def build_omni_corpus(
             out_f.flush()
 
     print("\n==================================================================")
-    print(f"🎉 Omni-Corpus Assembly Complete!")
+    print(f"🎉 8-Domain Omni-Corpus Assembly Complete!")
     print(f"📦 Total Samples Saved: {total_written}")
-    print(f"📁 File: {output_path}")
+    print(f"📁 Output: {output_path}")
     print(f"📊 Size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
     print("==================================================================")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build Multi-Domain Omni Corpus for Continuous Flow Matching")
+    parser = argparse.ArgumentParser(description="Build 8-Domain Omni Corpus for Continuous Flow Matching")
     parser.add_argument("--samples_per_source", type=int, default=100000, help="Max samples extracted per data source")
     parser.add_argument("--output", type=str, default="/content/omni_corpus.jsonl", help="Output JSONL file path")
     parser.add_argument("--local_moss", type=str, default="data/Basic_ZH/moss_dialogues.jsonl", help="Local MOSS jsonl path")
