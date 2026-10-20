@@ -309,8 +309,16 @@ def extract_math_ape210k(max_samples: int) -> Iterator[Dict[str, str]]:
         ds = load_dataset("MU-NLPC/calc-ape210k", split="train", streaming=True)
         for item in ds:
             q = clean_text(item.get("question_chinese", item.get("question", "")))
-            ans = clean_text(item.get("equation", item.get("chain_of_thought", item.get("answer", ""))))
-            if len(q) >= 5 and len(ans) >= 5:
+            eq = clean_text(item.get("equation", ""))
+            cot = clean_text(item.get("chain_of_thought", ""))
+            res = clean_text(str(item.get("result", item.get("answer", ""))))
+            if cot and len(cot) >= 20:
+                ans = f"{cot}\n计算公式：{eq}，最终结果：{res}".strip()
+            elif eq and res:
+                ans = f"根据题意建立数学求解方程：{eq}，求解得出最终答案：{res}。"
+            else:
+                ans = eq or res
+            if len(q) >= 5 and len(ans) >= 25:
                 yield {"prompt": q, "target": ans, "domain": "math_logic", "source": "ape210k"}
                 count += 1
                 if count >= max_samples:

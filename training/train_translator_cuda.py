@@ -24,7 +24,8 @@ def train_translator():
     parser.add_argument("--data_path", type=str, default="data/Basic_ZH/moss_dialogues.jsonl", help="Path to dialogue or text dataset")
     parser.add_argument("--encoder_ckpt", type=str, default="checkpoints/basencoder_step_115000/student.pt", help="Path to frozen Phase 1 encoder checkpoint")
     parser.add_argument("--max_samples", type=int, default=None, help="Max number of samples to load")
-    parser.set_defaults(ckpt_prefix="translator_conv1d", batch_size=128, epochs=1)
+    parser.add_argument("--max_steps", type=int, default=None, help="Optional max training steps (e.g. 2000 for fast convergence)")
+    parser.set_defaults(ckpt_prefix="translator_conv1d", batch_size=128, epochs=1, save_steps=1000)
     args = parser.parse_args()
     if not args.ckpt_prefix:
         args.ckpt_prefix = "translator_conv1d"
@@ -60,7 +61,10 @@ def train_translator():
     
     # 这是一个非常简单的纯凸优化问题，Learning Rate 可以开大一点
     optimizer = optim.AdamW(translator.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    # 对 <PAD> 赋予 0.1 权重（而非 ignore_index），让译码器学会将空白流形准确映射回 <PAD> (ID=0)，彻底消除尾部乱码
+    class_weights = torch.ones(tokenizer.vocab_size, device=device)
+    class_weights[tokenizer.pad_token_id] = 0.1
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     checkpointer = Checkpointer(out_dir=args.out_dir, prefix=args.ckpt_prefix, keep_last_k=3)
     checkpointer.register_model("translator", translator)
@@ -110,6 +114,14 @@ def train_translator():
                     print(f"Decode: {tokenizer.decode(pred_ids[0].tolist())}")
                     print("------------------------------\n")
                 translator.train()
+
+            if args.save_steps and global_step % args.save_steps == 0:
+                checkpointer.save(global_step)
+
+            if args.max_steps and global_step >= args.max_steps:
+                print(f"✅ Reached max_steps={args.max_steps}. Saving final translator checkpoint...")
+                checkpointer.save(global_step)
+                return
                 
         checkpointer.save(global_step)
 

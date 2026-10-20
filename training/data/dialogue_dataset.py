@@ -35,6 +35,7 @@ class GenericPairDataset(Dataset):
         prompt_key: Optional[str] = None,
         target_key: Optional[str] = None,
         max_samples: Optional[int] = None,
+        min_target_len: int = 0,
         verbose: bool = True
     ):
         self.tokenizer = tokenizer
@@ -44,6 +45,7 @@ class GenericPairDataset(Dataset):
         self.prompt_key = prompt_key
         self.target_key = target_key
         self.max_samples = max_samples
+        self.min_target_len = min_target_len
         self.verbose = verbose
 
         self.samples: List[Tuple[str, str]] = []
@@ -114,7 +116,10 @@ class GenericPairDataset(Dataset):
                     break
 
         if found_prompt_key and found_target_key:
-            return str(item[found_prompt_key]), str(item[found_target_key])
+            p_str, t_str = str(item[found_prompt_key]), str(item[found_target_key])
+            if self.min_target_len > 0 and len(t_str.strip()) < self.min_target_len:
+                return None
+            return p_str, t_str
 
         return None
 

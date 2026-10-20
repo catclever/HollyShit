@@ -25,10 +25,10 @@ from torch.utils.data import DataLoader
 def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
     candidates = []
     for bdir in base_dirs:
-        if not os.path.exists(bdir):
+        if not bdir or not os.path.exists(bdir):
             continue
         for d in os.listdir(bdir):
-            if "translator_conv1d_step_" in d:
+            if "translator" in d and "step_" in d:
                 full_dir = os.path.join(bdir, d)
                 pt_file = os.path.join(full_dir, "translator.pt")
                 if os.path.isfile(pt_file):
@@ -41,6 +41,15 @@ def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
     return None
+
+def decode_with_eos_marker(tokenizer, token_ids):
+    """Decodes token IDs and explicitly marks the first <EOS> as '<eos>' so sequence termination is visible."""
+    if tokenizer.eos_token_id in token_ids:
+        eos_idx = token_ids.index(tokenizer.eos_token_id)
+        head = tokenizer.decode(token_ids[:eos_idx], skip_special_tokens=True)
+        tail = tokenizer.decode(token_ids[eos_idx + 1:], skip_special_tokens=True)
+        return f"{head}<eos>{tail}"
+    return tokenizer.decode(token_ids, skip_special_tokens=True)
 
 @torch.no_grad()
 def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=256, device='cuda'):
@@ -73,7 +82,9 @@ def train():
     parser.add_argument("--euler_steps", type=int, default=10, help="Euler ODE integration steps for qualitative evaluation")
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["bf16", "fp16", "no"], help="Mixed precision mode (bf16, fp16, no)")
     parser.add_argument("--accum_steps", type=int, default=1, help="Number of gradient accumulation steps")
-    parser.set_defaults(ckpt_prefix="phase4_hippo_flow", batch_size=64)
+    parser.add_argument("--min_target_len", type=int, default=30, help="Filter out ultra-short target fragments (< N chars) to avoid 95%% padding dilution")
+    parser.add_argument("--pad_loss_weight", type=float, default=0.05, help="Relative weight for <PAD> tokens in flow matching MSE loss")
+    parser.set_defaults(ckpt_prefix="phase4_hippo_flow", batch_size=64, save_steps=1000)
 
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -114,6 +125,7 @@ def train():
         prompt_key=args.prompt_key,
         target_key=args.target_key,
         max_samples=args.max_samples,
+        min_target_len=args.min_target_len,
         verbose=True
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -130,7 +142,15 @@ def train():
         p.requires_grad = False
 
     # 3. Phase 4 Translator Lens (Frozen Continuous-to-Text Dictionary)
-    translator_path = args.translator_ckpt or find_latest_translator_ckpt()
+    translator_path = args.translator_ckpt
+    if translator_path and ("*" in translator_path or "?" in translator_path):
+        matched = sorted(glob.glob(translator_path))
+        translator_path = matched[-1] if matched else None
+    elif translator_path and os.path.isdir(translator_path):
+        translator_path = os.path.join(translator_path, "translator.pt")
+    if not translator_path:
+        translator_path = find_latest_translator_ckpt(base_dirs=[args.out_dir, "checkpoints/run", "checkpoints"])
+
     translator = None
     if translator_path and os.path.exists(translator_path):
         translator = ContinuousToTextTranslatorCUDA(d_model=1024, vocab_size=tokenizer.vocab_size).to(device)
@@ -171,6 +191,7 @@ def train():
         for batch_idx, (w_t, w_tgt) in enumerate(resumed_loader):
             w_t = w_t.to(device)
             w_tgt = w_tgt.to(device)
+            valid_mask = (w_tgt != tokenizer.pad_token_id)
 
             with torch.no_grad():
                 h_t = encoder.get_normalized_embeddings(w_t)
@@ -183,15 +204,18 @@ def train():
                     h_tgt = layer(h_tgt, None)
                 x_target = encoder.final_ln(h_tgt)
 
-                # 初次前向时做尺度方差体检并启动自适应尺度标定
+                # 初次前向时做尺度方差体检（仅统计非 PAD 真实字符位置）并启动自适应尺度标定
                 if global_step == 0 and batch_idx == 0:
-                    std_val = x_target.std().item()
-                    mean_val = x_target.mean().item()
-                    unet.calibrate_manifold(x_target)
-                    norm_std = unet.normalize(x_target).std().item()
+                    valid_tokens = x_target[valid_mask] if valid_mask.any() else x_target
+                    std_val = valid_tokens.std().item()
+                    mean_val = valid_tokens.mean().item()
+                    unet.calibrate_manifold(x_target, valid_mask=valid_mask)
+                    norm_x = unet.normalize(x_target)
+                    norm_std = (norm_x[valid_mask] if valid_mask.any() else norm_x).std().item()
                     scale_factor = 1.0 / unet.manifold_std.item()
-                    print(f"📊 Manifold Geometry Check -> Raw Mean: {mean_val:.4f}, Raw Std: {std_val:.4f}")
-                    print(f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | Normalized Std: {norm_std:.4f}")
+                    valid_pct = valid_mask.float().mean().item() * 100.0
+                    print(f"📊 Manifold Geometry Check (Valid Tokens: {valid_pct:.1f}%) -> Raw Mean: {mean_val:.4f}, Raw Valid Std: {std_val:.4f}")
+                    print(f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | Normalized Valid Std: {norm_std:.4f}")
 
             # Curriculum Schedule: Attractor probability increases smoothly from 0 to 0.5
             p_attractor = min(0.5, (global_step / max_steps) * 1.0)
@@ -199,7 +223,15 @@ def train():
 
             # Forward + Loss under autocast
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss = hippo_cfm_loss(unet, hippo_oracle, x_prompt, x_target, use_knowledge_attractor=use_attractor)
+                loss = hippo_cfm_loss(
+                    unet,
+                    hippo_oracle,
+                    x_prompt,
+                    x_target,
+                    use_knowledge_attractor=use_attractor,
+                    valid_mask=valid_mask,
+                    pad_loss_weight=args.pad_loss_weight
+                )
                 loss_scaled = loss / args.accum_steps
 
             if scaler is not None:
@@ -242,13 +274,12 @@ def train():
                             device=device
                         )
 
-                    # 解码生成轨迹 (转为 float32 传给 translator)
+                    # 解码生成轨迹与真实 Target (显式标注 <eos> 停止符位置)
                     gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
-                    gen_text = tokenizer.decode(gen_tokens)
+                    gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
 
-                    # 真实 Target 解码 (Sanity Check)
                     ref_tokens = translator.decode_greedy(tgt_sample.float())[0].tolist()
-                    ref_text = tokenizer.decode(ref_tokens)
+                    ref_text = decode_with_eos_marker(tokenizer, ref_tokens)
 
                     prompt_text = tokenizer.decode(w_t[0].tolist())
 
@@ -262,6 +293,9 @@ def train():
                 unet.train()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+            if args.save_steps and global_step % args.save_steps == 0:
+                checkpointer.save(global_step)
 
         checkpointer.save(global_step)
         if torch.cuda.is_available():

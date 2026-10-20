@@ -171,9 +171,17 @@ class FlowMatching1DUnet(nn.Module):
         return pos_emb
 
     @torch.no_grad()
-    def calibrate_manifold(self, x_sample: torch.Tensor, max_calib_steps: int = 50, momentum: float = 0.05) -> bool:
+    def calibrate_manifold(
+        self,
+        x_sample: torch.Tensor,
+        valid_mask: torch.Tensor = None,
+        max_calib_steps: int = 50,
+        momentum: float = 0.05
+    ) -> bool:
         """
         Online EMA Auto-Calibration for target manifold scale:
+        - Strictly computes mean and std over valid (non-PAD) tokens when valid_mask is provided,
+          preventing high-padding short sequences from shrinking manifold_std.
         - Step 0: Directly initializes manifold_mean and manifold_std from the first batch.
         - Steps 1 .. max_calib_steps-1: Smooths estimate via EMA.
         - Step >= max_calib_steps: Locks coordinate scale permanently for stable flow training.
@@ -182,8 +190,14 @@ class FlowMatching1DUnet(nn.Module):
         if step >= max_calib_steps:
             return False
 
-        batch_mean = x_sample.detach().float().mean()
-        batch_std = x_sample.detach().float().std().clamp(min=1e-5)
+        x_float = x_sample.detach().float()
+        if valid_mask is not None and valid_mask.any():
+            valid_tokens = x_float[valid_mask.bool()]
+            batch_mean = valid_tokens.mean()
+            batch_std = valid_tokens.std().clamp(min=1e-5)
+        else:
+            batch_mean = x_float.mean()
+            batch_std = x_float.std().clamp(min=1e-5)
 
         if step == 0:
             self.manifold_mean.copy_(batch_mean)
