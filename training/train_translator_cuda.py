@@ -11,7 +11,7 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
     sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
 
 from training.core.char_tokenizer import CharTokenizer
-from training.data.moss_dataset import MOSSDataset
+from training.data.dialogue_dataset import GenericPairDataset
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from training.core.args import get_training_parser
@@ -21,7 +21,10 @@ from torch.utils.data import DataLoader
 def train_translator():
     # 复用现有的 training parser，但修改默认后缀
     parser = get_training_parser("Phase 4 Translator (LM Head) Training")
-    parser.set_defaults(ckpt_prefix="translator_conv1d")
+    parser.add_argument("--data_path", type=str, default="data/Basic_ZH/moss_dialogues.jsonl", help="Path to dialogue or text dataset")
+    parser.add_argument("--encoder_ckpt", type=str, default="checkpoints/basencoder_step_115000/student.pt", help="Path to frozen Phase 1 encoder checkpoint")
+    parser.add_argument("--max_samples", type=int, default=None, help="Max number of samples to load")
+    parser.set_defaults(ckpt_prefix="translator_conv1d", batch_size=128, epochs=1)
     args = parser.parse_args()
     if not args.ckpt_prefix:
         args.ckpt_prefix = "translator_conv1d"
@@ -30,17 +33,18 @@ def train_translator():
     print(f"Using device: {device}")
     
     tokenizer = CharTokenizer()
-    # 使用专用的 MOSS 数据加载器
-    dataset = MOSSDataset(
-        jsonl_path="data/Basic_ZH/moss_dialogues.jsonl",
+    # 支持任意通用对话或双文本数据集 (MOSS, OmniCorpus, Parquet, JSONL)
+    dataset = GenericPairDataset(
+        data_path=args.data_path,
         tokenizer=tokenizer,
-        seq_len=args.seq_len
+        seq_len=args.seq_len,
+        max_samples=args.max_samples
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     # 1. 挂载并彻底冻结 Phase 1 Encoder
     encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
-    ckpt_path = "checkpoints/basencoder_step_115000/student.pt"
+    ckpt_path = args.encoder_ckpt
     if os.path.exists(ckpt_path):
         encoder.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
         print(f"Loaded frozen encoder from {ckpt_path}")
