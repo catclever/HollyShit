@@ -15,7 +15,7 @@ def mamba_cfm_loss(
     knowledge_mask: Optional[torch.Tensor] = None,
     pad_loss_weight: float = 0.05,
     know_drop_prob: float = 0.15,
-    verbosity_hint_prob: float = 0.50,
+    verbosity_hint_prob: float = 0.85,
     return_sequence: bool = True,
     return_metrics: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
@@ -25,9 +25,11 @@ def mamba_cfm_loss(
     in the normalized Flow Matching manifold, with:
       1. Manifold scale normalization for context, target, and multi-stream knowledge.
       2. Curriculum knowledge dropout (know_drop_prob = 0.15).
-      3. Verbosity hint conditioning (verbosity_hint_prob = 0.50) to break one-to-many length ambiguity.
-      4. Mask-weighted potential MSE + global length prediction loss (0.1 * SmoothL1)
-         + lightweight beat pacing anti-collapse regularization (0.01 * loss_pacing).
+      3. Target horizon alignment (verbosity_hint_prob = 0.85) so the 32 macro-beats align
+         with the true valid target span [0, L_true] during training while h_summary_clean
+         trains length_head on 100% of batches without leakage.
+      4. Mask-weighted potential MSE + FP32 global length prediction loss
+         + lightweight beat pacing anti-collapse regularization.
     """
     B, L_t, D = x_target.shape
 
@@ -69,7 +71,7 @@ def mamba_cfm_loss(
             if drop_samples.any():
                 eff_knowledge_mask[drop_samples] = False
 
-    # 3. True Target Verbosity Ratio & 50% Verbosity Hint Conditioning
+    # 3. True Target Verbosity Ratio & 85% Target Span Alignment
     if target_mask is not None:
         rho_true = (target_mask.float().sum(dim=1) / float(max(L_t, 1))).clamp(min=0.04, max=1.0)
     else:
@@ -77,7 +79,7 @@ def mamba_cfm_loss(
 
     rho_override = None
     if mamba.training and verbosity_hint_prob > 0.0:
-        if torch.rand(1, device=x_target.device).item() < verbosity_hint_prob:
+        if verbosity_hint_prob >= 1.0 or torch.rand(1, device=x_target.device).item() < verbosity_hint_prob:
             rho_override = rho_true
 
     # 4. Mamba Forward Prediction (supports both MultiStreamMambaPlanner and legacy MambaReader)
@@ -105,33 +107,34 @@ def mamba_cfm_loss(
     elif h_pred.dim() == 3 and h_target.dim() == 2:
         h_pred = h_pred[:, -1, :]
 
-    # 5. Mask-Weighted Potential Trajectory MSE Loss
-    sq_err = (h_pred - h_target) ** 2
-    if target_mask is not None and sq_err.dim() == 3:
-        mask_f = target_mask.to(dtype=sq_err.dtype).unsqueeze(-1)  # (B, L_t, 1)
-        weights = mask_f + (1.0 - mask_f) * pad_loss_weight
-        loss_potential = (sq_err * weights).sum() / (weights.sum() * D).clamp(min=1.0)
-    else:
-        loss_potential = torch.mean(sq_err)
+    # 5. Mask-Weighted Potential Trajectory MSE Loss (computed in FP32 for precision)
+    with torch.amp.autocast(device_type=x_target.device.type, enabled=False):
+        sq_err = (h_pred.float() - h_target.float()) ** 2
+        if target_mask is not None and sq_err.dim() == 3:
+            mask_f = target_mask.float().unsqueeze(-1)  # (B, L_t, 1)
+            weights = mask_f + (1.0 - mask_f) * float(pad_loss_weight)
+            loss_potential = (sq_err * weights).sum() / (weights.sum() * D).clamp(min=1.0)
+        else:
+            loss_potential = torch.mean(sq_err)
 
-    # 6. Auxiliary Horizon Length Loss & Beat Pacing Regularization
-    if aux is not None and "rho_pred" in aux:
-        rho_pred = aux["rho_pred"]
-        loss_len = F.smooth_l1_loss(rho_pred.float(), rho_true.float(), beta=0.05).to(dtype=loss_potential.dtype)
-    else:
-        rho_pred = rho_true
-        loss_len = torch.zeros((), device=x_target.device, dtype=loss_potential.dtype)
+        # 6. Auxiliary Horizon Length Loss & Beat Pacing Regularization (explicit FP32)
+        if aux is not None and "rho_pred" in aux:
+            rho_pred = aux["rho_pred"].float()
+            loss_len = F.smooth_l1_loss(rho_pred, rho_true.float(), beta=0.02)
+        else:
+            rho_pred = rho_true.float()
+            loss_len = torch.zeros((), device=x_target.device, dtype=torch.float32)
 
-    if aux is not None and "pacing_weights" in aux:
-        pacing_w = aux["pacing_weights"]
-        k_beats = pacing_w.shape[-1]
-        # Penalize only extreme beat collapse/explosion outside [0.5/K, 1.5/K]
-        dev = (pacing_w.float() * float(k_beats) - 1.0).abs()
-        loss_pacing = (torch.relu(dev - 0.5) ** 2).mean().to(dtype=loss_potential.dtype)
-    else:
-        loss_pacing = torch.zeros((), device=x_target.device, dtype=loss_potential.dtype)
+        if aux is not None and "pacing_weights" in aux:
+            pacing_w = aux["pacing_weights"].float()
+            k_beats = pacing_w.shape[-1]
+            # Penalize only extreme beat collapse/explosion outside [0.5/K, 1.5/K]
+            dev = (pacing_w * float(k_beats) - 1.0).abs()
+            loss_pacing = (torch.relu(dev - 0.5) ** 2).mean()
+        else:
+            loss_pacing = torch.zeros((), device=x_target.device, dtype=torch.float32)
 
-    total_loss = loss_potential + 0.1 * loss_len + 0.01 * loss_pacing
+        total_loss = loss_potential + 0.5 * loss_len + 0.01 * loss_pacing
 
     if return_metrics:
         metrics = {

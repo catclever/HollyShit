@@ -24,17 +24,21 @@ except ImportError:
         MultiStreamKnowledgeDataset = None
 
 try:
-    from model.flow_mamba import MultiStreamMambaPlanner, MambaReader
+    from model.flow_mamba_012 import MultiStreamMambaPlanner, MambaReader
 except ImportError:
-    from model.flow_mamba_009 import MultiStreamMambaPlanner, MambaReader
+    from model.flow_mamba import MultiStreamMambaPlanner, MambaReader
 
 from model.hippo_oracle import HiPPOOracleCUDA
 from model.flow_unet_cuda import FlowMatching1DUnet
-from model.loss_mamba_cfm import mamba_cfm_loss as _base_mamba_cfm_loss
-if "x_knowledge" not in inspect.signature(_base_mamba_cfm_loss).parameters:
-    from model.loss_mamba_cfm_009 import mamba_cfm_loss
-else:
-    mamba_cfm_loss = _base_mamba_cfm_loss
+
+try:
+    from model.loss_mamba_cfm_012 import mamba_cfm_loss
+except ImportError:
+    from model.loss_mamba_cfm import mamba_cfm_loss as _base_mamba_cfm_loss
+    if "x_knowledge" not in inspect.signature(_base_mamba_cfm_loss).parameters:
+        from model.loss_mamba_cfm_009 import mamba_cfm_loss
+    else:
+        mamba_cfm_loss = _base_mamba_cfm_loss
 
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
@@ -132,6 +136,47 @@ def encode_knowledge_streams(encoder, w_know: torch.Tensor, pad_token_id: int):
     flat_out[active_idx] = active_emb
     x_knowledge = flat_out.reshape(B, M, L_k, D)
     return x_knowledge, knowledge_mask
+
+
+@torch.no_grad()
+def build_fixed_length_attractors(
+    x_context_norm: torch.Tensor,
+    context_mask: torch.Tensor = None,
+    x_knowledge_norm: torch.Tensor = None,
+    knowledge_mask: torch.Tensor = None,
+    seq_len: int = 512,
+) -> torch.Tensor:
+    """
+    Builds a fixed-length (B, seq_len, D) attractor tensor matching Phase 4 FlowMatching1DUnet's
+    exact training distribution (`k_attractors = unet.normalize(x_prompt)` of length `seq_len=512`).
+    Places valid context tokens + active valid knowledge tokens into the front of a (B, seq_len, D)
+    buffer padded with normalized <PAD> embeddings from `x_context_norm` up to `seq_len`.
+    """
+    B, L_c, D = x_context_norm.shape
+    pad_vec = x_context_norm[:, -1:, :].expand(B, seq_len, D).clone()
+    attractor_buf = pad_vec.clone()
+
+    for b in range(B):
+        pieces = []
+        if context_mask is not None and context_mask[b].any():
+            pieces.append(x_context_norm[b][context_mask[b].bool()])
+        else:
+            pieces.append(x_context_norm[b])
+
+        if x_knowledge_norm is not None:
+            if knowledge_mask is not None:
+                k_mask_b = knowledge_mask[b].bool()
+                if k_mask_b.any():
+                    pieces.append(x_knowledge_norm[b][k_mask_b])
+            else:
+                pieces.append(x_knowledge_norm[b].reshape(-1, D))
+
+        combined = torch.cat(pieces, dim=0)[:seq_len]
+        n_valid = combined.shape[0]
+        if n_valid > 0:
+            attractor_buf[b, :n_valid, :] = combined
+
+    return attractor_buf
 
 
 @torch.no_grad()
@@ -315,7 +360,16 @@ def train():
     checkpointer.register_optimizer("engine_opt", optimizer)
     checkpointer.register_args(args)
 
-    global_step = checkpointer.load_latest() if args.auto_resume else 0
+    if args.auto_resume:
+        try:
+            global_step = checkpointer.load_latest()
+        except Exception as e:
+            print(f"⚠️ Legacy or incompatible checkpoint detected ({e}). Starting fresh from step 0!")
+            global_step = 0
+            optimizer = optim.AdamW(mamba.parameters(), lr=args.lr)
+            checkpointer.register_optimizer("engine_opt", optimizer)
+    else:
+        global_step = 0
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
@@ -400,9 +454,12 @@ def train():
 
             if (batch_idx + 1) % args.accum_steps == 0 or (batch_idx + 1) == len(resumed_loader):
                 if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(mamba.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(mamba.parameters(), 1.0)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -446,16 +503,14 @@ def train():
                             return_aux=True,
                         )
 
-                        # Construct Multi-Stream Orthogonal Attractors for Phase 4 Unet
-                        valid_ctx_norm = (
-                            x_context_norm[p_mask_sample].unsqueeze(0)
-                            if p_mask_sample.any() else x_context_norm
+                        # Build fixed-length (1, seq_len, D) attractors matching Phase 4 Unet's training distribution
+                        k_attractors_norm = build_fixed_length_attractors(
+                            x_context_norm=x_context_norm,
+                            context_mask=p_mask_sample,
+                            x_knowledge_norm=x_knowledge_norm,
+                            knowledge_mask=k_mask_sample,
+                            seq_len=args.seq_len,
                         )
-                        if x_knowledge_norm is not None and k_mask_sample is not None and k_mask_sample.any():
-                            valid_know_norm = x_knowledge_norm[k_mask_sample].unsqueeze(0)
-                            k_attractors_norm = torch.cat([valid_ctx_norm, valid_know_norm], dim=1)
-                        else:
-                            k_attractors_norm = valid_ctx_norm
 
                         x_gen = sample_euler_ode(
                             unet=unet,
