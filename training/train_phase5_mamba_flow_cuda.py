@@ -182,6 +182,7 @@ def train():
     parser.add_argument("--mamba_layers", type=int, default=6, help="Number of stacked Mamba planner layers")
     parser.add_argument("--know_drop_prob", type=float, default=0.15, help="Curriculum knowledge stream dropout probability during training")
     parser.add_argument("--verbosity_rho", type=float, default=None, help="Optional float in (0, 1] for manual verbosity control during evaluation")
+    parser.add_argument("--auto_resume", dest="auto_resume", action="store_true", help="Automatically find and resume from the latest checkpoint (alias for --continue)")
     parser.set_defaults(ckpt_prefix="phase5_mamba_flow", batch_size=64, save_steps=1000)
 
     args = parser.parse_args()
