@@ -24,21 +24,17 @@ except ImportError:
         MultiStreamKnowledgeDataset = None
 
 try:
-    from model.flow_mamba_012 import MultiStreamMambaPlanner, MambaReader
-except ImportError:
     from model.flow_mamba import MultiStreamMambaPlanner, MambaReader
+except ImportError:
+    from model.flow_mamba_013 import MultiStreamMambaPlanner, MambaReader
 
 from model.hippo_oracle import HiPPOOracleCUDA
 from model.flow_unet_cuda import FlowMatching1DUnet
 
 try:
-    from model.loss_mamba_cfm_012 import mamba_cfm_loss
+    from model.loss_mamba_cfm import mamba_cfm_loss
 except ImportError:
-    from model.loss_mamba_cfm import mamba_cfm_loss as _base_mamba_cfm_loss
-    if "x_knowledge" not in inspect.signature(_base_mamba_cfm_loss).parameters:
-        from model.loss_mamba_cfm_009 import mamba_cfm_loss
-    else:
-        mamba_cfm_loss = _base_mamba_cfm_loss
+    from model.loss_mamba_cfm_013 import mamba_cfm_loss
 
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
@@ -180,11 +176,24 @@ def build_fixed_length_attractors(
 
 
 @torch.no_grad()
-def sample_euler_ode(unet, x_prompt, h_potential, k_attractors_norm=None, steps=10, seq_len=256, device='cuda'):
+def sample_euler_ode(
+    unet,
+    x_prompt,
+    h_potential=None,
+    k_attractors_norm=None,
+    mamba=None,
+    macro_state=None,
+    steps=10,
+    seq_len=256,
+    device='cuda',
+):
     """
-    Euler ODE Integrator:
-    dX_t = v(X_t, t, h_potential, k_attractors=k_attractors_norm) * dt
-    Integrates from white noise X_0 ~ N(0, I) -> X_1_norm, then auto-denormalizes back to encoder manifold.
+    Closed-Loop Two-Stage Euler ODE Integrator:
+    - Stage 1 (`macro_state`) is computed ONCE outside the ODE loop via `mamba.encode_macro(...)`.
+    - Stage 2 (`mamba.forward_canvas`) is called at each Euler step i in [0, steps-1] to dynamically
+      articulate `h_potential(X_t, t)` and `v_mamba(X_t, t)` from the current trajectory state `x`,
+      blending `v_pred = 0.8 * v_unet + 0.2 * v_mamba`.
+    - Gracefully falls back to static `h_potential` when `mamba` or `macro_state` is None.
     """
     B = x_prompt.shape[0]
     D = x_prompt.shape[-1]
@@ -195,7 +204,12 @@ def sample_euler_ode(unet, x_prompt, h_potential, k_attractors_norm=None, steps=
     for i in range(steps):
         t_val = i / float(steps)
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.float32)
-        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=k_attractors_norm)
+        if mamba is not None and macro_state is not None:
+            h_pot_t, v_mamba = mamba.forward_canvas(x, t_tensor, macro_state, return_velocity=True)
+            v_unet = unet(x, t_tensor, h_potential=h_pot_t, k_attractors=k_attractors_norm)
+            v_pred = 0.8 * v_unet + 0.2 * v_mamba
+        else:
+            v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=k_attractors_norm)
         x = x + v_pred * dt
     return unet.denormalize(x)
 
@@ -373,7 +387,7 @@ def train():
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
-        f"🚀 Starting Phase 5 Multi-Stream Mamba Planner Training "
+        f"🚀 Starting Phase 5 Closed-Loop Multi-Stream Mamba Planner Training "
         f"(Layers={args.mamba_layers}, Beats={args.num_beats}, MaxKnowStreams={args.max_know_streams})..."
     )
 
@@ -407,9 +421,18 @@ def train():
                 else:
                     x_knowledge, knowledge_mask = None, None
 
-                if global_step == 0 and batch_idx == 0:
+                if batch_idx == 0:
                     if int(unet.calib_steps.item()) == 0:
                         unet.calibrate_manifold(x_target, valid_mask=target_mask)
+
+                    # Calibrate Mamba's <PAD> tail attractor from the frozen Phase 1 encoder's <PAD> coordinate
+                    if float(mamba.expander.pad_tail_emb.detach().abs().max().item()) < 1e-6:
+                        pad_ids = torch.full((1, 4), tokenizer.pad_token_id, dtype=torch.long, device=device)
+                        pad_raw = encode_tokens(encoder, pad_ids)[:, -1:, :]
+                        pad_norm = unet.normalize(pad_raw)
+                        mamba.expander.pad_tail_emb.data.copy_(pad_norm.to(dtype=mamba.expander.pad_tail_emb.dtype))
+
+                if global_step == 0 and batch_idx == 0:
                     valid_tokens = x_target[target_mask] if target_mask.any() else x_target
                     std_val = valid_tokens.std().item()
                     mean_val = valid_tokens.mean().item()
@@ -466,15 +489,18 @@ def train():
             global_step += 1
             if global_step % 50 == 0:
                 scale_factor = 1.0 / unet.manifold_std.item()
+                cfm_val = metrics["loss_cfm"].item() if "loss_cfm" in metrics else 0.0
+                macro_val = metrics["loss_macro"].item() if "loss_macro" in metrics else 0.0
                 print(
                     f"Epoch {epoch+1} | Step {global_step} | "
                     f"Total Loss: {loss.item():.4f} (Pot: {metrics['loss_potential'].item():.4f}, "
+                    f"CFM: {cfm_val:.4f}, Macro: {macro_val:.4f}, "
                     f"Len: {metrics['loss_len'].item():.4f}, "
                     f"Rho: {metrics['rho_pred_mean'].item():.2f}/{metrics['rho_true_mean'].item():.2f}) | "
                     f"Scale: {scale_factor:.2f}x"
                 )
 
-            # Periodic Dual-Brain End-to-End Qualitative Evaluation
+            # Periodic Dual-Brain Closed-Loop End-to-End Qualitative Evaluation
             if translator is not None and unet is not None and (global_step == 50 or global_step % args.eval_interval == 0):
                 mamba.eval()
                 with torch.no_grad():
@@ -492,16 +518,17 @@ def train():
                         k_mask_sample = None
 
                     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        h_potential, eval_aux = mamba(
-                            x_context_norm,
+                        # Stage 1: Encode Macro Narrative Beats ONCE per dialogue turn
+                        macro_state = mamba.encode_macro(
+                            x_context=x_context_norm,
                             valid_mask=p_mask_sample,
                             x_knowledge=x_knowledge_norm,
                             knowledge_mask=k_mask_sample,
                             target_len=args.seq_len,
                             rho_override=args.verbosity_rho,
-                            return_sequence=True,
-                            return_aux=True,
                         )
+                        eval_aux = macro_state["aux_dict"]
+                        h_potential = macro_state["h_macro_potential"]
 
                         # Build fixed-length (1, seq_len, D) attractors matching Phase 4 Unet's training distribution
                         k_attractors_norm = build_fixed_length_attractors(
@@ -512,11 +539,14 @@ def train():
                             seq_len=args.seq_len,
                         )
 
+                        # Stage 2: Closed-Loop Euler ODE Integration with dynamic mamba.forward_canvas(x_t, t)
                         x_gen = sample_euler_ode(
                             unet=unet,
                             x_prompt=p_sample,
                             h_potential=h_potential,
                             k_attractors_norm=k_attractors_norm,
+                            mamba=mamba,
+                            macro_state=macro_state,
                             steps=args.euler_steps,
                             seq_len=args.seq_len,
                             device=device,
@@ -543,7 +573,7 @@ def train():
                     est_chars = int(round(rho_used_val * args.seq_len))
 
                     print("\n" + "="*60)
-                    print(f"🧠 [Step {global_step}] Phase 5 Dual-Brain Euler ODE Generation Test ({args.euler_steps} steps)")
+                    print(f"🧠 [Step {global_step}] Phase 5 Closed-Loop Dual-Brain Euler ODE Test ({args.euler_steps} steps)")
                     print(f"Prompt:                      {prompt_text}")
                     print(f"Knowledge Streams (Active):  {know_summary}")
                     print(f"Pred Verbosity (rho -> len): rho_pred={rho_pred_val:.2f} (used={rho_used_val:.2f} -> ~{est_chars} chars)")

@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple, Dict, Union, List
+from typing import Optional, Tuple, Dict, Union, List, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +10,38 @@ try:
 except ImportError:
     Mamba = None
     HAS_MAMBA = False
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Continuous Flow Timestep Embedder: maps scalar timestep t in [0, 1] -> R^{d_model}
+    using sinusoidal frequency embeddings + 2-layer SiLU MLP (matching FlowMatching1DUnet).
+    """
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    @staticmethod
+    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / max(half, 1)
+        )
+        args = t[:, None].float() * freqs[None] * 1000.0
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_dtype = self.mlp[0].weight.dtype
+        return self.mlp(t_freq.to(dtype=t_dtype))
 
 
 class CausalMambaFallbackBlock(nn.Module):
@@ -129,28 +161,21 @@ class OrthogonalFieldSuperposition(nn.Module):
 
 class OrthogonalKnowledgeResonance(nn.Module):
     """
-    Macro- and Token-level Orthogonal Attractor with <PAD> mask support.
-    Reuses the ReLU(inner_product) physics of FlowMatching1DUnet.OrthogonalAttractor:
+    Parameter-Free Metric-Preserving Orthogonal Attractor with <PAD> mask support.
+    Directly measures inner-product similarity in the shared Phase 1 geometric manifold
+    without redundant Q/K/V linear projections (saving 75.5M parameters across 24 modules and
+    ~3.5 GB of intermediate activation memory at B=64, L=512):
       - Normalizes query trajectory X and knowledge pool K via LayerNorm(D).
-      - Applies identity-initialized learnable query/key/value projections so step-0 preserves
-        exact inner-product orthogonality while allowing token-level resonant addressing.
-      - Computes inner-product scores = (Q @ K^T) / sqrt(D).
+      - Computes inner-product scores = (X_norm @ K_norm^T) / sqrt(D).
       - Masks <PAD> knowledge tokens to 0.0 before ReLU.
       - Applies thresholded ReLU (NO Softmax!) so irrelevant/orthogonal knowledge yields 0.0 force.
-      - Superimposes the resulting force onto X via OrthogonalFieldSuperposition.
+      - Superimposes the resulting force onto X via 1-parameter OrthogonalFieldSuperposition.
     """
     def __init__(self, d_model: int = 1024, init_gate: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.norm_x = nn.LayerNorm(d_model)
         self.norm_k = nn.LayerNorm(d_model)
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        nn.init.eye_(self.q_proj.weight)
-        nn.init.eye_(self.k_proj.weight)
-        nn.init.eye_(self.v_proj.weight)
-
         self.scale = 1.0 / math.sqrt(d_model)
         self.superposition = OrthogonalFieldSuperposition(d_model, init_gate=init_gate)
 
@@ -176,7 +201,14 @@ class OrthogonalKnowledgeResonance(nn.Module):
             return torch.zeros_like(x)
 
         B, L_q, D = x.shape
-        L_k = k.shape[1]
+        if k.dim() == 4:
+            _, M, L_k_sub, _ = k.shape
+            L_k = M * L_k_sub
+            k = k.reshape(B, L_k, D)
+            if k_mask is not None:
+                k_mask = k_mask.reshape(B, L_k)
+        else:
+            L_k = k.shape[1]
 
         if k_mask is not None:
             k_mask_bool = k_mask.bool()
@@ -189,8 +221,8 @@ class OrthogonalKnowledgeResonance(nn.Module):
             mask_f = None
             k_masked = k
 
-        x_norm = self.q_proj(self.norm_x(x))
-        k_norm = self.k_proj(self.norm_k(k_masked))
+        x_norm = self.norm_x(x)
+        k_norm = self.norm_k(k_masked)
 
         # Zero out k_norm at <PAD> positions in case LayerNorm bias is non-zero
         if k_mask_bool is not None:
@@ -208,18 +240,14 @@ class OrthogonalKnowledgeResonance(nn.Module):
         # Snap-to-grid ReLU threshold with 0.25 margin (NO Softmax -> prevents random mean washout & preserves zero-pollution)
         activation = torch.relu(scores - 0.25) * has_any
 
-        # Normalize by active positive resonance mass + sqrt(active_count) floor
+        # Normalize by sqrt(active_count) floor
         if k_mask_bool is not None:
             active_count = k_mask_bool.float().sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1.0)
             norm_factor = 1.0 / torch.sqrt(active_count).to(dtype=x.dtype)
         else:
             norm_factor = 1.0 / math.sqrt(max(L_k, 1))
 
-        v_masked = self.v_proj(k_masked)
-        if k_mask_bool is not None:
-            v_masked = v_masked * mask_f
-
-        force = torch.bmm(activation, v_masked) * norm_factor
+        force = torch.bmm(activation, k_masked) * norm_factor
         return force
 
     def forward(
@@ -242,9 +270,10 @@ class OrthogonalKnowledgeResonance(nn.Module):
 class TimeWarpedLegendreExpander(nn.Module):
     """
     Expands K_beats (e.g., 32) macroscopic narrative beats into a full-resolution 3D canvas
-    H_canvas of arbitrary canvas length L_out (e.g., 256, 512, 768) with zero hardcoded L weights.
+    H_canvas of arbitrary canvas length L_out (e.g., 256, 512, 768) with zero hardcoded L weights
+    and without the 8.9M-parameter harmonic_proj bottleneck.
 
-    Implements Dual-Level Elastic Time-Warping + Full-Rank Orthonormal Harmonic Packet Expansion:
+    Implements Dual-Level Elastic Time-Warping + Orthonormal Nyquist Slot Articulation:
       1. Global Effective Horizon (length_head / rho_override):
          Runs explicitly in FP32 with straight-through leaky tanh logit bounding:
            soft_logit = 4.5 * tanh(raw_len_logit / 4.5)
@@ -254,18 +283,15 @@ class TimeWarpedLegendreExpander(nn.Module):
          l_eff = rho_used * L_out (512x multiplier) never hijack length_head.
       2. Local Beat Pacing (pacing_head):
          Predicts positive beat duration weights delta_s_k -> normalized p_k (sum_k p_k = 1).
-      3. Dual Basis Macro Projection + Orthonormal DCT/DST Harmonic Packet Expansion:
-         Each beat k in [0, K-1] emits sub_harmonics local spectral modes (total K * sub_harmonics = 512
-         modes), projected onto an analytical orthonormal Nyquist Fourier basis Phi(t) where
-         <Phi(t), Phi(t+1)> == 0.0 across all t in [0, L_out-1], completely eliminating the rank-32
-         low-pass bottleneck!
+      3. Dual Basis Macro Projection + Orthonormal Nyquist Slot Carrier Articulation:
+         Combines K-order Legendre polynomials + Gaussian beat kernels with an analytical
+         orthonormal Nyquist carrier (`<slot[t], slot[t+1]> == 0.0` for all t) modulated by
+         macro beat & summary projections (`self.slot_proj`).
     """
     def __init__(self, d_model: int = 1024, num_beats: int = 32):
         super().__init__()
         self.d_model = d_model
         self.num_beats = num_beats
-        self.sub_harmonics = max(1, (512 + num_beats - 1) // num_beats)
-        self.num_harmonics = num_beats * self.sub_harmonics
 
         # 1. Global Effective Horizon Predictor: h_summary (B, D) -> rho_pred in (0.04, 0.99)
         self.length_head = nn.Sequential(
@@ -293,34 +319,25 @@ class TimeWarpedLegendreExpander(nn.Module):
         nn.init.normal_(self.film_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.film_proj.bias)
 
-        # 4. Full-Rank Beat-Packet Harmonic Projector: maps (B, K, D) + h_summary -> (B, K * sub_harmonics, D)
-        #    Uses H_feat = max(512, d_model // 2) Fourier phase-modulated sample x beat features so all B * K
-        #    sample-beat pairs are mutually orthogonal in R^{H_feat} with condition number ~1.0!
-        self.harmonic_feat_dim = max(512, d_model // 2)
-        self.harmonic_beat_norm = nn.LayerNorm(d_model)
-        self.harmonic_sum_norm = nn.LayerNorm(d_model)
-        self.harmonic_beat_proj = nn.Linear(d_model, self.harmonic_feat_dim // 2, bias=False)
-        self.harmonic_sum_proj = nn.Linear(d_model, self.harmonic_feat_dim // 2, bias=False)
-        nn.init.normal_(self.harmonic_beat_proj.weight, mean=0.0, std=1.2 / math.sqrt(d_model))
-        nn.init.normal_(self.harmonic_sum_proj.weight, mean=0.0, std=1.2 / math.sqrt(d_model))
-        self.harmonic_proj = nn.Linear(self.harmonic_feat_dim, self.sub_harmonics * d_model)
-        nn.init.normal_(self.harmonic_proj.weight, mean=0.0, std=0.005)
-        nn.init.zeros_(self.harmonic_proj.bias)
+        # 4. Lightweight Orthonormal Nyquist Slot Articulation (replaces 8.9M harmonic_proj)
+        self.slot_proj = nn.Linear(d_model, d_model)
+        nn.init.normal_(self.slot_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.slot_proj.bias)
 
-        # 5. Learned <PAD>/<EOS> asymptotic tail state beyond L_eff
+        # 5. Learned <PAD>/<EOS> asymptotic tail state beyond L_eff (calibrated at runtime from <PAD> embedding)
         self.pad_tail_emb = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        # 6. Lightweight 1D sharpening conv block (local grammatical transition refinement)
+        # 6. Lightweight bottleneck 1D sharpening conv block (local grammatical transition refinement)
+        conv_mid = max(d_model // 2, 64)
         self.sharpen_norm = nn.LayerNorm(d_model)
-        self.conv1 = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
+        self.conv1 = nn.Conv1d(d_model, conv_mid, kernel_size=5, padding=2)
         self.act = nn.SiLU()
-        self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(conv_mid, d_model, kernel_size=5, padding=2)
         nn.init.normal_(self.conv2.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.conv2.bias)
 
         self._pos_cache = {}
         self._slot_cache = {}
-        self._ortho_basis_cache = {}
 
     def _get_pos_emb(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Generates 1D Sinusoidal Positional Embeddings of shape (1, seq_len, d_model)."""
@@ -360,36 +377,6 @@ class TimeWarpedLegendreExpander(nn.Module):
         self._slot_cache[key] = carrier
         return carrier
 
-    def _get_ortho_harmonic_basis(
-        self, seq_len: int, t_warped: torch.Tensor, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        """
-        Evaluates the analytical M = num_harmonics (e.g. 512) orthonormal DCT/DST basis Phi(t)
-        blended with time-warped harmonics Phi(t_warped) of shape (B, seq_len, num_harmonics).
-        Satisfies Phi @ Phi^T = I_512 (condition number 1.0, exact 0.0 adjacent token correlation).
-        """
-        F_dim = self.num_harmonics
-        half_f = max(F_dim // 2, 1)
-        key = (seq_len, F_dim, device)
-        if key in self._ortho_basis_cache:
-            theta, static_basis = self._ortho_basis_cache[key]
-        else:
-            t_idx = torch.arange(seq_len, dtype=torch.float32, device=device).unsqueeze(1)  # (L, 1)
-            theta = ((torch.arange(half_f, dtype=torch.float32, device=device) + 0.5) / float(half_f)) * math.pi
-            angles_static = t_idx * theta.unsqueeze(0)  # (L, half_f)
-            static_basis = torch.cat([torch.sin(angles_static), torch.cos(angles_static)], dim=-1) * math.sqrt(
-                2.0 / float(F_dim)
-            )  # (L, F_dim), unit row norm
-            self._ortho_basis_cache[key] = (theta, static_basis)
-
-        # Time-warped harmonic basis on t_warped (B, L_out)
-        angles_warped = t_warped.unsqueeze(-1) * theta.view(1, 1, half_f)  # (B, L, half_f)
-        warped_basis = torch.cat([torch.sin(angles_warped), torch.cos(angles_warped)], dim=-1) * math.sqrt(
-            2.0 / float(F_dim)
-        )
-        combined = 0.8 * static_basis.unsqueeze(0) + 0.2 * warped_basis
-        return combined.to(dtype=dtype)
-
     def _eval_legendre_basis(self, tau: torch.Tensor, degree: int) -> torch.Tensor:
         """
         Evaluates orthogonal Legendre polynomials P_0(tau) .. P_{degree-1}(tau) on tau in [-1, 1]
@@ -419,7 +406,7 @@ class TimeWarpedLegendreExpander(nn.Module):
             target_len: int (dynamic output canvas length L_out)
             rho_override: Optional (B,) tensor or float in (0, 1] for manual verbosity or target alignment
         Returns:
-            h_potential: (B, target_len, D)
+            h_macro_potential: (B, target_len, D)
             aux_dict: dict with rho_pred, rho_used, l_eff, pacing_weights, beat_centers, horizon_gate, h_canvas
         """
         B, K, D = c_beats.shape
@@ -433,7 +420,7 @@ class TimeWarpedLegendreExpander(nn.Module):
             # Softly bound forward logit to (-4.5, 4.5) with straight-through leaky gradient (min slope >= 0.1)
             soft_logit = 4.5 * torch.tanh(raw_len_logit / 4.5)
             bounded_logit = 0.9 * soft_logit + 0.1 * raw_len_logit + 0.1 * (soft_logit - raw_len_logit).detach()
-            rho_pred = 0.04 + 0.95 * torch.sigmoid(bounded_logit)  # Strictly in (0.04, 0.99), FP32, backward slope >= 0.001 everywhere!
+            rho_pred = 0.04 + 0.95 * torch.sigmoid(bounded_logit)
             rho_pred = rho_pred.view(B)
 
         if rho_override is not None:
@@ -467,7 +454,6 @@ class TimeWarpedLegendreExpander(nn.Module):
         local_frac = ((s_grid.unsqueeze(-1) - low_edges.unsqueeze(1)) / p_weights.unsqueeze(1).clamp(min=1e-6)).clamp(0.0, 1.0)
         s_warped = local_frac.mean(dim=-1)  # (B, L_out) in [0, 1]
         tau = 2.0 * s_warped - 1.0          # (B, L_out) in [-1, 1]
-        t_warped = s_warped * denom         # (B, L_out) in [0, L_eff - 1]
 
         # Evaluate K-order Legendre basis on warped coordinate tau(t)
         p_legendre = self._eval_legendre_basis(tau, K).to(dtype=dtype)  # (B, L_out, K)
@@ -481,20 +467,12 @@ class TimeWarpedLegendreExpander(nn.Module):
         h_macro = torch.bmm(p_legendre, self.leg_proj(c_beats)) + torch.bmm(w_gauss, self.gauss_proj(c_beats))
         h_macro_norm = self.macro_norm(h_macro)
 
-        # Full-Rank Orthonormal Harmonic Packet Expansion (breaks the 32-beat low-pass bottleneck!)
-        beat_normed = self.harmonic_beat_norm(c_beats)  # (B, K, D)
-        sum_normed = self.harmonic_sum_norm(h_summary.to(dtype=dtype)).unsqueeze(1)  # (B, 1, D)
-        phase_angles = self.harmonic_beat_proj(beat_normed) + self.harmonic_sum_proj(sum_normed)  # (B, K, H_feat // 2)
-        fourier_feats = torch.cat([torch.sin(phase_angles), torch.cos(phase_angles)], dim=-1)  # (B, K, H_feat)
-        c_harmonics = 2.0 * self.harmonic_proj(fourier_feats).view(B, self.num_harmonics, D)  # (B, num_harmonics, D)
-
-        phi_basis = self._get_ortho_harmonic_basis(L_out, t_warped, device, dtype)  # (B, L_out, num_harmonics)
-        h_harmonic = torch.bmm(phi_basis, c_harmonics)  # (B, L_out, D)
-
-        # High-Frequency Orthogonal Slot Carrier modulated by Macro-Beat FiLM
+        # High-Frequency Orthonormal Nyquist Slot Carrier modulated by Macro-Beat & Summary FiLM
         slot_carrier = self._get_slot_carrier(L_out, device, dtype)  # (1, L_out, D), cos_sim(t, t+1) == 0.0
         gamma, beta = self.film_proj(h_macro_norm).chunk(2, dim=-1)
-        h_pos = h_harmonic + (0.35 + gamma) * slot_carrier + 0.10 * (h_macro_norm + beta)
+        sum_normed = self.macro_norm(h_summary.to(dtype=dtype)).unsqueeze(1)  # (B, 1, D)
+        h_slot = self.slot_proj((0.5 * h_macro_norm + 0.5 * sum_normed + 0.5) * (2.5 * slot_carrier))
+        h_pos = h_macro + (0.35 + gamma) * slot_carrier + h_slot + 0.10 * beta
 
         # Residual 1D Conv local transition refinement
         h_conv_in = self.sharpen_norm(h_pos).transpose(1, 2)  # (B, D, L_out)
@@ -514,24 +492,23 @@ class TimeWarpedLegendreExpander(nn.Module):
             "beat_centers": u_centers,
             "horizon_gate": horizon_gate.squeeze(-1),
             "h_canvas": h_canvas,
+            "h_macro_potential": h_potential,
         }
         return h_potential, aux_dict
 
 
 class MultiStreamMambaPlanner(nn.Module):
     """
-    Phase 5 Unified Left-Brain Architecture (Multi-Stream Mamba Planner).
-    1. Context & Knowledge Scan:
-       Adds sinusoidal positional embeddings to x_context and x_knowledge, strictly masks <PAD> tokens
-       before and after every layer, and extracts a clean summary h_summary_clean (combining masked mean
-       pooling + last valid non-EOS token + pooled active knowledge summary) for length_head.
-    2. Macroscopic 32-Beat Rollout:
-       Rolls out K=32 orthogonal + sinusoidally-initialized narrative beats with Context & Knowledge
-       Orthogonal Resonance.
-    3. Dual-Basis Time-Warped Legendre + Orthonormal Harmonic Expansion & Full-Resolution L=512 Causal Articulation:
-       Expands the 32 beats onto the L_out canvas and articulates every token t in [0, L_out-1] through
-       causal sequence layers (`canvas_layers`) + token-level context resonance (`canvas_ctx_resonance`)
-       + token-level multi-stream knowledge resonance (`canvas_know_resonance`).
+    Phase 5 Unified Left-Brain Architecture (Two-Stage Macro-Once + Micro-Flow (X_t, t) Closed-Loop Planner).
+    1. Stage 1 (`encode_macro` — Executed ONCE per dialogue turn):
+       Scans context & multi-stream knowledge, extracts clean summary `h_summary_clean` for `length_head`,
+       rolls out K=32 narrative beats, and expands them onto the L_out canvas `h_canvas_macro`.
+    2. Stage 2 (`forward_canvas` — Executed at each Flow Timestep t in [0, 1]):
+       Injects strictly 1-step right-shifted causal prefix state `x_t_prev` (position l ONLY observes
+       indices 0 .. l-1, NEVER index l!) weighted by the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)`
+       + macro-centered causal innovation + continuous timestep `t_emb` into the 3-layer causal `canvas_layers`
+       stack, outputting the refined trajectory `h_potential(X_t, t)` and instantaneous OT-CFM velocity
+       vector field `v_mamba(X_t, t)`.
     """
     def __init__(
         self,
@@ -575,7 +552,7 @@ class MultiStreamMambaPlanner(nn.Module):
         self.layers = nn.ModuleList([_make_seq_block() for _ in range(num_layers)])
         self.layer_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
 
-        # Multi-stream orthogonal knowledge resonance modules per macro layer
+        # Parameter-free metric-preserving orthogonal knowledge resonance modules per macro layer
         self.ctx_know_resonance = nn.ModuleList([
             OrthogonalKnowledgeResonance(d_model, init_gate=0.15) for _ in range(num_layers)
         ])
@@ -594,7 +571,7 @@ class MultiStreamMambaPlanner(nn.Module):
         )
         self.verbosity_superposition = OrthogonalFieldSuperposition(d_model, init_gate=0.1)
 
-        # Elastic Time-Warped Legendre + Orthonormal Harmonic Expander
+        # Elastic Time-Warped Legendre + Orthonormal Nyquist Expander
         self.expander = TimeWarpedLegendreExpander(d_model=d_model, num_beats=num_beats)
 
         # K=32 learnable future narrative beat queries: distinct sinusoidal beat pos + orthogonal init (std 0.25)
@@ -610,7 +587,24 @@ class MultiStreamMambaPlanner(nn.Module):
         self.beat_norm = nn.LayerNorm(d_model)
         self.z_proj = nn.Linear(d_model, d_model)
 
-        # Full-Resolution L=512 Causal Canvas Articulation Stack
+        # Stage 2 Micro-Flow (X_t, t) Conditioning & Causal Canvas Articulation Stack
+        self.t_embedder = TimestepEmbedder(hidden_size=d_model, frequency_embedding_size=256)
+        self.canvas_prev_proj = nn.Linear(d_model, d_model)
+        nn.init.normal_(self.canvas_prev_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.canvas_prev_proj.bias)
+
+        self.canvas_t_proj = nn.Linear(d_model, d_model)
+        nn.init.normal_(self.canvas_t_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.canvas_t_proj.bias)
+        self.canvas_t_gates = nn.Parameter(torch.full((self.num_canvas_layers,), 0.2, dtype=torch.float32))
+
+        # Causal prefix branch discriminator + orthonormal slot carrier projection
+        self.canvas_branch_gate = nn.Linear(d_model, 1, bias=False)
+        nn.init.normal_(self.canvas_branch_gate.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+        self.canvas_slot_proj = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.canvas_slot_proj.weight)
+        nn.init.zeros_(self.canvas_slot_proj.bias)
+
         self.canvas_layers = nn.ModuleList([
             _make_seq_block() for _ in range(self.num_canvas_layers)
         ])
@@ -627,6 +621,11 @@ class MultiStreamMambaPlanner(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.out_proj.bias)
+
+        # Instantaneous OT-CFM Velocity Head v_mamba(X_t, t)
+        self.vel_proj = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.vel_proj.weight)
+        nn.init.zeros_(self.vel_proj.bias)
 
     def _flatten_knowledge(
         self,
@@ -665,7 +664,7 @@ class MultiStreamMambaPlanner(nn.Module):
         k_pool = k_pool * k_mask.unsqueeze(-1).to(dtype=k_pool.dtype)
         return k_pool, k_mask
 
-    def forward(
+    def encode_macro(
         self,
         x_context: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
@@ -673,22 +672,11 @@ class MultiStreamMambaPlanner(nn.Module):
         knowledge_mask: Optional[torch.Tensor] = None,
         target_len: Optional[int] = None,
         rho_override: Optional[Union[torch.Tensor, float]] = None,
-        return_sequence: bool = True,
-        keepdim: bool = False,
-        return_aux: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+    ) -> Dict[str, Any]:
         """
-        Args:
-            x_context: (B, L_c, D) - Continuous embeddings of dialogue context
-            valid_mask: (B, L_c) - Boolean mask (True for non-PAD context tokens)
-            x_knowledge: (B, M, L_k, D) or (B, L_know, D) - Multi-stream knowledge embeddings
-            knowledge_mask: (B, M, L_k) or (B, L_know) - Boolean mask for valid knowledge tokens
-            target_len: int - Target canvas length L_out (defaults to L_c if None)
-            rho_override: Optional (B,) tensor or float in (0, 1] for manual verbosity or hint conditioning
-            return_sequence: If True (default), returns (B, target_len, D) potential curve;
-                             if False, returns (B, D) pooled summary state.
-            keepdim: If True (and not return_sequence), returns (B, 1, D).
-            return_aux: If True, returns (output, aux_dict).
+        Stage 1 (Executed ONCE per dialogue turn):
+        Scans context and knowledge streams, extracts clean summary `h_summary_clean`,
+        rolls out K=32 narrative beats, and expands them onto the L_out macroscopic canvas.
         """
         B, L_c, D = x_context.shape
         out_len = int(target_len) if target_len is not None else L_c
@@ -731,7 +719,6 @@ class MultiStreamMambaPlanner(nn.Module):
             valid_len_f = valid_len.float().clamp(min=1.0).unsqueeze(-1).to(dtype=h_ctx.dtype)
             ctx_mean = (h_ctx * mask_f).sum(dim=1) / valid_len_f  # (B, D)
 
-            # Last valid non-EOS token (index valid_len - 2 when valid_len > 1, else valid_len - 1)
             non_eos_idx = torch.where(valid_len > 1, valid_len - 2, (valid_len - 1).clamp(min=0))
             last_non_eos = torch.gather(
                 h_ctx, dim=1, index=non_eos_idx.view(B, 1, 1).expand(B, 1, D)
@@ -762,11 +749,6 @@ class MultiStreamMambaPlanner(nn.Module):
         raw_summary_clean = 0.4 * ctx_mean + 0.4 * last_non_eos + 0.2 * last_eos + 0.5 * know_summary
         h_summary_clean = self.z_proj(raw_summary_clean)  # (B, D)
 
-        if not return_sequence and not return_aux:
-            if keepdim:
-                return h_summary_clean.unsqueeze(1)
-            return h_summary_clean
-
         # Modulate beat seed with verbosity_cond ONLY when an explicit rho_override is provided,
         # keeping h_summary_clean untouched for length_head!
         if rho_override is not None:
@@ -789,41 +771,198 @@ class MultiStreamMambaPlanner(nn.Module):
 
         for i, layer in enumerate(self.layers):
             beats = beats + layer(self.layer_norms[i](beats))
-            # Cross-resonate with valid context tokens so beats recall specific prompt entities
             beats = self.beat_ctx_resonance[i](beats, h_ctx, stream_mask=valid_mask_bool)
-            # Cross-resonate with multi-stream external knowledge pool
             if k_pool is not None:
                 beats = self.beat_know_resonance[i](beats, k_pool, stream_mask=k_mask)
 
         beats = self.beat_norm(beats)
 
-        # 4. Dynamic Time-Warped Legendre + Orthonormal Harmonic Expansion -> h_canvas (B, out_len, D)
-        _, aux_dict = self.expander(
+        # 4. Dynamic Time-Warped Legendre + Orthonormal Slot Expansion -> h_macro_potential (B, out_len, D)
+        h_macro_potential, aux_dict = self.expander(
             c_beats=beats,
             h_summary=h_summary_clean,
             target_len=out_len,
             rho_override=rho_override,
         )
+        aux_dict["beats"] = beats
+        aux_dict["h_macro_potential"] = h_macro_potential
+
+        h_canvas_macro = aux_dict["h_canvas"]
+        horizon_gate = aux_dict["horizon_gate"].unsqueeze(-1).to(dtype=h_canvas_macro.dtype)
+        pad_tail = self.expander.pad_tail_emb.to(dtype=h_canvas_macro.dtype)
+        slot_carrier = self.expander._get_slot_carrier(out_len, x_context.device, h_canvas_macro.dtype)
+
+        return {
+            "h_ctx": h_ctx,
+            "valid_mask_bool": valid_mask_bool,
+            "k_pool": k_pool,
+            "k_mask": k_mask,
+            "h_summary_clean": h_summary_clean,
+            "beats": beats,
+            "h_canvas_macro": h_canvas_macro,
+            "h_macro_potential": h_macro_potential,
+            "horizon_gate": horizon_gate,
+            "pad_tail": pad_tail,
+            "slot_carrier": slot_carrier,
+            "out_len": out_len,
+            "aux_dict": aux_dict,
+        }
+
+    def forward_canvas(
+        self,
+        x_t: torch.Tensor,
+        t: Union[torch.Tensor, float],
+        macro_state: Dict[str, Any],
+        return_velocity: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Stage 2 (Executed at each Flow Matching timestep t in [0, 1]):
+        Takes the current noisy trajectory `x_t` (B, L, D), shifts it right by 1 position (`x_t_prev`)
+        so position l ONLY observes causal prefix `x_t[:, :l, :]` (strictly 0.0 intra-step leakage!),
+        applies the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)` (which is 0.0 at t=0.0,
+        preventing white-noise amplification at Euler step 0), and runs the 3-layer causal `canvas_layers`
+        stack to articulate `h_potential(X_t, t)` and `v_mamba(X_t, t)`.
+        """
+        h_canvas_macro = macro_state["h_canvas_macro"]
+        horizon_gate = macro_state["horizon_gate"]
+        pad_tail = macro_state["pad_tail"]
+        slot_carrier = macro_state["slot_carrier"]
+        h_ctx = macro_state["h_ctx"]
+        valid_mask_bool = macro_state["valid_mask_bool"]
+        k_pool = macro_state["k_pool"]
+        k_mask = macro_state["k_mask"]
+
+        B, L, D = h_canvas_macro.shape
+        device = h_canvas_macro.device
+        dtype = h_canvas_macro.dtype
+
+        if isinstance(t, (int, float)):
+            t_tensor = torch.full((B,), float(t), device=device, dtype=torch.float32)
+        elif t.dim() == 0:
+            t_tensor = t.view(1).expand(B).to(device=device, dtype=torch.float32)
+        else:
+            t_tensor = t.reshape(B).to(device=device, dtype=torch.float32)
+
+        t_emb = self.t_embedder(t_tensor).to(dtype=dtype)  # (B, D)
+        t_expand = t_tensor.view(B, 1, 1).to(dtype=dtype)
+
+        # Bayesian Wiener filter weight: w_wiener(0.0) == 0.0 (zero white-noise amplification at Step 0!),
+        # w_wiener(0.5) == 1.0, and w_wiener(1.0) == 1.0.
+        w_wiener = (t_tensor / (t_tensor.pow(2) + (1.0 - t_tensor).pow(2) + 1e-6)).view(B, 1, 1).to(dtype=dtype)
+
+        # Strictly 1-step right-shifted causal prefix of x_t:
+        # At index l in [0, L-1], x_t_prev[:, :l+1, :] ONLY contains x_t[:, :l, :] (NEVER index l!)
+        x_t_cast = x_t.to(dtype=dtype)
+        x_t_gated = x_t_cast * horizon_gate
+        x_t_prev = F.pad(x_t_gated[:, :-1, :], (0, 0, 1, 0))  # (B, L, D)
+
+        # Macro-centered causal innovation weighted by w_wiener(t)
+        h_macro_gated = h_canvas_macro.detach() * horizon_gate
+        h_macro_prev = F.pad(h_macro_gated[:, :-1, :], (0, 0, 1, 0))  # (B, L, D)
+        innov_prev = w_wiener * (x_t_prev - t_expand * h_macro_prev)  # (B, L, D)
+
+        if L > 1:
+            has_prefix = F.pad(torch.ones((1, L - 1, 1), device=device, dtype=dtype), (0, 0, 1, 0))
+            innov_first = innov_prev[:, 1:2, :] * has_prefix  # (B, L, D): 0 at l=0, innov[:, 0, :] at l>=1
+        else:
+            has_prefix = torch.zeros((1, L, 1), device=device, dtype=dtype)
+            innov_first = torch.zeros_like(innov_prev)
+
+        counts = torch.arange(L, device=device, dtype=torch.float32).clamp(min=1.0).view(1, L, 1).to(dtype=dtype)
+        innov_cum = torch.cumsum(innov_prev, dim=1) / counts  # (B, L, D): 0 at l=0, prefix mean over 0..l-1 at l>=1
+        prefix_innov = 0.4 * innov_first + 0.4 * innov_cum + 0.2 * innov_prev
+
+        # Causal branch gate z_branch in (-1, 1): strictly 0 at t=0.0 and at l=0, causal over 0..l-1 for l>=1
+        z_branch = torch.tanh(8.0 * self.canvas_branch_gate(prefix_innov)) * has_prefix  # (B, L, 1)
+
+        # Fuse macro canvas with Wiener-filtered causal prefix state and flow timestep embedding
+        t_proj_shared = self.canvas_t_proj(t_emb).unsqueeze(1)  # (B, 1, D)
+        h_canvas = (
+            h_canvas_macro
+            + self.canvas_prev_proj(w_wiener * x_t_prev + 0.5 * prefix_innov)
+            + t_proj_shared
+        )
+
+        for j in range(self.num_canvas_layers):
+            t_gate_j = self.canvas_t_gates[j].to(dtype=dtype)
+            normed_c = self.canvas_norms[j](h_canvas + t_gate_j * t_proj_shared)
+            h_canvas = h_canvas + self.canvas_layers[j](normed_c)
+            h_canvas = self.canvas_ctx_resonance[j](h_canvas, h_ctx, stream_mask=valid_mask_bool)
+            if k_pool is not None:
+                h_canvas = self.canvas_know_resonance[j](h_canvas, k_pool, stream_mask=k_mask)
+
+        h_normed = self.canvas_final_norm(h_canvas)
+        h_branch_slot = self.canvas_slot_proj(z_branch * (4.0 * slot_carrier))
+        h_refined = h_canvas + self.out_proj(h_normed) + h_branch_slot
+        h_potential = horizon_gate * h_refined + (1.0 - horizon_gate) * pad_tail
+
+        if return_velocity:
+            inv_one_minus_t = 1.0 / (1.0 - t_tensor).clamp(min=0.05).view(B, 1, 1).to(dtype=dtype)
+            v_base = (h_potential - x_t_cast) * inv_one_minus_t
+            v_mamba = v_base + self.vel_proj(F.silu(h_normed - x_t_cast))
+            return h_potential, v_mamba
+
+        return h_potential
+
+    def forward(
+        self,
+        x_context: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+        x_knowledge: Optional[torch.Tensor] = None,
+        knowledge_mask: Optional[torch.Tensor] = None,
+        target_len: Optional[int] = None,
+        rho_override: Optional[Union[torch.Tensor, float]] = None,
+        x_t: Optional[torch.Tensor] = None,
+        t: Optional[Union[torch.Tensor, float]] = None,
+        return_sequence: bool = True,
+        keepdim: bool = False,
+        return_aux: bool = False,
+        return_velocity: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, Dict[str, torch.Tensor]],
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]],
+    ]:
+        """
+        Unified Two-Stage Forward Pass:
+          1. Runs `encode_macro(...)` once on context + multi-stream knowledge.
+          2. Runs `forward_canvas(x_t, t, macro_state)` on the flow-matching canvas.
+             If `x_t` is omitted (legacy caller), defaults to `x_t = h_macro_potential.detach(), t = 1.0`.
+        """
+        B = x_context.shape[0]
+        macro_state = self.encode_macro(
+            x_context=x_context,
+            valid_mask=valid_mask,
+            x_knowledge=x_knowledge,
+            knowledge_mask=knowledge_mask,
+            target_len=target_len,
+            rho_override=rho_override,
+        )
+        h_summary_clean = macro_state["h_summary_clean"]
+        aux_dict = macro_state["aux_dict"]
 
         if not return_sequence:
             out = h_summary_clean.unsqueeze(1) if keepdim else h_summary_clean
             return (out, aux_dict) if return_aux else out
 
-        # 5. Full-Resolution L=512 Causal Canvas Articulation Stack
-        h_canvas = aux_dict["h_canvas"]
-        horizon_gate = aux_dict["horizon_gate"].unsqueeze(-1).to(dtype=h_canvas.dtype)  # (B, out_len, 1)
+        if x_t is None:
+            x_t = macro_state["h_macro_potential"].detach()
+        if t is None:
+            t = torch.ones((B,), device=x_context.device, dtype=torch.float32)
 
-        for j in range(self.num_canvas_layers):
-            h_canvas = h_canvas + self.canvas_layers[j](self.canvas_norms[j](h_canvas))
-            h_canvas = self.canvas_ctx_resonance[j](h_canvas, h_ctx, stream_mask=valid_mask_bool)
-            if k_pool is not None:
-                h_canvas = self.canvas_know_resonance[j](h_canvas, k_pool, stream_mask=k_mask)
+        h_potential, v_mamba = self.forward_canvas(
+            x_t=x_t,
+            t=t,
+            macro_state=macro_state,
+            return_velocity=True,
+        )
+        aux_dict["v_mamba"] = v_mamba
 
-        # Residual output projection preserves the orthonormal harmonic highway
-        h_canvas = h_canvas + self.out_proj(self.canvas_final_norm(h_canvas))
-        pad_tail = self.expander.pad_tail_emb.to(dtype=h_canvas.dtype)
-        h_potential = horizon_gate * h_canvas + (1.0 - horizon_gate) * pad_tail
-
+        if return_velocity and return_aux:
+            return h_potential, v_mamba, aux_dict
+        if return_velocity:
+            return h_potential, v_mamba
         if return_aux:
             return h_potential, aux_dict
         return h_potential
