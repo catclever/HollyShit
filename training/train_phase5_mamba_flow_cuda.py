@@ -87,6 +87,61 @@ def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
     return None
 
 
+def find_compatible_mamba_ckpt(mamba, out_dir, prefix="phase5_mamba_flow", device="cpu"):
+    """
+    Finds the latest checkpoint with matching architecture by testing state_dict compatibility
+    in descending order of global_step. Skips incompatible legacy checkpoints.
+    """
+    if not out_dir or not os.path.exists(out_dir):
+        return None, 0
+
+    candidates = []
+    expected_step_prefix = f"{prefix}_step_" if prefix else "step_"
+    expected_emergency = f"{prefix}_latest_emergency" if prefix else "latest_emergency"
+
+    for d in os.listdir(out_dir):
+        d_path = os.path.join(out_dir, d)
+        if not os.path.isdir(d_path):
+            continue
+        if prefix and d != expected_emergency and not d.startswith(expected_step_prefix):
+            continue
+
+        step = -1
+        # Extract global_step from dataloader json or step regex
+        for file in os.listdir(d_path):
+            if file.endswith(".json") and "dataloader" in file:
+                try:
+                    import json
+                    with open(os.path.join(d_path, file), "r") as f:
+                        state = json.load(f)
+                        step = state.get("global_step", -1)
+                except Exception:
+                    pass
+        if step == -1:
+            import re
+            m = re.search(r'step_(\d+)', d)
+            if m:
+                step = int(m.group(1))
+        if step >= 0:
+            mamba_pt = os.path.join(d_path, "mamba.pt")
+            if os.path.isfile(mamba_pt):
+                candidates.append((step, d_path, d))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    for step, c_path, c_name in candidates:
+        mamba_pt = os.path.join(c_path, "mamba.pt")
+        try:
+            state_dict = torch.load(mamba_pt, map_location=device, weights_only=True)
+            mamba.load_state_dict(state_dict, strict=True)
+            print(f"✅ Verified compatible Mamba checkpoint '{c_name}' (step {step})")
+            return c_path, step
+        except Exception as e:
+            print(f"ℹ️ Skipping incompatible legacy checkpoint '{c_name}' (step {step}): {e}")
+
+    return None, 0
+
+
 def decode_with_eos_marker(tokenizer, token_ids):
     """Decodes token IDs and explicitly marks the first <EOS> as '<eos>' so sequence termination is visible."""
     if tokenizer.eos_token_id in token_ids:
@@ -375,15 +430,43 @@ def train():
     checkpointer.register_args(args)
 
     if args.auto_resume:
-        try:
-            global_step = checkpointer.load_latest()
-        except Exception as e:
-            print(f"⚠️ Legacy or incompatible checkpoint detected ({e}). Starting fresh from step 0!")
+        compat_path, compat_step = find_compatible_mamba_ckpt(
+            mamba=mamba,
+            out_dir=args.out_dir,
+            prefix=args.ckpt_prefix,
+            device=device,
+        )
+        if compat_path:
+            try:
+                loaded_step = checkpointer.load(compat_path)
+                global_step = loaded_step if loaded_step > 0 else compat_step
+                if hasattr(checkpointer, "set_step"):
+                    checkpointer.set_step(global_step)
+                else:
+                    checkpointer.current_step = global_step
+                print(f"✅ Successfully resumed training from step {global_step} ({compat_path})")
+            except Exception as e:
+                print(f"⚠️ Error loading checkpoint state ({e}). Starting fresh from step 0!")
+                global_step = 0
+                if hasattr(checkpointer, "set_step"):
+                    checkpointer.set_step(0)
+                else:
+                    checkpointer.current_step = 0
+                optimizer = optim.AdamW(mamba.parameters(), lr=args.lr)
+                checkpointer.register_optimizer("engine_opt", optimizer)
+        else:
+            print(f"ℹ️ No compatible checkpoints found in '{args.out_dir}'. Starting fresh from step 0!")
             global_step = 0
-            optimizer = optim.AdamW(mamba.parameters(), lr=args.lr)
-            checkpointer.register_optimizer("engine_opt", optimizer)
+            if hasattr(checkpointer, "set_step"):
+                checkpointer.set_step(0)
+            else:
+                checkpointer.current_step = 0
     else:
         global_step = 0
+        if hasattr(checkpointer, "set_step"):
+            checkpointer.set_step(0)
+        else:
+            checkpointer.current_step = 0
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
@@ -487,6 +570,10 @@ def train():
                 optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+            if hasattr(checkpointer, "set_step"):
+                checkpointer.set_step(global_step)
+            else:
+                checkpointer.current_step = global_step
             if global_step % 50 == 0:
                 scale_factor = 1.0 / unet.manifold_std.item()
                 cfm_val = metrics["loss_cfm"].item() if "loss_cfm" in metrics else 0.0
