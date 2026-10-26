@@ -6,6 +6,7 @@ import glob
 import json
 import re
 import random
+from typing import List, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,22 +17,38 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
     sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
 
 from training.core.char_tokenizer import CharTokenizer
+
+# Import Phase 4 version 020 modules (with fallback)
 try:
-    from training.data.dialogue_dataset_017 import GenericPairDataset
-    from model.hippo_oracle_017 import HiPPOOracleCUDA
-    from model.flow_unet_cuda_017 import FlowMatching1DUnet
-    from model.loss_hippo_cfm_017 import hippo_cfm_loss
+    from model.hippo_oracle_020 import HiPPOOracleCUDA
+    from model.flow_unet_cuda_020 import FlowMatching1DUnet
+    from model.loss_hippo_cfm_020 import hippo_cfm_loss
 except ImportError:
-    from training.data.dialogue_dataset import GenericPairDataset
     from model.hippo_oracle import HiPPOOracleCUDA
     from model.flow_unet_cuda import FlowMatching1DUnet
     from model.loss_hippo_cfm import hippo_cfm_loss
+
+try:
+    from training.data.dialogue_dataset import GenericPairDataset
+except ImportError:
+    from training.data.knowledge_dataset import GenericPairDataset
 
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 from torch.utils.data import DataLoader
+
+CANONICAL_DOMAINS = [
+    "grounded_instruct",
+    "code_api",
+    "classical_quote",
+    "encyclopedia_rag",
+    "math_rule",
+    "literature_lore",
+    "general",
+    "dialogue_social",
+]
 
 
 def get_warmup_cosine_scheduler(
@@ -56,6 +73,52 @@ def get_warmup_cosine_scheduler(
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def select_fixed_benchmark_indices(dataset, seed: int = 42, max_domains: int = 8) -> List[Tuple[str, int]]:
+    """
+    Deterministically selects 1 representative sample index per available domain (up to `max_domains`)
+    using a fixed random seed (42) so qualitative cross-domain evaluation is reproducible and benchmarks all domains.
+    """
+    rng = random.Random(seed)
+    domain_to_indices: Dict[str, List[int]] = {}
+
+    if hasattr(dataset, "samples") and isinstance(dataset.samples, list):
+        for idx, rec in enumerate(dataset.samples):
+            dom = "general"
+            if isinstance(rec, tuple):
+                if len(rec) >= 4 and isinstance(rec[3], str) and rec[3].strip():
+                    dom = rec[3].strip()
+                elif len(rec) >= 3 and isinstance(rec[2], str) and rec[2].strip():
+                    dom = rec[2].strip()
+                elif len(rec) >= 1 and isinstance(rec[0], str):
+                    m = re.match(r"^\s*【([^】]{1,20})】", rec[0])
+                    if m:
+                        dom = m.group(1).strip()
+            elif isinstance(rec, dict):
+                dom = str(rec.get("domain", "general")).strip()
+            domain_to_indices.setdefault(dom, []).append(idx)
+    else:
+        n = min(len(dataset), max_domains)
+        return [("general", i) for i in range(n)]
+
+    if len(domain_to_indices) <= 1 and len(dataset) > 1:
+        n = min(len(dataset), max_domains)
+        step = max(1, len(dataset) // n)
+        return [(f"sample_{i*step}", i * step) for i in range(n)]
+
+    ordered_domains = [d for d in CANONICAL_DOMAINS if d in domain_to_indices]
+    for d in sorted(domain_to_indices.keys()):
+        if d not in ordered_domains:
+            ordered_domains.append(d)
+
+    selected: List[Tuple[str, int]] = []
+    for dom in ordered_domains[:max_domains]:
+        cands = domain_to_indices[dom]
+        chosen_idx = rng.choice(cands)
+        selected.append((dom, chosen_idx))
+
+    return selected
 
 
 def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
@@ -151,10 +214,10 @@ def encode_tokens(encoder, token_ids: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=128, device="cuda"):
+def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=128, prompt_mask=None, device="cpu"):
     """
-    Euler ODE Integrator conditioned on 2D Sentence Vector `h_potential: (B, 1024)` + `k_attractors`:
-    dX_t = v(X_t, t, h_potential=z_sent, k_attractors=x_prompt_norm) * dt
+    Standard Stable Euler ODE Integrator conditioned on 2D Sentence Vector `h_potential: (B, 1024)` + `k_attractors`:
+    dX_t = v(X_t, t, h_potential=z_sent, k_attractors=x_prompt_norm, k_mask=prompt_mask) * dt
     Integrates from white noise X_0 ~ N(0, I) -> X_1_norm, then auto-denormalizes back to encoder manifold.
     """
     B = x_prompt.shape[0]
@@ -165,7 +228,7 @@ def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=128, device=
     for i in range(steps):
         t_val = i / float(steps)
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.float32)
-        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=x_prompt_norm)
+        v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=x_prompt_norm, k_mask=prompt_mask)
         x = x + v_pred * dt
     return unet.denormalize(x)
 
@@ -177,7 +240,7 @@ def train():
         else "data/Basic_ZH/moss_dialogues.jsonl"
     )
 
-    parser = get_training_parser("Phase 4 HiPPO 2D Sentence Vector + Flow Match Engine (CUDA)")
+    parser = get_training_parser("Phase 4 HiPPO 2D Sentence Vector + Flow Match Engine (CUDA 020)")
     parser.add_argument("--data_path", type=str, default=default_data_path, help="Path to dialogue/knowledge dataset (file, dir, or glob)")
     parser.add_argument("--prompt_seq_len", type=int, default=256, help="Max token length for Prompt + Knowledge k_attractors")
     parser.add_argument("--prompt_key", type=str, default=None, help="Explicit prompt key in dataset items")
@@ -252,9 +315,10 @@ def train():
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # Pick 2 fixed representative samples for qualitative ODE evaluation
-    rng = random.Random(42)
-    eval_indices = [rng.randrange(len(dataset)) for _ in range(min(2, len(dataset)))] if len(dataset) > 0 else []
+    # Cross-domain benchmark: select 1 representative sample per domain (up to 8 domains)
+    eval_benchmark_samples = select_fixed_benchmark_indices(dataset, seed=42, max_domains=8)
+    bench_domains_str = ", ".join(f"{dom} (#{idx})" for dom, idx in eval_benchmark_samples)
+    print(f"📌 Fixed Cross-Domain Benchmark Samples ({len(eval_benchmark_samples)} domains): {bench_domains_str}")
 
     # 2. Phase 1 Encoder (Frozen Continuous Geometric Mapper)
     encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
@@ -292,7 +356,7 @@ def train():
     hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=16).to(device)
     hippo_oracle.eval()
 
-    # 5. Flow Match Unet (Trainable Right Brain)
+    # 5. Flow Match Unet (Trainable Right Brain 020)
     unet = FlowMatching1DUnet(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=16).to(device)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
 
@@ -343,7 +407,7 @@ def train():
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
-        f"🚀 Starting Phase 4 2D Sentence Vector + Flow Match Training "
+        f"🚀 Starting Phase 4 2D Sentence Vector + Stable Flow Match Training (020) "
         f"(seq_len={args.seq_len}, prompt_seq_len={args.prompt_seq_len}, "
         f"attractor_prob={args.attractor_prob:.2f}, warmup={args.warmup_steps})..."
     )
@@ -354,10 +418,16 @@ def train():
         resumed_loader = checkpointer.wrap_dataloader(dataloader, epoch, global_step)
         unet.train()
 
-        for batch_idx, (w_t, w_tgt) in enumerate(resumed_loader):
+        for batch_idx, batch_data in enumerate(resumed_loader):
+            if len(batch_data) == 2:
+                w_t, w_tgt = batch_data
+            else:
+                w_t, w_tgt = batch_data[0], batch_data[-1]
+
             w_t = w_t.to(device)
             w_tgt = w_tgt.to(device)
             valid_mask = (w_tgt != tokenizer.pad_token_id)
+            prompt_mask = (w_t != tokenizer.pad_token_id)
 
             with torch.no_grad():
                 x_prompt = encode_tokens(encoder, w_t)
@@ -393,6 +463,7 @@ def train():
                     x_target,
                     use_knowledge_attractor=use_attractor,
                     valid_mask=valid_mask,
+                    prompt_mask=prompt_mask,
                     pad_loss_weight=args.pad_loss_weight,
                     return_metrics=True,
                 )
@@ -405,9 +476,12 @@ def train():
 
             if (batch_idx + 1) % args.accum_steps == 0 or (batch_idx + 1) == len(resumed_loader):
                 if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
                     optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -424,16 +498,26 @@ def train():
                     f"Attractor Prob: {p_attractor:.2f} | Scale: {scale_factor:.2f}x"
                 )
 
+            # Upgraded cross-domain evaluation: 1 representative sample per domain (up to 8 domains)
             if translator is not None and (global_step == 50 or global_step % args.eval_interval == 0):
                 unet.eval()
                 with torch.no_grad():
                     print("\n" + "=" * 70)
-                    print(f"🔮 [Step {global_step}] 2D Sentence Vector Euler ODE Evaluation ({args.euler_steps} steps)")
-                    for s_idx, ds_idx in enumerate(eval_indices):
-                        w_p_s, w_t_s = dataset[ds_idx]
+                    print(
+                        f"🔮 [Step {global_step}] 2D Sentence Vector Cross-Domain Euler ODE Evaluation "
+                        f"({len(eval_benchmark_samples)} domains, {args.euler_steps} steps)"
+                    )
+                    for s_idx, (dom_name, ds_idx) in enumerate(eval_benchmark_samples):
+                        item_data = dataset[ds_idx]
+                        if len(item_data) == 2:
+                            w_p_s, w_t_s = item_data
+                        else:
+                            w_p_s, w_t_s = item_data[0], item_data[-1]
+
                         w_p_s = w_p_s.unsqueeze(0).to(device)
                         w_t_s = w_t_s.unsqueeze(0).to(device)
                         tgt_valid_mask = (w_t_s != tokenizer.pad_token_id)
+                        p_valid_mask = (w_p_s != tokenizer.pad_token_id)
 
                         p_sample = encode_tokens(encoder, w_p_s)
                         tgt_sample = encode_tokens(encoder, w_t_s)
@@ -448,6 +532,7 @@ def train():
                                 h_potential=z_sent,
                                 steps=args.euler_steps,
                                 seq_len=args.seq_len,
+                                prompt_mask=p_valid_mask,
                                 device=device,
                             )
 
@@ -460,7 +545,7 @@ def train():
                         prompt_text = tokenizer.decode(w_p_s[0].tolist(), skip_special_tokens=True)
                         valid_len = int(tgt_valid_mask.sum().item())
 
-                        print(f"--- Sample #{s_idx + 1} (idx={ds_idx}) ---")
+                        print(f"--- [{dom_name}] Sample #{s_idx + 1} (idx={ds_idx}) ---")
                         print(f"Prompt + Knowledge (k_attractors): {prompt_text}")
                         print(f"Target Sentence (len={valid_len}, Z_sent shape: {tuple(z_sent.shape)}): {ref_text}")
                         print(f"Right-Brain Generated (from 1x1024 Z_sent + k_attractors): {gen_text}")

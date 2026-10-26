@@ -1,7 +1,7 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 def build_deterministic_ortho_mix(hidden_dim: int, seed: int = 42) -> torch.Tensor:
@@ -66,20 +66,28 @@ class OrthogonalAttractor(nn.Module):
     Implements Knowledge Extraction via Dimensional Cosine Resonance.
     Preserves the shared 1024-D embedding coordinate axes via diagonal `channel_weight`
     so `h_wave` unpacked from `z_sent` directly resonates with matching token embeddings in `k_attractors`.
+    Masks out <PAD> prompt tokens so target tokens are not overwritten by padding keys.
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.norm_x = nn.LayerNorm(hidden_dim)
         self.norm_k = nn.LayerNorm(hidden_dim)
         self.channel_weight = nn.Parameter(torch.ones(hidden_dim))
-        self.logit_scale = nn.Parameter(torch.tensor(50.0))
+        self.logit_scale = nn.Parameter(torch.tensor(15.0))
         self.snap_threshold = 0.08
 
-    def forward(self, x: torch.Tensor, k: torch.Tensor, k_val: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        k: torch.Tensor,
+        k_val: torch.Tensor = None,
+        k_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         x: (B, L_x, D) - Unet's current generative trajectory
         k: (B, L_k, D) - Knowledge attractor keys
         k_val: (B, L_k, D) - Knowledge attractor values (defaults to k)
+        k_mask: (B, L_k) - Boolean mask indicating non-PAD tokens in k (True=valid, False=PAD)
         """
         if k_val is None:
             k_val = k
@@ -90,11 +98,15 @@ class OrthogonalAttractor(nn.Module):
         # Cosine Similarity Matrix: (B, L_x, L_k) in [-1, 1]
         sim = torch.bmm(q_unit, k_unit.transpose(1, 2))
 
+        # Mask out <PAD> keys so padding receives strictly 0 attention
+        if k_mask is not None:
+            sim = sim.masked_fill(~k_mask.unsqueeze(1), -1e4)
+
         # Snap-to-Grid Threshold Gate: suppresses uncorrelated / negated distractors
         max_sim = sim.max(dim=-1, keepdim=True).values
-        gate = torch.sigmoid((max_sim - self.snap_threshold) * 40.0)
+        gate = torch.sigmoid((max_sim - self.snap_threshold) * 20.0)
 
-        scale = self.logit_scale.clamp(min=1.0, max=100.0)
+        scale = self.logit_scale.clamp(min=1.0, max=35.0)
         attn = F.softmax(sim * scale, dim=-1) * gate
 
         force = torch.bmm(attn, k_val)
@@ -128,8 +140,9 @@ class Gated1DResBlock(nn.Module):
         x: torch.Tensor,
         t_emb: torch.Tensor,
         h_potential: torch.Tensor,
-        k_attractors: torch.Tensor,
+        k_attractors: torch.Tensor = None,
         k_val: torch.Tensor = None,
+        k_mask: torch.Tensor = None,
     ):
         residual = x
 
@@ -140,11 +153,10 @@ class Gated1DResBlock(nn.Module):
         # 2. Inject Momentum (Macroscopic Wind via AdaLN)
         x = self.adaLN1(x, h_potential)
 
-        # 3. Inject Knowledge Attractor (Orthogonal Gravity)
-        force = None
+        # 3. Inject Knowledge Attractor smoothly into the residual stream
         if k_attractors is not None:
-            force = self.attractor(x, k_attractors, k_val=k_val)
-            x = x + (15.0 * self.attractor_gate) * force
+            force = self.attractor(x, k_attractors, k_val=k_val, k_mask=k_mask)
+            x = x + torch.tanh(self.attractor_gate) * force
 
         # 4. Sculpt Geometry (1D Conv)
         x = x.transpose(1, 2)
@@ -157,16 +169,18 @@ class Gated1DResBlock(nn.Module):
         x = self.conv2(x)
         x = x.transpose(1, 2)
 
-        return residual + x, force
+        return residual + x
 
 
 class FlowMatching1DUnet(nn.Module):
     """
-    Vector Field Predictor for OT-CFM (Right Brain / Motor Cortex).
-    Driven by a 2D Sentence Vector `h_potential: (B, 1024)` (unpacked via 16-mode shifted Legendre
-    basis + position-aware residual adapter), 1D sinusoidal positional coordinates, and orthogonal
-    knowledge attractors `k_attractors: (B, L_k, 1024)`.
-    Includes built-in Adaptive Manifold Auto-Calibration (manifold_mean & manifold_std).
+    Standard Stable Vector Field Predictor for OT-CFM (Right Brain / Motor Cortex).
+    - Driven by a 2D Sentence Vector `h_potential: (B, 1024)` (unpacked via 16-mode shifted Legendre
+      basis + position-aware residual adapter) as `h_cond`.
+    - Primary generative path driven directly by `x_t`: `x = x_t + 0.1 * pos_x`.
+    - Knowledge attractors with `<PAD>` key masking injected smoothly into the residual stream.
+    - Velocity output: `v_pred = self.final_proj(x_normed)` without 1/(1-t) division or x_t subtraction.
+    - Includes built-in Adaptive Manifold Auto-Calibration (manifold_mean & manifold_std).
     """
     def __init__(
         self,
@@ -208,12 +222,11 @@ class FlowMatching1DUnet(nn.Module):
         ])
 
         self.final_norm = AdaLN(hidden_dim, cond_dim)
-        # Full-rank 1024x1024 projection head for full-vocabulary Chinese generation
+        # Full-rank 1024x1024 projection head for velocity output
         self.final_proj = nn.Linear(hidden_dim, hidden_dim)
         with torch.no_grad():
             self.final_proj.weight.mul_(0.01)
             nn.init.zeros_(self.final_proj.bias)
-        self.x_t_gate = nn.Parameter(torch.ones(hidden_dim))
 
         # In-Model Adaptive Manifold Auto-Calibration Buffers (persisted in unet.pt)
         self.register_buffer("manifold_mean", torch.tensor(0.0, dtype=torch.float32))
@@ -355,12 +368,14 @@ class FlowMatching1DUnet(nn.Module):
         t: torch.Tensor,
         h_potential: torch.Tensor,
         k_attractors: torch.Tensor = None,
+        k_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        x_t: (B, L, D) - Current state of the normalized trajectory
-        t: (B,) - Timesteps in [0, 1]
-        h_potential: (B, D) 2D Sentence Vector (or legacy (B, L, D) 3D trajectory)
-        k_attractors: (B, L_k, D) - Knowledge/Context stream coordinates
+        Standard Stable Velocity Field Predictor for OT-CFM:
+        - Primary generative path: driven by x_t! `x = x_t + 0.1 * pos_x`
+        - Condition path: `h_cond = h_wave + 0.5 * h_global + sent_wave_proj(...)`
+        - Velocity output: simply `v_pred = self.final_proj(x_normed)`!
+        - Completely free of /(1-t) division and x_t_gate * x_t subtraction.
         """
         B, L, D = x_t.shape
         t_emb = self.t_embedder(t)
@@ -374,25 +389,21 @@ class FlowMatching1DUnet(nn.Module):
             h_cond = h_wave + 0.5 * h_global + self.sent_wave_proj(
                 torch.cat([h_wave, h_global + pos_x], dim=-1)
             )
-            x = h_wave + 0.05 * pos_x + 0.05 * x_t
         else:
             h_cond = h_potential
-            x = h_cond + 0.05 * pos_x + 0.05 * x_t
+
+        # Primary generative trajectory driven by x_t!
+        x = x_t + 0.1 * pos_x
 
         k_pos = None
         if k_attractors is not None:
             pos_k = self._get_pos_emb(k_attractors.shape[1], k_attractors.device, k_attractors.dtype)
             k_pos = k_attractors + 0.02 * pos_k
 
-        attractor_acc = torch.zeros_like(x_t)
         for block in self.blocks:
-            x, force = block(x, t_emb, h_cond, k_pos, k_val=k_attractors)
-            if force is not None:
-                attractor_acc = attractor_acc + (30.0 * block.attractor_gate) * force
+            x = block(x, t_emb, h_cond, k_attractors=k_pos, k_val=k_attractors, k_mask=k_mask)
 
         x_normed = self.final_norm(x, h_cond)
-        x_1_hat = self.final_proj(x_normed) + attractor_acc
-        denom = (1.0 - t.to(device=x_t.device, dtype=x_t.dtype)).clamp(min=0.05)[:, None, None]
-        v_pred = (x_1_hat - self.x_t_gate * x_t) / denom
+        v_pred = self.final_proj(x_normed)
 
         return v_pred

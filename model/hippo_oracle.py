@@ -43,6 +43,8 @@ class HiPPOOracleCUDA(nn.Module):
     - Default mode (`return_sequence=False`): Projects a 3D token trajectory `x_seq` of shape `(B, L, D)`
       into a strictly 2D Sentence Vector `z_sent` of shape `(B, D)` by mixing all `D=1024` channels
       across `K=16` orthogonal Legendre temporal sub-bands (`d_sub = 64` dims per polynomial degree `k=0..15`).
+      With sample-adaptive Legendre projection on the valid span, sequences of any length (15 to 128)
+      span the full [0, 1] harmonic range, PAD tokens contribute exactly 0, and z_sent maintains unit variance.
     - Legacy sequence mode (`return_sequence=True`): Returns the 3D causal Toeplitz trajectory `(B, L, D)`.
     """
 
@@ -143,19 +145,50 @@ class HiPPOOracleCUDA(nn.Module):
         """
         Projects 3D sequence `x_seq` of shape `(B, L, D)` into a strictly 2D Sentence Vector
         `z_sent` of shape `(B, D)` (`(B, 1024)`):
-          1. Mixes all D channels across K=16 sub-bands via `self.ortho_mix`;
-          2. Projects along sequence dimension `L` onto the `K` orthonormal Legendre polynomials `basis` `(K, L)`;
-          3. Reshapes `(B, K, d_sub)` -> `(B, D)` with unit variance (`Std ≈ 1.0`).
+          1. Masks out <PAD> positions if valid_mask is provided:
+             `x_masked = x_seq * valid_mask.unsqueeze(-1).to(x_seq.dtype)`;
+          2. Computes per-sequence valid lengths: `valid_lens = valid_mask.sum(dim=-1).clamp(min=1)`;
+          3. Evaluates sample-adaptive Legendre basis on the valid span [0, L_v-1] for each sample b,
+             guaranteeing valid characters span the full domain [0, 1] of all 16 Legendre harmonics,
+             and PAD positions contribute strictly 0;
+          4. Mixes all D channels across K=16 sub-bands via `self.ortho_mix`;
+          5. Reshapes `(B, K, d_sub)` -> `(B, D)` with unit variance (`Std ≈ 1.0`).
         """
         B_size, L, D = x_seq.shape
         K = self.num_subbands
         d_sub = self.d_sub
 
         ortho = self.ortho_mix.to(device=x_seq.device, dtype=x_seq.dtype)
-        x_mixed = torch.matmul(x_seq, ortho).reshape(B_size, L, K, d_sub)
 
-        basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype)  # (K, L)
-        z_sub = torch.einsum("kl,blkd->bkd", basis, x_mixed)  # (B, K, d_sub)
+        if valid_mask is not None:
+            mask_f = valid_mask.unsqueeze(-1).to(x_seq.dtype)
+            x_masked = x_seq * mask_f
+            valid_lens = valid_mask.sum(dim=-1).clamp(min=1)  # (B,)
+        else:
+            x_masked = x_seq
+            valid_lens = None
+
+        x_mixed = torch.matmul(x_masked, ortho).reshape(B_size, L, K, d_sub)
+
+        # Build sample-adaptive Legendre basis on the valid span
+        if valid_lens is None:
+            basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype)  # (K, L)
+            z_sub = torch.einsum("kl,blkd->bkd", basis, x_mixed)  # (B, K, d_sub)
+        else:
+            min_l = int(valid_lens.min().item())
+            max_l = int(valid_lens.max().item())
+            if min_l == max_l and min_l == L:
+                basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype)
+                z_sub = torch.einsum("kl,blkd->bkd", basis, x_mixed)
+            else:
+                basis_batch = torch.zeros((B_size, K, L), device=x_seq.device, dtype=x_seq.dtype)
+                for b in range(B_size):
+                    L_v = int(valid_lens[b].item())
+                    L_v = min(L_v, L)
+                    b_mat = self._get_legendre_basis(L_v, x_seq.device, x_seq.dtype)  # (K, L_v)
+                    basis_batch[b, :, :L_v] = b_mat
+                z_sub = torch.einsum("bkl,blkd->bkd", basis_batch, x_mixed)
+
         z_sent = z_sub.reshape(B_size, D)  # (B, D)
         return z_sent
 

@@ -9,6 +9,7 @@ def hippo_cfm_loss(
     x_target,
     use_knowledge_attractor=True,
     valid_mask=None,
+    prompt_mask=None,
     pad_loss_weight: float = 0.05,
     return_metrics: bool = False,
 ):
@@ -20,6 +21,7 @@ def hippo_cfm_loss(
     x_target: (B, L_t, D) Raw continuous embeddings of the single-clause target sentence
     use_knowledge_attractor: (bool) Toggle for orthogonal attraction from k_attractors
     valid_mask: (B, L_t) Boolean mask (True for non-PAD tokens, False for PAD tokens)
+    prompt_mask: (B, L_p) Boolean mask (True for non-PAD tokens in prompt, False for PAD tokens)
     pad_loss_weight: Relative loss weight on PAD positions (default 0.05) to prevent gradient dilution
     return_metrics: (bool) If True, returns (loss, metrics_dict)
     """
@@ -40,16 +42,17 @@ def hippo_cfm_loss(
         )
 
     # 2. Setup Symmetric Flow Matching Trajectory (Both X_1 and X_0 have Std = 1.0)
-    # Sample t in [0, 0.85] so (1 - t) >= 0.15 is bounded away from singularity while spanning the Euler ODE horizon
-    t = torch.rand((B,), device=device, dtype=x_target_norm.dtype) * 0.85
+    # Sample t ~ Uniform(0, 1) spanning the full continuous unit interval
+    t = torch.rand((B,), device=device, dtype=x_target_norm.dtype)
     t_expand = t[:, None, None]  # (B, 1, 1)
     x_0 = torch.randn_like(x_target_norm)
     x_t = t_expand * x_target_norm + (1.0 - t_expand) * x_0
     v_target = x_target_norm - x_0
 
-    # 3. Predict Velocity conditioned on 2D Sentence Vector z_sent + k_attractors
+    # 3. Predict Velocity conditioned on 2D Sentence Vector z_sent + k_attractors with prompt_mask
     k_attractors = x_prompt_norm if use_knowledge_attractor else None
-    v_pred = unet(x_t, t, h_potential=z_sent, k_attractors=k_attractors)
+    k_mask = prompt_mask if use_knowledge_attractor else None
+    v_pred = unet(x_t, t, h_potential=z_sent, k_attractors=k_attractors, k_mask=k_mask)
 
     # 4. Mask-Weighted Flow Matching Velocity MSE Loss
     sq_err = (v_pred - v_target) ** 2
@@ -63,14 +66,14 @@ def hippo_cfm_loss(
         loss_valid_raw = loss_vel
 
     # 5. Implied Endpoint Prediction & Valid-Token Cosine Direction Loss
-    x_1_pred = x_t + (1.0 - t_expand) * v_pred
-    cos_sim = F.cosine_similarity(x_1_pred.float(), x_target_norm.float(), dim=-1, eps=1e-6)
+    x_1_hat = x_t + (1.0 - t_expand) * v_pred
+    cos_sim = F.cosine_similarity(x_1_hat.float(), x_target_norm.float(), dim=-1, eps=1e-6)
     cos_err = 1.0 - cos_sim
     if valid_mask is not None and valid_mask.any():
         mask_2d = valid_mask.to(dtype=cos_err.dtype)
-        loss_cos = 0.2 * (cos_err * mask_2d).sum() / mask_2d.sum().clamp(min=1.0)
+        loss_cos = 0.1 * (cos_err * mask_2d).sum() / mask_2d.sum().clamp(min=1.0)
     else:
-        loss_cos = 0.2 * cos_err.mean()
+        loss_cos = 0.1 * cos_err.mean()
 
     loss = loss_vel + loss_cos.to(dtype=loss_vel.dtype)
 
