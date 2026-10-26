@@ -29,11 +29,21 @@ def mamba_cfm_loss(
            X_0 ~ N(0, I)
            X_t = t * H_target + (1 - t) * X_0
            V_target = H_target - X_0
-      3. Curriculum knowledge dropout (know_drop_prob = 0.15) and target horizon alignment
-         (verbosity_hint_prob = 0.85) with strict h_summary_clean gradient isolation.
-      4. Explicit FP32 multi-objective continuous loss with t^2-weighted potential loss:
-           w_pot(t) = 3.0 * max(t, 0.1)^2   (E[3*t^2] = 1.0, suppresses t -> 0 unconditional mean pull by 30x)
-           total_loss = loss_potential + 0.5 * loss_cfm + 0.25 * loss_macro + 0.5 * loss_len + 0.01 * loss_pacing
+      3. Self-conditioned prefix passing (`x_0=x_0`) to eliminate teacher-forced `x_t_prev` leakage,
+         curriculum knowledge dropout (`know_drop_prob = 0.15`), and target horizon alignment
+         (`verbosity_hint_prob = 0.85`) with strict `h_summary_clean` gradient isolation.
+      4. Explicit FP32 multi-objective continuous loss with gentle linear `t`-weighting (`0.5 + t`),
+         pure valid-token MSE metrics (`loss_potential_raw`, `per_sample_pot`), stronger Stage 1
+         macro supervision (`0.75 * loss_macro`), and spherical cosine + radial norm preservation (`0.25 * loss_cos`):
+           w_pot(t) = 0.5 + clamp(t, 0.0, 1.0)   (mean weight 1.0, gentle 3:1 ratio)
+           total_loss = (
+               loss_potential
+               + 0.5 * loss_cfm
+               + 0.75 * loss_macro
+               + 0.25 * loss_cos
+               + 0.5 * loss_len
+               + 0.01 * loss_pacing
+           )
     """
     B, L_t, D = x_target.shape
     device = x_target.device
@@ -113,7 +123,7 @@ def mamba_cfm_loss(
         x_t = t_expand * h_target + (1.0 - t_expand) * x_0
         v_target = h_target - x_0
 
-    # 5. Mamba Closed-Loop Forward Prediction (supports Two-Stage (X_t, t) and legacy MambaReader)
+    # 5. Mamba Closed-Loop Forward Prediction (passes x_0 for self-conditioned prefix x_t_prefix)
     aux = None
     v_mamba = None
     try:
@@ -126,6 +136,7 @@ def mamba_cfm_loss(
             rho_override=rho_override,
             x_t=x_t if h_target.dim() == 3 else None,
             t=t_used,
+            x_0=x_0 if h_target.dim() == 3 else None,
             return_sequence=return_sequence,
             return_aux=True,
             return_velocity=True,
@@ -150,15 +161,41 @@ def mamba_cfm_loss(
                 knowledge_mask=eff_knowledge_mask,
                 target_len=L_t,
                 rho_override=rho_override,
+                x_t=x_t if h_target.dim() == 3 else None,
+                t=t_used,
                 return_sequence=return_sequence,
                 return_aux=True,
+                return_velocity=True,
             )
             if isinstance(out, tuple):
-                h_pred, aux = out
+                if len(out) == 3:
+                    h_pred, v_mamba, aux = out
+                elif len(out) == 2:
+                    h_pred, aux = out
+                    if isinstance(aux, dict) and "v_mamba" in aux:
+                        v_mamba = aux["v_mamba"]
+                else:
+                    h_pred = out[0]
             else:
                 h_pred = out
         except TypeError:
-            h_pred = mamba(x_context_norm, valid_mask=context_mask, return_sequence=return_sequence)
+            try:
+                out = mamba(
+                    x_context_norm,
+                    valid_mask=context_mask,
+                    x_knowledge=x_knowledge_norm,
+                    knowledge_mask=eff_knowledge_mask,
+                    target_len=L_t,
+                    rho_override=rho_override,
+                    return_sequence=return_sequence,
+                    return_aux=True,
+                )
+                if isinstance(out, tuple):
+                    h_pred, aux = out
+                else:
+                    h_pred = out
+            except TypeError:
+                h_pred = mamba(x_context_norm, valid_mask=context_mask, return_sequence=return_sequence)
 
     if h_pred.dim() == 2 and h_target.dim() == 3:
         h_pred = h_pred.unsqueeze(1)
@@ -168,28 +205,35 @@ def mamba_cfm_loss(
     # 6. Explicit FP32 Multi-Objective Loss Computation
     with torch.amp.autocast(device_type=device.type, enabled=False):
         t_f = t_used.float()
-        w_pot_sample = 3.0 * (t_f.clamp(min=0.1) ** 2)  # (B,)
+        # Gentle linear t-weighting: mean weight 1.0, gentle 3:1 ratio (does not starve t < 0.3)
+        w_pot_sample = 0.5 + t_f.clamp(min=0.0, max=1.0)  # (B,)
 
         if target_mask is not None and h_target.dim() == 3:
             mask_f = target_mask.float().unsqueeze(-1)  # (B, L_t, 1)
+            valid_mask_f = mask_f
             weights = mask_f + (1.0 - mask_f) * float(pad_loss_weight)
             denom = (weights.sum() * D).clamp(min=1.0)
             sample_denom = (weights.sum(dim=(1, 2)) * D).clamp(min=1.0)  # (B,)
+            valid_denom = (valid_mask_f.sum() * D).clamp(min=1.0)
+            sample_valid_denom = (valid_mask_f.sum(dim=(1, 2)) * D).clamp(min=1.0)  # (B,)
         else:
+            valid_mask_f = None
             weights = None
             denom = None
             sample_denom = None
+            valid_denom = None
+            sample_valid_denom = None
 
-        # (a) Refined Potential Trajectory MSE Loss (t^2-weighted + unweighted raw per-sample tracking)
+        # (a) Refined Potential Trajectory MSE Loss (gentle linear t-weighted + pure valid-token raw tracking)
         sq_err_pot = (h_pred.float() - h_target.float()) ** 2
         if weights is not None and sq_err_pot.dim() == 3:
-            w_pot_3d = w_pot_sample.view(B, 1, 1)
-            loss_potential = (sq_err_pot * weights * w_pot_3d).sum() / denom
-            loss_potential_raw = (sq_err_pot * weights).sum() / denom
-            per_sample_pot_mse = (sq_err_pot * weights).sum(dim=(1, 2)) / sample_denom
+            w_pot_t = w_pot_sample.view(B, 1, 1).to(dtype=sq_err_pot.dtype)
+            loss_potential = (sq_err_pot * weights * w_pot_t).sum() / denom
+            loss_potential_raw = (sq_err_pot * valid_mask_f).sum() / valid_denom
+            per_sample_pot_mse = (sq_err_pot * valid_mask_f).sum(dim=(1, 2)) / sample_valid_denom
             per_sample_pot_weighted = per_sample_pot_mse * w_pot_sample
         else:
-            w_pot_nd = w_pot_sample.view(B, *([1] * (sq_err_pot.dim() - 1)))
+            w_pot_nd = w_pot_sample.view(B, *([1] * (sq_err_pot.dim() - 1))).to(dtype=sq_err_pot.dtype)
             loss_potential = torch.mean(sq_err_pot * w_pot_nd)
             loss_potential_raw = torch.mean(sq_err_pot)
             per_sample_pot_mse = sq_err_pot.reshape(B, -1).mean(dim=1)
@@ -219,7 +263,7 @@ def mamba_cfm_loss(
             sq_err_macro = (h_macro_pot - h_target.float()) ** 2
             if weights is not None and sq_err_macro.dim() == 3:
                 loss_macro = (sq_err_macro * weights).sum() / denom
-                per_sample_macro = (sq_err_macro * weights).sum(dim=(1, 2)) / sample_denom
+                per_sample_macro = (sq_err_macro * valid_mask_f).sum(dim=(1, 2)) / sample_valid_denom
             else:
                 loss_macro = torch.mean(sq_err_macro)
                 per_sample_macro = sq_err_macro.reshape(B, -1).mean(dim=1)
@@ -227,7 +271,26 @@ def mamba_cfm_loss(
             loss_macro = torch.zeros((), device=device, dtype=torch.float32)
             per_sample_macro = torch.zeros(B, device=device, dtype=torch.float32)
 
-        # (d) Global Horizon Length Prediction Loss (Smooth L1 in FP32)
+        # (d) Spherical Cosine Direction & Radial Norm Preservation Loss (loss_cos)
+        if valid_mask_f is not None and h_pred.dim() == 3:
+            v_mask_2d = valid_mask_f.squeeze(-1).float()  # (B, L_t)
+            cos_sim = F.cosine_similarity(h_pred.float(), h_target.float(), dim=-1, eps=1e-6)
+            cos_err = (1.0 - cos_sim) * v_mask_2d
+            rms_pred = h_pred.float().pow(2).mean(dim=-1).add(1e-6).sqrt()
+            rms_tgt = h_target.float().pow(2).mean(dim=-1).add(1e-6).sqrt()
+            norm_err = (rms_pred - rms_tgt).pow(2) * v_mask_2d
+            loss_cos = (cos_err.sum() + 0.25 * norm_err.sum()) / valid_mask_f.sum().clamp(min=1.0)
+            per_sample_cos = (cos_err.sum(dim=1) + 0.25 * norm_err.sum(dim=1)) / v_mask_2d.sum(dim=1).clamp(min=1.0)
+        else:
+            cos_sim = F.cosine_similarity(h_pred.float(), h_target.float(), dim=-1, eps=1e-6)
+            cos_err = 1.0 - cos_sim
+            rms_pred = h_pred.float().pow(2).mean(dim=-1).add(1e-6).sqrt()
+            rms_tgt = h_target.float().pow(2).mean(dim=-1).add(1e-6).sqrt()
+            norm_err = (rms_pred - rms_tgt).pow(2)
+            loss_cos = (cos_err + 0.25 * norm_err).mean()
+            per_sample_cos = (cos_err + 0.25 * norm_err).reshape(B, -1).mean(dim=1)
+
+        # (e) Global Horizon Length Prediction Loss (Smooth L1 in FP32)
         if aux is not None and "rho_pred" in aux:
             rho_pred = aux["rho_pred"].float()
             loss_len = F.smooth_l1_loss(rho_pred, rho_true.float(), beta=0.02)
@@ -237,7 +300,7 @@ def mamba_cfm_loss(
             loss_len = torch.zeros((), device=device, dtype=torch.float32)
             per_sample_len = torch.zeros(B, device=device, dtype=torch.float32)
 
-        # (e) Beat Pacing Anti-Collapse Regularization
+        # (f) Beat Pacing Anti-Collapse Regularization
         if aux is not None and "pacing_weights" in aux:
             pacing_w = aux["pacing_weights"].float()
             k_beats = pacing_w.shape[-1]
@@ -248,20 +311,27 @@ def mamba_cfm_loss(
             loss_pacing = torch.zeros((), device=device, dtype=torch.float32)
             per_sample_pacing = torch.zeros(B, device=device, dtype=torch.float32)
 
+        cfm_weight = 0.5
+        len_loss_weight = 0.5
+        ortho_loss_weight = 0.01
+        loss_ortho = loss_pacing
+
         total_loss = (
             loss_potential
-            + 0.5 * loss_cfm
-            + 0.25 * loss_macro
-            + 0.5 * loss_len
-            + 0.01 * loss_pacing
+            + cfm_weight * loss_cfm
+            + 0.75 * loss_macro
+            + 0.25 * loss_cos
+            + len_loss_weight * loss_len
+            + ortho_loss_weight * loss_ortho
         )
 
         per_sample_total_loss = (
             per_sample_pot_weighted
-            + 0.5 * per_sample_cfm
-            + 0.25 * per_sample_macro
-            + 0.5 * per_sample_len
-            + 0.01 * per_sample_pacing
+            + cfm_weight * per_sample_cfm
+            + 0.75 * per_sample_macro
+            + 0.25 * per_sample_cos
+            + len_loss_weight * per_sample_len
+            + ortho_loss_weight * per_sample_pacing
         )
 
     if return_metrics:
@@ -289,6 +359,7 @@ def mamba_cfm_loss(
             "loss_potential_raw": loss_potential_raw.detach(),
             "loss_cfm": loss_cfm.detach(),
             "loss_macro": loss_macro.detach(),
+            "loss_cos": loss_cos.detach(),
             "loss_len": loss_len.detach(),
             "loss_pacing": loss_pacing.detach(),
             "rho_pred_mean": rho_pred.detach().float().mean(),

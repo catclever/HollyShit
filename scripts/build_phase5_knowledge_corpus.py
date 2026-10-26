@@ -17,16 +17,15 @@ Core Architectural Rules:
      All knowledge streams are kept completely natural (no `【经典原句】` or `【表结构】` prefixes)
      so the Left-Brain Mamba Planner learns to distinguish poetry, code, equations, encyclopedia
      facts, and narrative lore purely from continuous manifold geometry.
-  2. Relaxed Clause-Disjoint / Entity-Overlap Allowed ("No Full-Sentence Cheating, Entities Preserved"):
-     `is_non_cheating_knowledge(k, target)` prevents full-sentence verbatim copying while
-     explicitly allowing short entities, table/column names, equations, numbers, and API signatures
-     to overlap naturally between `knowledge` (K+) and `target` for `CopyPointerHead` learning.
-  3. Dual Execution Modes:
-     - `--mode hf_stream` (or `--stream_hf`): Streams directly from HuggingFace across the 6 non-cheating
-       Channel-1 domains (`grounded_instruct`, `code_api`, `classical_quote`, `encyclopedia_rag`,
-       `math_rule`, `literature_lore`).
-     - `--mode local_file`: Converts an existing local JSONL corpus (`omni_corpus.jsonl` or
-       `moss_dialogues.jsonl`) using the relaxed clause-disjoint split.
+  2. Reading-Comprehension-Friendly & Entity-Overlap Allowed ("No Full-Sentence Cheating, MRC & Entities Preserved"):
+     `is_non_cheating_knowledge(k, target)` prevents identical/near-identical full-sentence duplicates
+     (`len(target) >= 0.85 * len(k)`) while allowing Reading Comprehension passages `k` that contain
+     the concise answer clause `target` (`len(target) < 0.85 * len(k)`) as well as short entities,
+     table/column names, equations, numbers, and API signatures for `CopyPointerHead` learning.
+  3. Pure Grounded Backbone Default (`--domains grounded_instruct,encyclopedia_rag`, `--samples_per_source 60000`):
+     Focuses Phase 5 backbone training on 100% grounded machine reading comprehension (`cmrc2018`,
+     `dureader_robust`, `squad`) and grounded instruction QA (`Belle`, `Alpaca-GPT4-CN` with `input`),
+     leaving ungrounded open-ended webnovel continuation (`literature_lore`) out of the default backbone.
 """
 
 import os
@@ -35,7 +34,7 @@ import sys
 import json
 import random
 import argparse
-from typing import Iterator, List, Tuple, Dict, Any, Optional
+from typing import Iterator, List, Tuple, Dict, Any, Optional, Union
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,15 +63,19 @@ _STRIP_PUNCT_RE = re.compile(r"^[\s,，.。!！?？;；:：、\"'“”‘’()�
 
 def is_non_cheating_knowledge(k: str, target: str) -> bool:
     """
-    Relaxed Clause-Disjoint / Entity-Overlap Allowed validation:
+    Reading-Comprehension-Friendly & Entity-Overlap Allowed validation:
       - Strips leading/trailing whitespace and punctuation from `k` and `target`.
-      - Rejects empty strings, exact verbatim equality (`k_clean == tgt_clean`),
-        or cases where `target` is wholly contained inside `k` (`tgt_clean in k_clean and len(tgt_clean) >= 12`).
+      - Rejects empty strings or exact verbatim equality (`k_clean == tgt_clean`).
+      - When `tgt_clean in k_clean` (e.g., Reading Comprehension where `k` is a longer reference
+        passage and `target` is the concise answer clause contained in `k`):
+          * Rejects if `len(tgt_clean) >= 0.85 * len(k_clean)` (near-identical full-sentence copy).
+          * ALLOWS reference passages `k` that contain the answer `target` as long as `k` carries
+            at least >15% additional surrounding context (`len(tgt_clean) < 0.85 * len(k_clean)`).
       - When `k_clean in tgt_clean`:
-          * Rejects ONLY if `len(k_clean) >= 24` AND `len(k_clean) >= 0.4 * len(tgt_clean)`
-            (i.e. a full long sentence/clause verbatim copy).
+          * Rejects ONLY if `len(k_clean) >= 24` AND `len(k_clean) >= 0.5 * len(tgt_clean)`
+            (i.e. a long sentence verbatim copy).
           * ALLOWS short entities, table/column names, equations, numbers, API signatures,
-            and short clauses (`len(k_clean) < 24` or `< 40%` of target) to naturally overlap
+            and short clauses (`len(k_clean) < 24` or `< 50%` of target) to naturally overlap
             between `knowledge` (K+) and `target` so `CopyPointerHead` receives rich copy supervision!
     """
     if not k or not target or not isinstance(k, str) or not isinstance(target, str):
@@ -87,11 +90,14 @@ def is_non_cheating_knowledge(k: str, target: str) -> bool:
     if k_clean == tgt_clean:
         return False
 
-    if tgt_clean in k_clean and len(tgt_clean) >= 12:
-        return False
+    if tgt_clean in k_clean:
+        if len(tgt_clean) >= 24 and len(tgt_clean) >= 0.85 * len(k_clean):
+            return False
+        if len(tgt_clean) >= 0.85 * len(k_clean):
+            return False
 
     if k_clean in tgt_clean:
-        if len(k_clean) >= 24 and len(k_clean) >= 0.4 * len(tgt_clean):
+        if len(k_clean) >= 24 and len(k_clean) >= 0.5 * len(tgt_clean):
             return False
 
     return True
@@ -154,6 +160,171 @@ def extract_factual_clauses(
                 clauses.append(acc)
 
     return clauses
+
+
+def _ensure_sentence_end_punct(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return text
+    if re.search(r"[。！？.!?;；\"'”’）\)]$", text):
+        return text
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    text = re.sub(r"[,，、:：]+$", "", text).strip()
+    return text + ("。" if has_cjk else ".")
+
+
+def _extract_mrc_grounded_sample(
+    context: str,
+    question: str,
+    raw_ans: str,
+    max_clause_len: int = 126,
+) -> Optional[Tuple[str, List[str], str]]:
+    """
+    Extracts a grounded Reading Comprehension sample `(question, k_plus, target)` from
+    `(context, question, raw_ans)`:
+      1. Cleans `context`, `question`, `raw_ans`; requires `len(question) >= 4`,
+         `len(context) >= 25`, `len(raw_ans) >= 2`.
+      2. Locates `raw_ans` in `context` (or the sentence in `context` with highest character overlap)
+         and extracts the sentence `ans_sent` containing `raw_ans`.
+      3. Constructs `target` (complete, natural answer clause/sentence, 10..95 chars):
+         - If `12 <= len(raw_ans) <= max_tgt_len`: uses `raw_ans` (with ending punctuation).
+         - Else if `10 <= len(ans_sent) <= max_tgt_len`: uses `ans_sent`.
+         - Else: extracts the comma sub-clause window around `raw_ans` within `ans_sent` of length `12..90` chars.
+      4. Constructs `k_plus` (1 to 2 reference clauses from `context` up to `max_clause_len = 126`):
+         - Extracts a wider context window around `raw_ans` / `target` in `context` of length
+           `max(len(target) + 20, 70)` up to `max_clause_len` so `len(target) < 0.80 * len(k_window)`
+           and `is_non_cheating_knowledge(k_window, target) == True`, plus optionally 1 adjacent clause.
+    """
+    ctx = clean_text(context)
+    q = clean_text(question)
+    ans = clean_text(raw_ans)
+
+    if len(q) < 4 or len(ctx) < 25 or len(ans) < 2:
+        return None
+
+    eff_ctx_cap = min(max_clause_len, len(ctx))
+    max_tgt_len = min(92, max(14, int(0.74 * eff_ctx_cap)))
+
+    # Split context into sentence spans with their character offsets
+    sent_matches = list(re.finditer(r"[^。！？.!?\n]+[。！？.!?]*", ctx))
+    if not sent_matches:
+        return None
+
+    ans_core = _STRIP_PUNCT_RE.sub("", ans)
+    ans_pos = ctx.find(ans)
+    if ans_pos < 0 and ans_core:
+        ans_pos = ctx.find(ans_core)
+
+    best_sent_idx = 0
+    if ans_pos >= 0:
+        for i, m in enumerate(sent_matches):
+            if m.start() <= ans_pos < m.end():
+                best_sent_idx = i
+                break
+    else:
+        ans_chars = set(ans_core or ans)
+        best_overlap = -1
+        for i, m in enumerate(sent_matches):
+            s_txt = m.group(0).strip()
+            overlap = sum(1 for ch in ans_chars if ch in s_txt)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_sent_idx = i
+        ans_pos = sent_matches[best_sent_idx].start()
+
+    ans_sent = sent_matches[best_sent_idx].group(0).strip()
+
+    # Construct natural complete target sentence/clause (10..max_tgt_len chars)
+    target = ""
+    if 12 <= len(ans) <= max_tgt_len:
+        target = _ensure_sentence_end_punct(ans)
+    elif 10 <= len(ans_sent) <= max_tgt_len:
+        target = _ensure_sentence_end_punct(ans_sent)
+    else:
+        # Extract comma sub-clause window around raw_ans within ans_sent (or raw_ans if raw_ans > max_tgt_len)
+        source_for_sub = ans if len(ans) > max_tgt_len else ans_sent
+        comma_spans = [
+            s.strip()
+            for s in re.findall(r"[^，,;；。！？.!?\n]+[，,;；。！？.!?]*", source_for_sub)
+            if s.strip()
+        ]
+        pivot_idx = 0
+        if ans_core:
+            for idx_c, sp in enumerate(comma_spans):
+                if ans_core in sp or sp in ans_core:
+                    pivot_idx = idx_c
+                    break
+        if comma_spans:
+            acc = comma_spans[pivot_idx]
+            left_i = pivot_idx - 1
+            right_i = pivot_idx + 1
+            while len(acc) < 18 and (left_i >= 0 or right_i < len(comma_spans)):
+                if right_i < len(comma_spans) and len(acc) + len(comma_spans[right_i]) <= max_tgt_len:
+                    acc = acc + comma_spans[right_i]
+                    right_i += 1
+                elif left_i >= 0 and len(comma_spans[left_i]) + len(acc) <= max_tgt_len:
+                    acc = comma_spans[left_i] + acc
+                    left_i -= 1
+                else:
+                    break
+            if len(acc) > max_tgt_len:
+                acc = acc[:max_tgt_len]
+            target = _ensure_sentence_end_punct(acc)
+        else:
+            target = _ensure_sentence_end_punct(ans_sent[:max_tgt_len])
+
+    if len(target) < 10:
+        return None
+
+    tgt_clean = _STRIP_PUNCT_RE.sub("", target)
+    t_pos = ctx.find(tgt_clean)
+    if t_pos < 0:
+        t_pos = max(0, ans_pos)
+    t_end = min(len(ctx), t_pos + len(tgt_clean))
+
+    # Construct wider context window k_window around target/raw_ans in context
+    min_k_len = max(len(tgt_clean) + 20, int(len(tgt_clean) / 0.75) + 6, 70)
+    desired_k_len = min(max_clause_len, max(min_k_len, eff_ctx_cap))
+
+    if len(ctx) < min_k_len:
+        # If context itself is shorter than min_k_len, trim target so len(target) < 0.78 * len(ctx)
+        trim_t = max(10, int(0.75 * len(_STRIP_PUNCT_RE.sub("", ctx))))
+        if len(tgt_clean) >= trim_t:
+            target = _ensure_sentence_end_punct(tgt_clean[:trim_t])
+            tgt_clean = _STRIP_PUNCT_RE.sub("", target)
+        desired_k_len = min(max_clause_len, len(ctx))
+
+    span_len = t_end - t_pos
+    extra_room = max(0, desired_k_len - span_len)
+    win_start = max(0, t_pos - extra_room // 2)
+    win_end = min(len(ctx), win_start + desired_k_len)
+    win_start = max(0, win_end - desired_k_len)
+
+    k_window = ctx[win_start:win_end].strip()
+    if not is_non_cheating_knowledge(k_window, target):
+        return None
+
+    k_plus = [k_window]
+
+    # Optionally add 1 adjacent clause from context outside [win_start, win_end]
+    adj_candidates: List[str] = []
+    if best_sent_idx + 1 < len(sent_matches):
+        adj_candidates.append(sent_matches[best_sent_idx + 1].group(0).strip())
+    if best_sent_idx - 1 >= 0:
+        adj_candidates.append(sent_matches[best_sent_idx - 1].group(0).strip())
+
+    for adj in adj_candidates:
+        adj_c = clean_text(adj)[:max_clause_len]
+        if (
+            len(adj_c) >= 12
+            and adj_c != k_window
+            and adj_c not in k_window
+            and is_non_cheating_knowledge(adj_c, target)
+        ):
+            k_plus.append(adj_c)
+            break
+
+    return q, k_plus[:2], target
 
 
 def try_split_structured_prompt(
@@ -290,7 +461,7 @@ def disjoint_split_target_clauses(
 
 
 # =========================================================================
-# Direct HuggingFace 6-Domain Channel-1 Non-Cheating Streamers
+# Direct HuggingFace Channel-1 Grounded Streamers
 # =========================================================================
 
 def stream_domain1_grounded_instruct(
@@ -314,21 +485,29 @@ def stream_domain1_grounded_instruct(
                 instr = clean_text(item.get("instruction", ""))
                 inp = clean_text(item.get("input", ""))
                 out = clean_text(item.get("output", ""))
-                if len(instr) >= 4 and len(inp) >= 15 and len(out) >= 15:
+                if len(out) < 15 or len(instr) < 4:
+                    continue
+                if len(inp) >= 15:
                     k_clauses = extract_factual_clauses(inp, min_len=8, max_len=max_clause_len)
                     if not k_clauses:
                         k_clauses = [inp[:max_clause_len]]
-                    k_plus = [k for k in k_clauses[:2] if is_non_cheating_knowledge(k, out)]
-                    if k_plus:
-                        yield {
-                            "domain": "grounded_instruct",
-                            "prompt": instr,
-                            "k_plus": k_plus,
-                            "target": out[:350],
-                        }
-                        count += 1
-                        if count >= per_src:
-                            break
+                    eff_prompt = instr
+                else:
+                    split_res = try_split_structured_prompt(instr, max_know_streams=2, max_clause_len=max_clause_len)
+                    if split_res is None:
+                        continue
+                    eff_prompt, k_clauses = split_res
+                k_plus = [k for k in k_clauses[:2] if is_non_cheating_knowledge(k, out)]
+                if k_plus:
+                    yield {
+                        "domain": "grounded_instruct",
+                        "prompt": eff_prompt,
+                        "k_plus": k_plus,
+                        "target": out[:350],
+                    }
+                    count += 1
+                    if count >= per_src:
+                        break
         except Exception as e:
             print(f"⚠️ Warning during {sname} stream: {e}")
         print(f"  -> Extracted {count} samples from {sname}")
@@ -340,9 +519,6 @@ def stream_domain2_code_api(
     """
     Domain 2 (`code_api`):
     Sources: `b-mc2/sql-create-context` & `sahil2801/CodeAlpaca-20k` / `theblackcat102/evol-codealpaca-v1`
-      - SQL: prompt = question, K+ = [context], target = answer
-      - CodeAlpaca: where `input` is non-empty (`K+ = [input]`, allowing variable/identifier overlap with `out`)
-        or disjoint signature (`K+`) vs body (`target`).
     """
     from datasets import load_dataset
     sql_target = max(1, max_samples // 2)
@@ -419,8 +595,6 @@ def stream_domain3_classical_quote(
     """
     Domain 3 (`classical_quote`):
     Sources: `gujilab/chinese-classical-corpus` & `Lifan-Z/Chinese-poetries-txt` / `erhwenkuo/poetry-chinese-zhtw`
-      - Classical translation: prompt = instruction, K+ = [source], target = target
-      - Poetry: prompt = title + author, K+ = [opening couplet], target = subsequent couplets.
     """
     from datasets import load_dataset
     half = max(1, max_samples // 2)
@@ -486,80 +660,139 @@ def stream_domain3_classical_quote(
     print(f"  -> Extracted {p_count} classical poetry samples")
 
 
+def _extract_raw_answer_from_mrc_item(item: Dict[str, Any]) -> str:
+    answers = item.get("answers", item.get("answer", item.get("output", "")))
+    if isinstance(answers, dict):
+        text_list = answers.get("text", [])
+        if isinstance(text_list, list) and text_list:
+            return str(text_list[0])
+        if isinstance(text_list, str):
+            return text_list
+    elif isinstance(answers, list) and answers:
+        first = answers[0]
+        if isinstance(first, dict):
+            return str(first.get("text", first.get("answer", "")))
+        return str(first)
+    elif isinstance(answers, str):
+        return answers
+    return ""
+
+
 def stream_domain4_encyclopedia_rag(
     max_samples: int, max_clause_len: int = 126
 ) -> Iterator[Dict[str, Any]]:
     """
-    Domain 4 (`encyclopedia_rag`):
-    Sources: `pleisto/wikipedia-cn-20230720-filtered` & `wangrui6/Zhihu-KOL`
-    Splits multi-sentence/multi-paragraph articles into disjoint clause spans:
-      Paragraph 1 / premise clauses -> K+, topic/question -> prompt, Paragraph 2 / continuation -> target.
+    Domain 4 (`encyclopedia_rag` — Authentic Machine Reading Comprehension):
+    Replaces legacy ungrounded Wikipedia/Zhihu disjoint splitting with 100% grounded MRC datasets:
+      - Chinese MRC (80% of `max_samples`): `hfl/cmrc2018`, `cmrc2018`, `clue/cmrc2018`,
+        `PaddlePaddle/dureader_robust`, `dureader_robust`, `Simulate/cmrc2018`, plus
+        `BelleGroup/train_1M_CN` reading-comprehension records as fallback.
+      - English MRC (20% of `max_samples`): `rajpurkar/squad`.
     """
     from datasets import load_dataset
-    half = max(1, max_samples // 2)
 
-    print(">>> [4/6 encyclopedia_rag] Streaming pleisto/wikipedia-cn-20230720-filtered...")
-    w_count = 0
-    try:
-        ds = load_dataset("pleisto/wikipedia-cn-20230720-filtered", split="train", streaming=True)
-        for item in ds:
-            title = clean_text(item.get("title", ""))
-            completion = clean_text(item.get("completion", item.get("text", "")))
-            if not completion or len(completion) < 50:
-                continue
-            k_plus, rem_target = disjoint_split_target_clauses(
-                completion[:450], max_pos=2, max_clause_len=max_clause_len, min_remaining_len=20
-            )
-            if not k_plus or len(rem_target) < 20:
-                continue
-            prompt_str = f"请详细介绍{title}的相关背景与核心内容。" if title else "请根据相关百科事实继续阐述："
-            yield {
-                "domain": "encyclopedia_rag",
-                "prompt": prompt_str,
-                "k_plus": k_plus,
-                "target": rem_target[:320],
-            }
-            w_count += 1
-            if w_count >= half:
-                break
-    except Exception as e:
-        print(f"⚠️ Warning during wikipedia-cn stream: {e}")
-    print(f"  -> Extracted {w_count} Wikipedia RAG samples")
+    zh_target = max(1, int(0.80 * max_samples))
+    en_target = max(1, max_samples - zh_target)
 
-    z_count = 0
-    z_target = max(1, max_samples - w_count)
-    for dname in ["wangrui6/Zhihu-KOL", "zirui3/zhihu_qa"]:
-        if z_count >= z_target:
+    zh_count = 0
+    zh_mrc_sources: List[Tuple[str, Optional[str]]] = [
+        ("hfl/cmrc2018", None),
+        ("cmrc2018", None),
+        ("clue", "cmrc2018"),
+        ("PaddlePaddle/dureader_robust", None),
+        ("dureader_robust", None),
+        ("Simulate/cmrc2018", None),
+    ]
+
+    for ds_name, ds_config in zh_mrc_sources:
+        if zh_count >= zh_target:
             break
-        print(f">>> [4/6 encyclopedia_rag] Streaming {dname}...")
+        label_str = f"{ds_name} ({ds_config})" if ds_config else ds_name
+        print(f">>> [4/6 encyclopedia_rag] Streaming Chinese MRC {label_str}...")
+        src_extracted = 0
         try:
-            ds = load_dataset(dname, split="train", streaming=True)
+            if ds_config:
+                ds = load_dataset(ds_name, ds_config, split="train", streaming=True)
+            else:
+                ds = load_dataset(ds_name, split="train", streaming=True)
             for item in ds:
-                q = clean_text(
-                    item.get("INSTRUCTION", item.get("instruction", item.get("question", item.get("title", ""))))
-                )
-                a = clean_text(
-                    item.get("RESPONSE", item.get("output", item.get("answer", item.get("content", ""))))
-                )
-                if len(q) < 5 or len(a) < 50:
+                ctx = str(item.get("context", item.get("passage", item.get("input", ""))))
+                q = str(item.get("question", item.get("query", item.get("instruction", ""))))
+                raw_ans = _extract_raw_answer_from_mrc_item(item)
+                res = _extract_mrc_grounded_sample(ctx, q, raw_ans, max_clause_len=max_clause_len)
+                if res is not None:
+                    q_out, k_plus, tgt_out = res
+                    yield {
+                        "domain": "encyclopedia_rag",
+                        "prompt": q_out,
+                        "k_plus": k_plus,
+                        "target": tgt_out,
+                    }
+                    zh_count += 1
+                    src_extracted += 1
+                    if zh_count >= zh_target:
+                        break
+        except Exception as e:
+            print(f"⚠️ Warning during {label_str} stream: {e}")
+        print(f"  -> Extracted {src_extracted} Chinese MRC samples from {label_str}")
+
+    if zh_count < zh_target:
+        print(">>> [4/6 encyclopedia_rag] Streaming BelleGroup/train_1M_CN reading-comprehension fallback...")
+        fb_extracted = 0
+        try:
+            ds = load_dataset("BelleGroup/train_1M_CN", split="train", streaming=True)
+            for item in ds:
+                instr = clean_text(item.get("instruction", ""))
+                inp = clean_text(item.get("input", ""))
+                out = clean_text(item.get("output", ""))
+                if not (4 <= len(out) <= 140 and len(instr) >= 4):
                     continue
-                k_plus, rem_target = disjoint_split_target_clauses(
-                    a[:450], max_pos=2, max_clause_len=max_clause_len, min_remaining_len=20
-                )
-                if not k_plus or len(rem_target) < 20:
-                    continue
+                if len(inp) < 40:
+                    split_res = try_split_structured_prompt(instr, max_know_streams=2, max_clause_len=max_clause_len)
+                    if split_res is not None:
+                        instr, k_clauses_fb = split_res
+                        inp = "。".join(k_clauses_fb)
+                if len(inp) >= 40 and len(instr) >= 4:
+                    res = _extract_mrc_grounded_sample(inp, instr, out, max_clause_len=max_clause_len)
+                    if res is not None:
+                        q_out, k_plus, tgt_out = res
+                        yield {
+                            "domain": "encyclopedia_rag",
+                            "prompt": q_out,
+                            "k_plus": k_plus,
+                            "target": tgt_out,
+                        }
+                        zh_count += 1
+                        fb_extracted += 1
+                        if zh_count >= zh_target:
+                            break
+        except Exception as e:
+            print(f"⚠️ Warning during BelleGroup/train_1M_CN MRC fallback stream: {e}")
+        print(f"  -> Extracted {fb_extracted} Chinese MRC fallback samples")
+
+    en_count = 0
+    print(">>> [4/6 encyclopedia_rag] Streaming English MRC rajpurkar/squad...")
+    try:
+        ds = load_dataset("rajpurkar/squad", split="train", streaming=True)
+        for item in ds:
+            ctx = str(item.get("context", ""))
+            q = str(item.get("question", ""))
+            raw_ans = _extract_raw_answer_from_mrc_item(item)
+            res = _extract_mrc_grounded_sample(ctx, q, raw_ans, max_clause_len=max_clause_len)
+            if res is not None:
+                q_out, k_plus, tgt_out = res
                 yield {
                     "domain": "encyclopedia_rag",
-                    "prompt": q,
+                    "prompt": q_out,
                     "k_plus": k_plus,
-                    "target": rem_target[:320],
+                    "target": tgt_out,
                 }
-                z_count += 1
-                if z_count >= z_target:
+                en_count += 1
+                if en_count >= en_target:
                     break
-        except Exception as e:
-            print(f"⚠️ Warning during {dname} stream: {e}")
-    print(f"  -> Extracted {z_count} Zhihu RAG samples")
+    except Exception as e:
+        print(f"⚠️ Warning during rajpurkar/squad stream: {e}")
+    print(f"  -> Extracted {en_count} SQuAD MRC samples (Total encyclopedia_rag: {zh_count + en_count})")
 
 
 def stream_domain5_math_rule(
@@ -568,9 +801,6 @@ def stream_domain5_math_rule(
     """
     Domain 5 (`math_rule`):
     Source: `MU-NLPC/calc-ape210k`
-      prompt = question_chinese, K+ = [equation], target = chain_of_thought / solution.
-      Keeps `cot` intact (without stripping `eq`) so numbers and formulas in `eq` naturally
-      overlap with `ans`, only checking `is_non_cheating_knowledge(eq, ans)`.
     """
     from datasets import load_dataset
     print(">>> [5/6 math_rule] Streaming MU-NLPC/calc-ape210k...")
@@ -612,10 +842,6 @@ def stream_domain6_literature_lore(
     """
     Domain 6 (`literature_lore`):
     Sources: `wdndev/webnovel-chinese` / `jetaudio/chinese_web_novels`
-    Splits narrative chunks (`text[:1200]`, requiring `len(sents) >= 4`) into:
-      - Part 1 (scene/character lore setup, `sents[0]`) -> K+
-      - Part 2 (2 to 4 sentences of rich narrative context, ~120-380 chars) -> prompt
-      - Part 3 (remaining continuation sentences, `[:350]`) -> target.
     """
     from datasets import load_dataset
     count = 0
@@ -637,7 +863,6 @@ def stream_domain6_literature_lore(
                 if len(sents) < 4:
                     continue
                 part1_lore = re.sub(r"[。！？；\n]+$", "", sents[0]).strip()[:max_clause_len]
-                # Take 2 to 4 sentences for rich narrative prompt context (~120-380 chars)
                 prompt_end_idx = min(5, max(3, len(sents) - 2))
                 part2_prompt = "".join(sents[1:prompt_end_idx]).strip()[:380]
                 part3_target = "".join(sents[prompt_end_idx:]).strip()[:350]
@@ -663,17 +888,18 @@ def stream_domain6_literature_lore(
 
 def stream_hf_6domain_knowledge_corpus(
     output_path: str = "/content/omni_knowledge_corpus.jsonl",
-    samples_per_source: int = 50000,
+    samples_per_source: int = 60000,
     max_know_streams: int = 4,
     know_seq_len: int = 128,
     empty_know_prob: float = 0.15,
     seed: int = 42,
     shuffle_buffer_size: int = 25000,
+    domains: Optional[Union[List[str], str]] = "grounded_instruct,encyclopedia_rag",
 ) -> Dict[str, Any]:
     """
-    Streams directly from HuggingFace across the 6 non-cheating Channel-1 domains,
-    mixing 1-2 same-domain distractors K- from a rolling domain buffer and writing
-    shuffled multi-stream JSONL records to `output_path`.
+    Streams directly from HuggingFace across selected Channel-1 domains (defaulting to the
+    pure grounded backbone: `grounded_instruct` + `encyclopedia_rag`), mixing 1-2 same-domain
+    distractors K- from a rolling domain buffer and writing shuffled multi-stream JSONL records.
     """
     rng = random.Random(seed)
     max_clause_len = max(12, know_seq_len - 2)
@@ -681,13 +907,34 @@ def stream_hf_6domain_knowledge_corpus(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
+    all_domain_streams = [
+        ("grounded_instruct", "1. grounded_instruct", lambda: stream_domain1_grounded_instruct(samples_per_source, max_clause_len)),
+        ("code_api", "2. code_api", lambda: stream_domain2_code_api(samples_per_source, max_clause_len)),
+        ("classical_quote", "3. classical_quote", lambda: stream_domain3_classical_quote(samples_per_source, max_clause_len)),
+        ("encyclopedia_rag", "4. encyclopedia_rag", lambda: stream_domain4_encyclopedia_rag(samples_per_source, max_clause_len)),
+        ("math_rule", "5. math_rule", lambda: stream_domain5_math_rule(samples_per_source, max_clause_len)),
+        ("literature_lore", "6. literature_lore", lambda: stream_domain6_literature_lore(samples_per_source, max_clause_len)),
+    ]
+
+    if domains is None:
+        selected_domains = {"grounded_instruct", "encyclopedia_rag"}
+    elif isinstance(domains, str):
+        parts = [d.strip() for d in domains.split(",") if d.strip()]
+        if not parts or "all" in [p.lower() for p in parts]:
+            selected_domains = {d[0] for d in all_domain_streams}
+        else:
+            selected_domains = set(parts)
+    else:
+        parts = [str(d).strip() for d in domains if str(d).strip()]
+        if not parts or "all" in [p.lower() for p in parts]:
+            selected_domains = {d[0] for d in all_domain_streams}
+        else:
+            selected_domains = set(parts)
+
     domain_streams = [
-        ("1. grounded_instruct", lambda: stream_domain1_grounded_instruct(samples_per_source, max_clause_len)),
-        ("2. code_api", lambda: stream_domain2_code_api(samples_per_source, max_clause_len)),
-        ("3. classical_quote", lambda: stream_domain3_classical_quote(samples_per_source, max_clause_len)),
-        ("4. encyclopedia_rag", lambda: stream_domain4_encyclopedia_rag(samples_per_source, max_clause_len)),
-        ("5. math_rule", lambda: stream_domain5_math_rule(samples_per_source, max_clause_len)),
-        ("6. literature_lore", lambda: stream_domain6_literature_lore(samples_per_source, max_clause_len)),
+        (label, fn)
+        for dom_key, label, fn in all_domain_streams
+        if dom_key in selected_domains
     ]
 
     rolling_domain_pool: Dict[str, List[str]] = {}
@@ -743,7 +990,7 @@ def stream_hf_6domain_knowledge_corpus(
                     rng.shuffle(k_streams)
                     active_count += 1
 
-                # Update rolling domain pool with K+ and target clauses
+                # Update rolling domain pool with K+ clauses
                 for kp in k_plus:
                     if len(kp) >= 8:
                         dom_pool.append(kp)
@@ -1120,12 +1367,18 @@ def main():
         type=str,
         default="auto",
         choices=["auto", "hf_stream", "local_file"],
-        help="Execution mode: 'hf_stream' (6-domain HuggingFace streaming), 'local_file' (convert local JSONL), or 'auto'",
+        help="Execution mode: 'hf_stream' (HuggingFace streaming), 'local_file' (convert local JSONL), or 'auto'",
     )
     parser.add_argument(
         "--stream_hf",
         action="store_true",
-        help="Shortcut flag to run in 6-domain HuggingFace streaming mode (--mode hf_stream)",
+        help="Shortcut flag to run in HuggingFace streaming mode (--mode hf_stream)",
+    )
+    parser.add_argument(
+        "--domains",
+        type=str,
+        default="grounded_instruct,encyclopedia_rag",
+        help="Comma-separated domains to stream in hf_stream mode (default: 'grounded_instruct,encyclopedia_rag', or 'all' for all 6 domains)",
     )
     parser.add_argument(
         "--input_path",
@@ -1146,8 +1399,8 @@ def main():
     parser.add_argument(
         "--samples_per_source",
         type=int,
-        default=50000,
-        help="Target samples per domain in hf_stream mode (default: 50000)",
+        default=60000,
+        help="Target samples per domain in hf_stream mode (default: 60000)",
     )
     parser.add_argument(
         "--max_samples",
@@ -1170,8 +1423,8 @@ def main():
     parser.add_argument(
         "--empty_know_prob",
         type=float,
-        default=0.25,
-        help="Probability of empty knowledge stream [] for pure endogenous reasoning (default: 0.25)",
+        default=0.15,
+        help="Probability of empty knowledge stream [] for pure endogenous reasoning (default: 0.15)",
     )
     parser.add_argument(
         "--seed",
@@ -1195,6 +1448,7 @@ def main():
             know_seq_len=args.know_seq_len,
             empty_know_prob=args.empty_know_prob,
             seed=args.seed,
+            domains=args.domains,
         )
     else:
         build_phase5_knowledge_corpus(

@@ -356,6 +356,78 @@ def sample_euler_ode(
 
 
 @torch.no_grad()
+def evaluate_validation_loss(
+    mamba,
+    hippo_oracle,
+    unet,
+    x_context: torch.Tensor,
+    x_target: torch.Tensor,
+    context_mask: Optional[torch.Tensor] = None,
+    target_mask: Optional[torch.Tensor] = None,
+    x_knowledge: Optional[torch.Tensor] = None,
+    knowledge_mask: Optional[torch.Tensor] = None,
+    pad_loss_weight: float = 0.05,
+    t_val: float = 0.75,
+) -> Dict[str, torch.Tensor]:
+    """
+    Evaluates validation loss and metrics on a sample/batch at fixed timestep `t_val` (default 0.75),
+    explicitly passing `x_0=x_0` into `mamba(..., x_t=x_t, t=t, x_0=x_0, ...)` so `FlowMamba.forward`
+    uses the exact `x_0` noise vector to form the self-conditioned prefix `x_t_prefix`.
+    """
+    B, L_t, D = x_target.shape
+    device = x_target.device
+    t_tensor = torch.full((B,), float(t_val), device=device, dtype=torch.float32)
+
+    if unet is not None:
+        x_ctx_norm = unet.normalize(x_context)
+        x_tgt_norm = unet.normalize(x_target)
+        x_know_norm = unet.normalize(x_knowledge) if x_knowledge is not None else None
+    else:
+        x_ctx_norm = x_context
+        x_tgt_norm = x_target
+        x_know_norm = x_knowledge
+
+    h_target = hippo_oracle(x_tgt_norm, return_sequence=True)
+    x_0 = torch.randn_like(h_target)
+    t_expand = t_tensor.view(B, 1, 1).to(dtype=h_target.dtype)
+    x_t = t_expand * h_target + (1.0 - t_expand) * x_0
+
+    # Verify direct model call with explicit x_0=x_0
+    _ = mamba(
+        x_ctx_norm,
+        valid_mask=context_mask,
+        x_knowledge=x_know_norm,
+        knowledge_mask=knowledge_mask,
+        target_len=L_t,
+        x_t=x_t,
+        t=t_tensor,
+        x_0=x_0,
+        return_sequence=True,
+        return_aux=True,
+        return_velocity=True,
+    )
+
+    _, metrics = mamba_cfm_loss(
+        mamba=mamba,
+        hippo_oracle=hippo_oracle,
+        x_context=x_context,
+        x_target=x_target,
+        unet=unet,
+        context_mask=context_mask,
+        target_mask=target_mask,
+        x_knowledge=x_knowledge,
+        knowledge_mask=knowledge_mask,
+        pad_loss_weight=pad_loss_weight,
+        know_drop_prob=0.0,
+        verbosity_hint_prob=0.0,
+        t=t_tensor,
+        return_sequence=True,
+        return_metrics=True,
+    )
+    return metrics
+
+
+@torch.no_grad()
 def run_attractor_ablation_benchmark(
     mamba,
     unet,
@@ -443,10 +515,11 @@ def run_attractor_ablation_benchmark(
                     rho_override=args.verbosity_rho,
                 )
                 h_pot_final, _ = mamba.forward_canvas(
-                    h_target,
+                    macro_state["h_macro_potential"].detach(),
                     torch.ones((1,), device=device, dtype=torch.float32),
                     macro_state,
                     return_velocity=True,
+                    x_t_prefix=macro_state["h_macro_potential"].detach(),
                 )
                 k_attr = build_fixed_length_attractors(
                     x_context_norm=x_ctx_norm,
@@ -504,7 +577,7 @@ def train():
     parser.add_argument("--euler_steps", type=int, default=10, help="Euler ODE integration steps for qualitative evaluation")
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["bf16", "fp16", "no"], help="Mixed precision mode (bf16, fp16, no)")
     parser.add_argument("--accum_steps", type=int, default=1, help="Number of gradient accumulation steps")
-    parser.add_argument("--min_target_len", type=int, default=30, help="Filter out ultra-short target fragments (< N chars) to avoid 95%% padding dilution")
+    parser.add_argument("--min_target_len", type=int, default=15, help="Filter out ultra-short target fragments (< N chars)")
     parser.add_argument("--pad_loss_weight", type=float, default=0.05, help="Relative weight for <PAD> tokens in Mamba-HiPPO CFM MSE loss")
     parser.add_argument("--disable_multistream", action="store_true", help="Fallback to GenericPairDataset without multi-stream knowledge")
     parser.add_argument("--max_know_streams", type=int, default=4, help="Max number of parallel external knowledge streams M")
@@ -517,6 +590,12 @@ def train():
     parser.add_argument("--max_steps", type=int, default=50000, help="Cosine LR decay horizon (if > 0, else epochs * len(dataloader))")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Minimum LR ratio at end of cosine decay as fraction of --lr")
     parser.add_argument("--ema_decay", type=float, default=0.98, help="EMA smoothing factor for training logs")
+    parser.add_argument(
+        "--active_domains",
+        type=str,
+        default="grounded_instruct,encyclopedia_rag,code_api,classical_quote,math_rule",
+        help="Comma-separated active domains to load (default excludes ungrounded literature_lore; pass 'all' for all domains)",
+    )
     parser.add_argument(
         "--attractor_mode",
         type=str,
@@ -562,7 +641,7 @@ def train():
 
     tokenizer = CharTokenizer()
 
-    # 1. Dataset Selection (Multi-Stream Knowledge Dataset with return_domain_id=True)
+    # 1. Dataset Selection (Multi-Stream Knowledge Dataset with return_domain_id=True and active_domains)
     if MultiStreamKnowledgeDataset is not None and not args.disable_multistream:
         sig = inspect.signature(MultiStreamKnowledgeDataset.__init__)
         ds_kwargs = dict(
@@ -579,6 +658,8 @@ def train():
         )
         if "return_domain_id" in sig.parameters:
             ds_kwargs["return_domain_id"] = True
+        if "active_domains" in sig.parameters:
+            ds_kwargs["active_domains"] = args.active_domains
         dataset = MultiStreamKnowledgeDataset(**ds_kwargs)
     else:
         if not args.disable_multistream:
@@ -698,7 +779,6 @@ def train():
                     checkpointer.set_step(global_step)
                 else:
                     checkpointer.current_step = global_step
-                # Ensure scheduler is synchronized with global_step even if lr_sched.pt didn't exist in older checkpoints
                 sched_file = os.path.join(compat_path, "lr_sched.pt")
                 if not os.path.exists(sched_file) and global_step > 0:
                     scheduler.step(global_step)
@@ -755,7 +835,8 @@ def train():
     print(
         f"🚀 Starting Phase 5 Closed-Loop Multi-Stream Mamba Planner Training "
         f"(Layers={args.mamba_layers}, Beats={args.num_beats}, MaxKnowStreams={args.max_know_streams}, "
-        f"Warmup={args.warmup_steps}, MaxSteps={total_horizon_steps}, AttractorMode={args.attractor_mode})..."
+        f"Warmup={args.warmup_steps}, MaxSteps={total_horizon_steps}, AttractorMode={args.attractor_mode}, "
+        f"ActiveDomains={args.active_domains})..."
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -767,6 +848,7 @@ def train():
         "pot_raw": None,
         "cfm": None,
         "macro": None,
+        "cos": None,
         "len": None,
         "copy_prob": None,
     }
@@ -902,6 +984,7 @@ def train():
             )
             raw_cfm = metrics["loss_cfm"].item() if "loss_cfm" in metrics else 0.0
             raw_macro = metrics["loss_macro"].item() if "loss_macro" in metrics else 0.0
+            raw_cos = metrics["loss_cos"].item() if "loss_cos" in metrics else 0.0
             raw_len = metrics["loss_len"].item() if "loss_len" in metrics else 0.0
             raw_copy = metrics["copy_prob_mean"].item() if "copy_prob_mean" in metrics else 0.0
 
@@ -910,6 +993,7 @@ def train():
             ema_pot_raw = _update_ema("pot_raw", raw_pot_unweighted)
             ema_cfm = _update_ema("cfm", raw_cfm)
             ema_macro = _update_ema("macro", raw_macro)
+            ema_cos = _update_ema("cos", raw_cos)
             ema_len = _update_ema("len", raw_len)
             ema_copy = _update_ema("copy_prob", raw_copy)
 
@@ -939,8 +1023,8 @@ def train():
                 print(
                     f"Epoch {epoch+1} | Step {global_step} | LR: {cur_lr:.2e} | "
                     f"EMA Loss: {ema_total:.4f} (Raw: {raw_total:.4f}) | "
-                    f"Pot(t²): {ema_pot:.4f} (Raw: {ema_pot_raw:.4f}) | "
-                    f"CFM: {ema_cfm:.4f} | Macro: {ema_macro:.4f} | "
+                    f"Pot: {ema_pot:.4f} (Raw: {ema_pot_raw:.4f}) | "
+                    f"CFM: {ema_cfm:.4f} | Macro: {ema_macro:.4f} | Cos: {ema_cos:.4f} | "
                     f"Len: {ema_len:.4f} | CopyProb: {ema_copy:.3f} | "
                     f"Rho: {metrics['rho_pred_mean'].item():.2f}/{metrics['rho_true_mean'].item():.2f} | "
                     f"Scale: {scale_factor:.2f}x"
@@ -997,22 +1081,18 @@ def train():
                             b_x_know, b_know_mask = None, None
 
                         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                            _, b_metrics = mamba_cfm_loss(
+                            b_metrics = evaluate_validation_loss(
                                 mamba=mamba,
                                 hippo_oracle=hippo_oracle,
+                                unet=unet,
                                 x_context=b_x_ctx,
                                 x_target=b_x_tgt,
-                                unet=unet,
                                 context_mask=b_ctx_mask,
                                 target_mask=b_tgt_mask,
                                 x_knowledge=b_x_know,
                                 knowledge_mask=b_know_mask,
                                 pad_loss_weight=args.pad_loss_weight,
-                                know_drop_prob=0.0,
-                                verbosity_hint_prob=0.0,
-                                t=torch.tensor([0.75], device=device, dtype=torch.float32),
-                                return_sequence=True,
-                                return_metrics=True,
+                                t_val=0.75,
                             )
                         val_pot_list.append(b_metrics["loss_potential_raw"].item())
                         val_copy_list.append(b_metrics["copy_prob_mean"].item())

@@ -269,10 +269,10 @@ class OrthogonalKnowledgeResonance(nn.Module):
 
 class CopyPointerHead(nn.Module):
     """
-    Lightweight Low-Rank Copy Pointer Head for Canvas Layers (No Auxiliary CE, No Value Projection):
+    Lightweight Low-Rank Copy Pointer Head for Macro & Canvas Layers (No Auxiliary CE, No Value Projection):
       - Low-rank addressing in R^{d_ptr} (d_ptr = 64) with depthwise 3-gram local context on keys (`key_conv`)
         so multi-character entities (e.g. `table_name_43`, `toronto`, equations) carry local n-gram signatures.
-      - Learnable "no-copy" sink slot (`sink_key`, `sink_bias = 1.5`) so non-copying is the default when no
+      - Learnable "no-copy" sink slot (`sink_key`, `sink_bias = 2.0`) so non-copying is the default when no
         knowledge token matches, preserving strict zero-pollution when k_tokens is empty or all masked.
       - Identity Value Transport (`torch.bmm(p_copy, k_val_masked)` with NO `v_proj` matrix):
         Directly transports pure normalized Phase 1 token embeddings onto `h_potential` via convex
@@ -399,21 +399,6 @@ class TimeWarpedLegendreExpander(nn.Module):
     Expands K_beats (e.g., 32) macroscopic narrative beats into a full-resolution 3D canvas
     H_canvas of arbitrary canvas length L_out (e.g., 256, 512, 768) with zero hardcoded L weights
     and without the 8.9M-parameter harmonic_proj bottleneck.
-
-    Implements Dual-Level Elastic Time-Warping + Orthonormal Nyquist Slot Articulation:
-      1. Global Effective Horizon (length_head / rho_override):
-         Runs explicitly in FP32 with straight-through leaky tanh logit bounding:
-           soft_logit = 4.5 * tanh(raw_len_logit / 4.5)
-           bounded_logit = 0.9 * soft_logit + 0.1 * raw_len_logit + 0.1 * (soft_logit - raw_len_logit).detach()
-           rho_pred = 0.04 + 0.95 * sigmoid(bounded_logit)  in (0.04, 0.99)
-         Detaches rho_pred when computing rho_used so loss_potential gradients through
-         l_eff = rho_used * L_out (512x multiplier) never hijack length_head.
-      2. Local Beat Pacing (pacing_head):
-         Predicts positive beat duration weights delta_s_k -> normalized p_k (sum_k p_k = 1).
-      3. Dual Basis Macro Projection + Orthonormal Nyquist Slot Carrier Articulation:
-         Combines K-order Legendre polynomials + Gaussian beat kernels with an analytical
-         orthonormal Nyquist carrier (`<slot[t], slot[t+1]> == 0.0` for all t) modulated by
-         macro beat & summary projections (`self.slot_proj`).
     """
     def __init__(self, d_model: int = 1024, num_beats: int = 32):
         super().__init__()
@@ -526,16 +511,6 @@ class TimeWarpedLegendreExpander(nn.Module):
         target_len: int = 512,
         rho_override: Optional[Union[torch.Tensor, float]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Args:
-            c_beats: (B, K_beats, D)
-            h_summary: (B, D) - Clean context/knowledge summary (unpolluted by rho_override)
-            target_len: int (dynamic output canvas length L_out)
-            rho_override: Optional (B,) tensor or float in (0, 1] for manual verbosity or target alignment
-        Returns:
-            h_macro_potential: (B, target_len, D)
-            aux_dict: dict with rho_pred, rho_used, l_eff, pacing_weights, beat_centers, horizon_gate, h_canvas
-        """
         B, K, D = c_beats.shape
         device = c_beats.device
         dtype = c_beats.dtype
@@ -629,14 +604,14 @@ class MultiStreamMambaPlanner(nn.Module):
     Phase 5 Unified Left-Brain Architecture (Two-Stage Macro-Once + Micro-Flow (X_t, t) Closed-Loop Planner).
     1. Stage 1 (`encode_macro` — Executed ONCE per dialogue turn):
        Scans context & multi-stream knowledge, extracts clean summary `h_summary_clean` for `length_head`,
-       rolls out K=32 narrative beats, and expands them onto the L_out canvas `h_canvas_macro`.
+       rolls out K=32 narrative beats, expands them onto the L_out canvas `h_canvas_macro`, and applies
+       `macro_copy_pointer` so even at Euler step 0 (`t = 0.0`) the macro canvas already copies entities/facts!
     2. Stage 2 (`forward_canvas` — Executed at each Flow Timestep t in [0, 1]):
-       Injects strictly 1-step right-shifted causal prefix state `x_t_prev` (position l ONLY observes
-       indices 0 .. l-1, NEVER index l!) weighted by the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)`
+       Injects strictly 1-step right-shifted causal prefix state `x_t_prev` (using self-conditioned
+       `x_t_prefix` during single-step training so `x_t_prev` never leaks ground-truth `H_target[:, l-1]`)
+       weighted by the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)`
        + macro-centered causal innovation + continuous timestep `t_emb` into the 3-layer causal `canvas_layers`
-       stack (equipped with low-rank `CopyPointerHead` for exact identity value transport from knowledge streams),
-       outputting the refined trajectory `h_potential(X_t, t)` and instantaneous OT-CFM velocity
-       vector field `v_mamba(X_t, t)`.
+       stack (equipped with low-rank `CopyPointerHead`), outputting `h_potential(X_t, t)` and `v_mamba(X_t, t)`.
     """
     def __init__(
         self,
@@ -700,8 +675,9 @@ class MultiStreamMambaPlanner(nn.Module):
         )
         self.verbosity_superposition = OrthogonalFieldSuperposition(d_model, init_gate=0.1)
 
-        # Elastic Time-Warped Legendre + Orthonormal Nyquist Expander
+        # Elastic Time-Warped Legendre + Orthonormal Nyquist Expander + Stage 1 Macro CopyPointerHead
         self.expander = TimeWarpedLegendreExpander(d_model=d_model, num_beats=num_beats)
+        self.macro_copy_pointer = CopyPointerHead(d_model=d_model, d_ptr=d_ptr)
 
         # K=32 learnable future narrative beat queries: distinct sinusoidal beat pos + orthogonal init (std 0.25)
         with torch.no_grad():
@@ -819,7 +795,8 @@ class MultiStreamMambaPlanner(nn.Module):
         """
         Stage 1 (Executed ONCE per dialogue turn):
         Scans context and knowledge streams, extracts clean summary `h_summary_clean`,
-        rolls out K=32 narrative beats, and expands them onto the L_out macroscopic canvas.
+        rolls out K=32 narrative beats, expands them onto the L_out macroscopic canvas,
+        and applies `self.macro_copy_pointer` so entities/facts are already copied at t=0.0.
         """
         B, L_c, D = x_context.shape
         out_len = int(target_len) if target_len is not None else L_c
@@ -928,7 +905,6 @@ class MultiStreamMambaPlanner(nn.Module):
             rho_override=rho_override,
         )
         aux_dict["beats"] = beats
-        aux_dict["h_macro_potential"] = h_macro_potential
 
         h_canvas_macro = aux_dict["h_canvas"]
         horizon_gate = aux_dict["horizon_gate"].unsqueeze(-1).to(dtype=h_canvas_macro.dtype)
@@ -939,6 +915,16 @@ class MultiStreamMambaPlanner(nn.Module):
         copy_k_key = k_pool
         copy_k_val = k_raw
         copy_k_mask = k_mask
+
+        # Stage 1 Macro CopyPointerHead: ensures h_canvas_macro and h_macro_potential already
+        # incorporate copied entities/facts from Knowledge even at Euler step 0 (t = 0.0)!
+        h_canvas_macro, macro_cp = self.macro_copy_pointer(
+            h_canvas_macro, copy_k_key, k_mask=copy_k_mask, k_val=copy_k_val
+        )
+        h_macro_potential = horizon_gate * h_canvas_macro + (1.0 - horizon_gate) * pad_tail
+        aux_dict["h_canvas"] = h_canvas_macro
+        aux_dict["h_macro_potential"] = h_macro_potential
+        aux_dict["macro_copy_prob"] = macro_cp
 
         return {
             "h_ctx": h_ctx,
@@ -965,14 +951,16 @@ class MultiStreamMambaPlanner(nn.Module):
         t: Union[torch.Tensor, float],
         macro_state: Dict[str, Any],
         return_velocity: bool = False,
+        x_t_prefix: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Stage 2 (Executed at each Flow Matching timestep t in [0, 1]):
-        Takes the current noisy trajectory `x_t` (B, L, D), shifts it right by 1 position (`x_t_prev`)
-        so position l ONLY observes causal prefix `x_t[:, :l, :]` (strictly 0.0 intra-step leakage!),
-        applies the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)` (which is 0.0 at t=0.0,
-        preventing white-noise amplification at Euler step 0), and runs the 3-layer causal `canvas_layers`
-        stack + `CopyPointerHead` to articulate `h_potential(X_t, t)` and `v_mamba(X_t, t)`.
+        Takes the current noisy trajectory `x_t` (B, L, D) and optional self-conditioned `x_t_prefix`,
+        shifts `x_t_for_prefix` right by 1 position (`x_t_prev`) so position l ONLY observes causal
+        prefix `0..l-1` without leaking ground-truth `H_target[:, l-1]` during training,
+        applies the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)` (0.0 at t=0.0),
+        and runs the 3-layer causal `canvas_layers` stack + `CopyPointerHead` to articulate
+        `h_potential(X_t, t)` and `v_mamba(X_t, t)`.
         """
         h_canvas_macro = macro_state["h_canvas_macro"]
         horizon_gate = macro_state["horizon_gate"]
@@ -1004,10 +992,11 @@ class MultiStreamMambaPlanner(nn.Module):
         # w_wiener(0.5) == 1.0, and w_wiener(1.0) == 1.0.
         w_wiener = (t_tensor / (t_tensor.pow(2) + (1.0 - t_tensor).pow(2) + 1e-6)).view(B, 1, 1).to(dtype=dtype)
 
-        # Strictly 1-step right-shifted causal prefix of x_t:
-        # At index l in [0, L-1], x_t_prev[:, :l+1, :] ONLY contains x_t[:, :l, :] (NEVER index l!)
+        # Strictly 1-step right-shifted causal prefix from x_t_for_prefix (self-conditioned during training
+        # so x_t_prev never leaks ground-truth H_target[:, l-1]; during Euler ODE x_t_prefix is None):
         x_t_cast = x_t.to(dtype=dtype)
-        x_t_gated = x_t_cast * horizon_gate
+        x_t_for_prefix = x_t_prefix.to(dtype=dtype) if x_t_prefix is not None else x_t_cast
+        x_t_gated = x_t_for_prefix * horizon_gate
         x_t_prev = F.pad(x_t_gated[:, :-1, :], (0, 0, 1, 0))  # (B, L, D)
 
         # Macro-centered causal innovation weighted by w_wiener(t)
@@ -1038,6 +1027,11 @@ class MultiStreamMambaPlanner(nn.Module):
         )
 
         copy_probs = []
+        if "aux_dict" in macro_state and isinstance(macro_state["aux_dict"], dict):
+            macro_cp = macro_state["aux_dict"].get("macro_copy_prob", None)
+            if macro_cp is not None:
+                copy_probs.append(macro_cp)
+
         for j in range(self.num_canvas_layers):
             t_gate_j = self.canvas_t_gates[j].to(dtype=dtype)
             normed_c = self.canvas_norms[j](h_canvas + t_gate_j * t_proj_shared)
@@ -1081,6 +1075,7 @@ class MultiStreamMambaPlanner(nn.Module):
         rho_override: Optional[Union[torch.Tensor, float]] = None,
         x_t: Optional[torch.Tensor] = None,
         t: Optional[Union[torch.Tensor, float]] = None,
+        x_0: Optional[torch.Tensor] = None,
         return_sequence: bool = True,
         keepdim: bool = False,
         return_aux: bool = False,
@@ -1094,8 +1089,8 @@ class MultiStreamMambaPlanner(nn.Module):
         """
         Unified Two-Stage Forward Pass:
           1. Runs `encode_macro(...)` once on context + multi-stream knowledge.
-          2. Runs `forward_canvas(x_t, t, macro_state)` on the flow-matching canvas.
-             If `x_t` is omitted (legacy caller), defaults to `x_t = h_macro_potential.detach(), t = 1.0`.
+          2. Constructs self-conditioned `x_t_prefix = t * h_macro_potential.detach() + (1 - t) * x_0`
+             so `forward_canvas` never peeks at ground-truth `H_target[:, l-1]` via `x_t_prev`.
         """
         B = x_context.shape[0]
         macro_state = self.encode_macro(
@@ -1118,11 +1113,40 @@ class MultiStreamMambaPlanner(nn.Module):
         if t is None:
             t = torch.ones((B,), device=x_context.device, dtype=torch.float32)
 
+        if isinstance(t, (int, float)):
+            t_for_pref = torch.full(
+                (B, 1, 1),
+                float(t),
+                device=x_context.device,
+                dtype=macro_state["h_macro_potential"].dtype,
+            )
+        elif t.dim() == 0:
+            t_for_pref = (
+                t.view(1, 1, 1)
+                .expand(B, 1, 1)
+                .to(device=x_context.device, dtype=macro_state["h_macro_potential"].dtype)
+            )
+        else:
+            t_for_pref = t.view(B, 1, 1).to(
+                device=x_context.device, dtype=macro_state["h_macro_potential"].dtype
+            )
+
+        noise_src = (
+            x_0.to(dtype=macro_state["h_macro_potential"].dtype)
+            if x_0 is not None
+            else torch.randn_like(macro_state["h_macro_potential"])
+        )
+        x_t_prefix = (
+            t_for_pref * macro_state["h_macro_potential"].detach()
+            + (1.0 - t_for_pref) * noise_src
+        )
+
         h_potential, v_mamba = self.forward_canvas(
             x_t=x_t,
             t=t,
             macro_state=macro_state,
             return_velocity=True,
+            x_t_prefix=x_t_prefix,
         )
         aux_dict["v_mamba"] = v_mamba
 
