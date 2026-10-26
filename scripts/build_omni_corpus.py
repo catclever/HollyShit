@@ -29,7 +29,7 @@ The 8 Core Domains:
 Usage:
   python scripts/build_omni_corpus.py \
       --samples_per_source 100000 \
-      --output /content/omni_corpus.jsonl \
+      --output /content/omni_knowledge_corpus.jsonl \
       --local_moss /content/drive/MyDrive/hollyshit/data/moss_dialogues.jsonl
 """
 
@@ -1538,8 +1538,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="/content/omni_corpus.jsonl",
-        help="Output JSONL file path (default: /content/omni_corpus.jsonl)",
+        default="/content/omni_knowledge_corpus.jsonl",
+        help="Output JSONL file path (default: /content/omni_knowledge_corpus.jsonl)",
     )
     parser.add_argument(
         "--local_moss",
