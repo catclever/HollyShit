@@ -1,7 +1,11 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
+import math
 import glob
+import json
+import re
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,15 +16,47 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
     sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
 
 from training.core.char_tokenizer import CharTokenizer
-from training.data.dialogue_dataset import GenericPairDataset
-from model.hippo_oracle import HiPPOOracleCUDA
-from model.flow_unet_cuda import FlowMatching1DUnet
-from model.loss_hippo_cfm import hippo_cfm_loss
+try:
+    from training.data.dialogue_dataset_017 import GenericPairDataset
+    from model.hippo_oracle_017 import HiPPOOracleCUDA
+    from model.flow_unet_cuda_017 import FlowMatching1DUnet
+    from model.loss_hippo_cfm_017 import hippo_cfm_loss
+except ImportError:
+    from training.data.dialogue_dataset import GenericPairDataset
+    from model.hippo_oracle import HiPPOOracleCUDA
+    from model.flow_unet_cuda import FlowMatching1DUnet
+    from model.loss_hippo_cfm import hippo_cfm_loss
+
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 from torch.utils.data import DataLoader
+
+
+def get_warmup_cosine_scheduler(
+    optimizer: optim.Optimizer,
+    warmup_steps: int,
+    max_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> optim.lr_scheduler.LambdaLR:
+    warmup_steps = max(0, int(warmup_steps))
+    max_steps = max(1, int(max_steps))
+    min_lr_ratio = float(min_lr_ratio)
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        if current_step >= max_steps:
+            return min_lr_ratio
+        decay_steps = max(1, max_steps - warmup_steps)
+        progress = float(current_step - warmup_steps) / float(decay_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
 
 def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
     candidates = []
@@ -33,7 +69,8 @@ def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
                 pt_file = os.path.join(full_dir, "translator.pt")
                 if os.path.isfile(pt_file):
                     try:
-                        step = int(d.split("step_")[-1])
+                        step_str = d.split("step_")[-1].replace("_emergency", "")
+                        step = int(step_str)
                         candidates.append((step, pt_file))
                     except ValueError:
                         pass
@@ -41,6 +78,59 @@ def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
     return None
+
+
+def find_compatible_unet_ckpt(unet, out_dir, prefix="phase4_hippo_flow", device="cpu"):
+    """
+    Finds the latest checkpoint with matching architecture by testing strict `load_state_dict`
+    compatibility in descending order of global_step. Skips incompatible legacy checkpoints cleanly.
+    """
+    if not out_dir or not os.path.exists(out_dir):
+        return None, 0
+
+    candidates = []
+    expected_step_prefix = f"{prefix}_step_" if prefix else "step_"
+    expected_emergency = f"{prefix}_latest_emergency" if prefix else "latest_emergency"
+
+    for d in os.listdir(out_dir):
+        d_path = os.path.join(out_dir, d)
+        if not os.path.isdir(d_path):
+            continue
+        if prefix and d != expected_emergency and not d.startswith(expected_step_prefix):
+            continue
+
+        step = -1
+        for file in os.listdir(d_path):
+            if file.endswith(".json") and "dataloader" in file:
+                try:
+                    with open(os.path.join(d_path, file), "r") as f:
+                        state = json.load(f)
+                        step = state.get("global_step", -1)
+                except Exception:
+                    pass
+        if step == -1:
+            m = re.search(r"step_(\d+)", d)
+            if m:
+                step = int(m.group(1))
+        if step >= 0:
+            unet_pt = os.path.join(d_path, "unet.pt")
+            if os.path.isfile(unet_pt):
+                candidates.append((step, d_path, d))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    for step, c_path, c_name in candidates:
+        unet_pt = os.path.join(c_path, "unet.pt")
+        try:
+            state_dict = torch.load(unet_pt, map_location=device, weights_only=True)
+            unet.load_state_dict(state_dict, strict=True)
+            print(f"✅ Verified compatible Phase 4 Unet checkpoint '{c_name}' (step {step})")
+            return c_path, step
+        except Exception as e:
+            print(f"ℹ️ Skipping incompatible legacy checkpoint '{c_name}' (step {step}): {e}")
+
+    return None, 0
+
 
 def decode_with_eos_marker(tokenizer, token_ids):
     """Decodes token IDs and explicitly marks the first <EOS> as '<eos>' so sequence termination is visible."""
@@ -51,11 +141,20 @@ def decode_with_eos_marker(tokenizer, token_ids):
         return f"{head}<eos>{tail}"
     return tokenizer.decode(token_ids, skip_special_tokens=True)
 
+
 @torch.no_grad()
-def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=256, device='cuda'):
+def encode_tokens(encoder, token_ids: torch.Tensor) -> torch.Tensor:
+    h = encoder.get_normalized_embeddings(token_ids)
+    for layer in encoder.layers:
+        h = layer(h, None)
+    return encoder.final_ln(h)
+
+
+@torch.no_grad()
+def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=128, device="cuda"):
     """
-    Euler ODE Integrator:
-    dX_t = v(X_t, t, h_potential, k_attractors=x_prompt_norm) * dt
+    Euler ODE Integrator conditioned on 2D Sentence Vector `h_potential: (B, 1024)` + `k_attractors`:
+    dX_t = v(X_t, t, h_potential=z_sent, k_attractors=x_prompt_norm) * dt
     Integrates from white noise X_0 ~ N(0, I) -> X_1_norm, then auto-denormalizes back to encoder manifold.
     """
     B = x_prompt.shape[0]
@@ -70,9 +169,17 @@ def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=256, device=
         x = x + v_pred * dt
     return unet.denormalize(x)
 
+
 def train():
-    parser = get_training_parser("Phase 4 HiPPO Oracle + Flow Match Engine (CUDA)")
-    parser.add_argument("--data_path", type=str, default="data/Basic_ZH/moss_dialogues.jsonl", help="Path to dialogue dataset (file, dir, or glob)")
+    default_data_path = (
+        "/content/omni_knowledge_corpus.jsonl"
+        if os.path.exists("/content/omni_knowledge_corpus.jsonl")
+        else "data/Basic_ZH/moss_dialogues.jsonl"
+    )
+
+    parser = get_training_parser("Phase 4 HiPPO 2D Sentence Vector + Flow Match Engine (CUDA)")
+    parser.add_argument("--data_path", type=str, default=default_data_path, help="Path to dialogue/knowledge dataset (file, dir, or glob)")
+    parser.add_argument("--prompt_seq_len", type=int, default=256, help="Max token length for Prompt + Knowledge k_attractors")
     parser.add_argument("--prompt_key", type=str, default=None, help="Explicit prompt key in dataset items")
     parser.add_argument("--target_key", type=str, default=None, help="Explicit target key in dataset items")
     parser.add_argument("--max_samples", type=int, default=None, help="Max number of samples to load (useful for smoke tests)")
@@ -82,12 +189,22 @@ def train():
     parser.add_argument("--euler_steps", type=int, default=10, help="Euler ODE integration steps for qualitative evaluation")
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["bf16", "fp16", "no"], help="Mixed precision mode (bf16, fp16, no)")
     parser.add_argument("--accum_steps", type=int, default=1, help="Number of gradient accumulation steps")
-    parser.add_argument("--min_target_len", type=int, default=30, help="Filter out ultra-short target fragments (< N chars) to avoid 95%% padding dilution")
+    parser.add_argument("--min_target_len", type=int, default=8, help="Minimum clause character length after punctuation split")
+    parser.add_argument("--max_clause_chars", type=int, default=120, help="Maximum clause character length after punctuation split")
+    parser.add_argument("--split_by_punctuation", action="store_true", default=True, help="Split multi-sentence targets into progressive single clauses")
+    parser.add_argument("--no_split_by_punctuation", dest="split_by_punctuation", action="store_false", help="Disable punctuation splitting")
+    parser.add_argument("--attractor_prob", type=float, default=0.90, help="Probability of enabling k_attractors during Phase 4 training (default 0.90)")
     parser.add_argument("--pad_loss_weight", type=float, default=0.05, help="Relative weight for <PAD> tokens in flow matching MSE loss")
-    parser.set_defaults(ckpt_prefix="phase4_hippo_flow", batch_size=64, save_steps=1000)
+    parser.set_defaults(
+        seq_len=128,
+        warmup_steps=500,
+        ckpt_prefix="phase4_hippo_flow",
+        batch_size=64,
+        save_steps=1000,
+    )
 
     args = parser.parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Mixed Precision Setup
@@ -95,7 +212,7 @@ def train():
     amp_dtype = torch.float32
     scaler = None
 
-    if device.type == 'cuda' and args.mixed_precision != "no":
+    if device.type == "cuda" and args.mixed_precision != "no":
         if args.mixed_precision == "bf16":
             if torch.cuda.is_bf16_supported():
                 amp_enabled = True
@@ -117,18 +234,27 @@ def train():
 
     tokenizer = CharTokenizer()
 
-    # 1. 通用数据加载器 (Generic Pair Dataset)
+    # 1. Punctuation-Split Single-Clause Dataset with Negative Distractor Removal
     dataset = GenericPairDataset(
         data_path=args.data_path,
         tokenizer=tokenizer,
         seq_len=args.seq_len,
+        prompt_seq_len=args.prompt_seq_len,
+        target_seq_len=args.seq_len,
         prompt_key=args.prompt_key,
         target_key=args.target_key,
         max_samples=args.max_samples,
         min_target_len=args.min_target_len,
-        verbose=True
+        split_by_punctuation=args.split_by_punctuation,
+        max_clause_chars=args.max_clause_chars,
+        min_clause_chars=args.min_target_len,
+        verbose=True,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    # Pick 2 fixed representative samples for qualitative ODE evaluation
+    rng = random.Random(42)
+    eval_indices = [rng.randrange(len(dataset)) for _ in range(min(2, len(dataset)))] if len(dataset) > 0 else []
 
     # 2. Phase 1 Encoder (Frozen Continuous Geometric Mapper)
     encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
@@ -162,26 +288,66 @@ def train():
     else:
         print(f"⚠️ No translator checkpoint found at '{translator_path}'. Text preview will be disabled.")
 
-    # 4. Phase 4 HiPPO Oracle (Frozen)
-    hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64).to(device)
+    # 4. Phase 4 HiPPO Oracle (Frozen 2D Sentence Vector Bottleneck)
+    hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=16).to(device)
     hippo_oracle.eval()
 
-    # 5. Flow Match Unet (Trainable)
-    unet = FlowMatching1DUnet(hidden_dim=1024, cond_dim=1024, num_layers=6).to(device)
-
+    # 5. Flow Match Unet (Trainable Right Brain)
+    unet = FlowMatching1DUnet(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=16).to(device)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
+
+    max_steps = max(1, args.epochs * len(dataloader))
+    scheduler = get_warmup_cosine_scheduler(
+        optimizer=optimizer,
+        warmup_steps=args.warmup_steps,
+        max_steps=max_steps,
+    )
 
     checkpointer = Checkpointer(out_dir=args.out_dir, prefix=args.ckpt_prefix, keep_last_k=args.keep_last_k)
     checkpointer.register_model("unet", unet)
     checkpointer.register_optimizer("engine_opt", optimizer)
+    checkpointer.register_optimizer("lr_sched", scheduler)
     checkpointer.register_args(args)
 
-    global_step = checkpointer.load_latest() if args.auto_resume else 0
+    if args.auto_resume or args.resume_from:
+        if args.resume_from and os.path.isdir(args.resume_from):
+            compat_path, compat_step = args.resume_from, 0
+        else:
+            compat_path, compat_step = find_compatible_unet_ckpt(
+                unet=unet,
+                out_dir=args.out_dir,
+                prefix=args.ckpt_prefix,
+                device=device,
+            )
+        if compat_path:
+            try:
+                loaded_step = checkpointer.load(compat_path)
+                global_step = loaded_step if loaded_step > 0 else compat_step
+                checkpointer.set_step(global_step)
+                sched_file = os.path.join(compat_path, "lr_sched.pt")
+                if not os.path.exists(sched_file) and global_step > 0:
+                    scheduler.step(global_step)
+                print(f"✅ Successfully resumed Phase 4 training from step {global_step} ({compat_path})")
+            except Exception as e:
+                print(f"⚠️ Error loading checkpoint state ({e}). Starting fresh from step 0!")
+                global_step = 0
+                checkpointer.set_step(0)
+        else:
+            print(f"ℹ️ No compatible Phase 4 checkpoints found in '{args.out_dir}'. Starting fresh from step 0!")
+            global_step = 0
+            checkpointer.set_step(0)
+    else:
+        global_step = 0
+        checkpointer.set_step(0)
+
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
-    print("🚀 Starting Phase 4 HiPPO + Flow Match Training (Curriculum Learning)...")
+    print(
+        f"🚀 Starting Phase 4 2D Sentence Vector + Flow Match Training "
+        f"(seq_len={args.seq_len}, prompt_seq_len={args.prompt_seq_len}, "
+        f"attractor_prob={args.attractor_prob:.2f}, warmup={args.warmup_steps})..."
+    )
 
-    max_steps = args.epochs * len(dataloader) if len(dataloader) > 0 else 1
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, args.epochs):
@@ -194,17 +360,9 @@ def train():
             valid_mask = (w_tgt != tokenizer.pad_token_id)
 
             with torch.no_grad():
-                h_t = encoder.get_normalized_embeddings(w_t)
-                for layer in encoder.layers:
-                    h_t = layer(h_t, None)
-                x_prompt = encoder.final_ln(h_t)
+                x_prompt = encode_tokens(encoder, w_t)
+                x_target = encode_tokens(encoder, w_tgt)
 
-                h_tgt = encoder.get_normalized_embeddings(w_tgt)
-                for layer in encoder.layers:
-                    h_tgt = layer(h_tgt, None)
-                x_target = encoder.final_ln(h_tgt)
-
-                # 初次前向时做尺度方差体检（仅统计非 PAD 真实字符位置）并启动自适应尺度标定
                 if global_step == 0 and batch_idx == 0:
                     valid_tokens = x_target[valid_mask] if valid_mask.any() else x_target
                     std_val = valid_tokens.std().item()
@@ -214,23 +372,29 @@ def train():
                     norm_std = (norm_x[valid_mask] if valid_mask.any() else norm_x).std().item()
                     scale_factor = 1.0 / unet.manifold_std.item()
                     valid_pct = valid_mask.float().mean().item() * 100.0
-                    print(f"📊 Manifold Geometry Check (Valid Tokens: {valid_pct:.1f}%) -> Raw Mean: {mean_val:.4f}, Raw Valid Std: {std_val:.4f}")
-                    print(f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | Normalized Valid Std: {norm_std:.4f}")
+                    z_check = hippo_oracle(norm_x, return_sequence=False, valid_mask=valid_mask)
+                    print(
+                        f"📊 Manifold Geometry Check (Valid Tokens: {valid_pct:.1f}%) -> "
+                        f"Raw Mean: {mean_val:.4f}, Raw Valid Std: {std_val:.4f}"
+                    )
+                    print(
+                        f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | "
+                        f"Normalized Valid Std: {norm_std:.4f} | 2D Z_sent Shape: {tuple(z_check.shape)} (Std: {z_check.std().item():.4f})"
+                    )
 
-            # Curriculum Schedule: Attractor probability increases smoothly from 0 to 0.5
-            p_attractor = min(0.5, (global_step / max_steps) * 1.0)
+            p_attractor = float(args.attractor_prob)
             use_attractor = torch.rand(1).item() < p_attractor
 
-            # Forward + Loss under autocast
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                loss = hippo_cfm_loss(
+                loss, metrics = hippo_cfm_loss(
                     unet,
                     hippo_oracle,
                     x_prompt,
                     x_target,
                     use_knowledge_attractor=use_attractor,
                     valid_mask=valid_mask,
-                    pad_loss_weight=args.pad_loss_weight
+                    pad_loss_weight=args.pad_loss_weight,
+                    return_metrics=True,
                 )
                 loss_scaled = loss / args.accum_steps
 
@@ -239,56 +403,68 @@ def train():
             else:
                 loss_scaled.backward()
 
-            # Gradient accumulation step
             if (batch_idx + 1) % args.accum_steps == 0 or (batch_idx + 1) == len(resumed_loader):
                 if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+            checkpointer.set_step(global_step)
+
             if global_step % 50 == 0:
                 scale_factor = 1.0 / unet.manifold_std.item()
-                print(f"Epoch {epoch+1} | Step {global_step} | Phase 4 Loss: {loss.item():.4f} | Attractor Prob: {p_attractor:.2f} | Scale: {scale_factor:.2f}x")
+                print(
+                    f"Epoch {epoch+1} | Step {global_step} | "
+                    f"Loss: {loss.item():.4f} (Vel: {metrics['loss_vel'].item():.4f}, Cos: {metrics['loss_cos'].item():.4f}) | "
+                    f"Z_sent Std: {metrics['z_sent_std'].item():.3f} | "
+                    f"Attractor Prob: {p_attractor:.2f} | Scale: {scale_factor:.2f}x"
+                )
 
-            # 定期进行 Euler ODE 真实文本生成测试
             if translator is not None and (global_step == 50 or global_step % args.eval_interval == 0):
                 unet.eval()
                 with torch.no_grad():
-                    # 提取第一条样本进行生成评估 (在归一化流形空间提取 HiPPO 势能曲线)
-                    p_sample = x_prompt[:1]
-                    tgt_sample = x_target[:1]
-                    tgt_sample_norm = unet.normalize(tgt_sample)
-                    h_potential = hippo_oracle(tgt_sample_norm)
+                    print("\n" + "=" * 70)
+                    print(f"🔮 [Step {global_step}] 2D Sentence Vector Euler ODE Evaluation ({args.euler_steps} steps)")
+                    for s_idx, ds_idx in enumerate(eval_indices):
+                        w_p_s, w_t_s = dataset[ds_idx]
+                        w_p_s = w_p_s.unsqueeze(0).to(device)
+                        w_t_s = w_t_s.unsqueeze(0).to(device)
+                        tgt_valid_mask = (w_t_s != tokenizer.pad_token_id)
 
-                    # 10 步 Euler ODE 从高斯白噪声中积分生成连续曲线
-                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        x_gen = sample_euler_ode(
-                            unet=unet,
-                            x_prompt=p_sample,
-                            h_potential=h_potential,
-                            steps=args.euler_steps,
-                            seq_len=args.seq_len,
-                            device=device
-                        )
+                        p_sample = encode_tokens(encoder, w_p_s)
+                        tgt_sample = encode_tokens(encoder, w_t_s)
+                        tgt_sample_norm = unet.normalize(tgt_sample)
 
-                    # 解码生成轨迹与真实 Target (显式标注 <eos> 停止符位置)
-                    gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
-                    gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
+                        z_sent = hippo_oracle(tgt_sample_norm, return_sequence=False, valid_mask=tgt_valid_mask)
 
-                    ref_tokens = translator.decode_greedy(tgt_sample.float())[0].tolist()
-                    ref_text = decode_with_eos_marker(tokenizer, ref_tokens)
+                        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            x_gen = sample_euler_ode(
+                                unet=unet,
+                                x_prompt=p_sample,
+                                h_potential=z_sent,
+                                steps=args.euler_steps,
+                                seq_len=args.seq_len,
+                                device=device,
+                            )
 
-                    prompt_text = tokenizer.decode(w_t[0].tolist())
+                        gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
+                        gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
 
-                    print("\n" + "="*50)
-                    print(f"🔮 [Step {global_step}] Flow Match Euler ODE Generation Test ({args.euler_steps} steps)")
-                    print(f"Prompt:    {prompt_text}")
-                    print(f"Target:    {ref_text}")
-                    print(f"Generated: {gen_text}")
-                    print("="*50 + "\n")
+                        ref_tokens = translator.decode_greedy(tgt_sample.float())[0].tolist()
+                        ref_text = decode_with_eos_marker(tokenizer, ref_tokens)
+
+                        prompt_text = tokenizer.decode(w_p_s[0].tolist(), skip_special_tokens=True)
+                        valid_len = int(tgt_valid_mask.sum().item())
+
+                        print(f"--- Sample #{s_idx + 1} (idx={ds_idx}) ---")
+                        print(f"Prompt + Knowledge (k_attractors): {prompt_text}")
+                        print(f"Target Sentence (len={valid_len}, Z_sent shape: {tuple(z_sent.shape)}): {ref_text}")
+                        print(f"Right-Brain Generated (from 1x1024 Z_sent + k_attractors): {gen_text}")
+                    print("=" * 70 + "\n")
 
                 unet.train()
                 if torch.cuda.is_available():
@@ -300,6 +476,7 @@ def train():
         checkpointer.save(global_step)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     train()

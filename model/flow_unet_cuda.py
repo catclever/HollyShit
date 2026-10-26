@@ -1,6 +1,23 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
+
+
+def build_deterministic_ortho_mix(hidden_dim: int, seed: int = 42) -> torch.Tensor:
+    """
+    Builds a fixed deterministic orthogonal channel-mixing matrix of shape (hidden_dim, hidden_dim)
+    using QR decomposition with positive diagonal sign convention (matches HiPPOOracleCUDA).
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    rand_mat = torch.randn((hidden_dim, hidden_dim), generator=gen, dtype=torch.float32)
+    q, r = torch.linalg.qr(rand_mat)
+    diag_sign = torch.sign(torch.diagonal(r))
+    diag_sign = torch.where(diag_sign == 0, torch.ones_like(diag_sign), diag_sign)
+    ortho_mix = q * diag_sign.unsqueeze(0)
+    return ortho_mix
+
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_dim, frequency_embedding_size=256):
@@ -22,6 +39,7 @@ class TimestepEmbedder(nn.Module):
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return self.mlp(emb)
 
+
 class AdaLN(nn.Module):
     def __init__(self, hidden_dim: int, cond_dim: int):
         super().__init__()
@@ -42,107 +60,160 @@ class AdaLN(nn.Module):
             scale = scale[:, None, :]
         return x_norm * (1.0 + scale) + shift
 
+
 class OrthogonalAttractor(nn.Module):
     """
-    Implements Knowledge Extraction via Dimensional Activation.
-    Computes inner product (activation) between current trajectory and knowledge vectors.
-    Applies orthogonal force along the activated dimensions.
+    Implements Knowledge Extraction via Dimensional Cosine Resonance.
+    Preserves the shared 1024-D embedding coordinate axes via diagonal `channel_weight`
+    so `h_wave` unpacked from `z_sent` directly resonates with matching token embeddings in `k_attractors`.
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.norm_x = nn.LayerNorm(hidden_dim)
         self.norm_k = nn.LayerNorm(hidden_dim)
-        self.scale = 1.0 / math.sqrt(hidden_dim)
+        self.channel_weight = nn.Parameter(torch.ones(hidden_dim))
+        self.logit_scale = nn.Parameter(torch.tensor(50.0))
+        self.snap_threshold = 0.08
 
-    def forward(self, x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, k: torch.Tensor, k_val: torch.Tensor = None) -> torch.Tensor:
         """
         x: (B, L_x, D) - Unet's current generative trajectory
-        k: (B, L_k, D) - Knowledge attractors (e.g. Prompt features)
+        k: (B, L_k, D) - Knowledge attractor keys
+        k_val: (B, L_k, D) - Knowledge attractor values (defaults to k)
         """
-        # Normalize to stabilize the dot product activation
-        x_norm = self.norm_x(x)
-        k_norm = self.norm_k(k)
-        
-        # Activation Matrix: (B, L_x, L_k)
-        # Measures how much the current curve 'x' activates the knowledge dimensions 'k'
-        activation = torch.bmm(x_norm, k_norm.transpose(1, 2)) * self.scale
-        
-        # We apply ReLU to ensure we only get pulled by positive dimensional matches
-        # This acts as the "Snap-to-Grid" threshold
-        activation = torch.relu(activation)
-        
-        # Apply Force: (B, L_x, D)
-        # The force vector aligns perfectly with the knowledge dimension 'k'
-        force = torch.bmm(activation, k)
+        if k_val is None:
+            k_val = k
+
+        q_unit = F.normalize(self.norm_x(x) * self.channel_weight, dim=-1, eps=1e-6)
+        k_unit = F.normalize(self.norm_k(k) * self.channel_weight, dim=-1, eps=1e-6)
+
+        # Cosine Similarity Matrix: (B, L_x, L_k) in [-1, 1]
+        sim = torch.bmm(q_unit, k_unit.transpose(1, 2))
+
+        # Snap-to-Grid Threshold Gate: suppresses uncorrelated / negated distractors
+        max_sim = sim.max(dim=-1, keepdim=True).values
+        gate = torch.sigmoid((max_sim - self.snap_threshold) * 40.0)
+
+        scale = self.logit_scale.clamp(min=1.0, max=100.0)
+        attn = F.softmax(sim * scale, dim=-1) * gate
+
+        force = torch.bmm(attn, k_val)
         return force
+
 
 class Gated1DResBlock(nn.Module):
     def __init__(self, hidden_dim: int, cond_dim: int, kernel_size: int = 5, dilation: int = 1):
         super().__init__()
-        
+
         self.time_proj = nn.Linear(hidden_dim, hidden_dim)
-        
+        nn.init.normal_(self.time_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.time_proj.bias)
+
         self.adaLN1 = AdaLN(hidden_dim, cond_dim)
         self.attractor = OrthogonalAttractor(hidden_dim)
-        
+        # Initialized to 0.0 so Step 0 starts prior to attractor lock-in, then opens smoothly via gradient descent
+        self.attractor_gate = nn.Parameter(torch.zeros(hidden_dim))
+
         padding = ((kernel_size - 1) * dilation) // 2
         self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=padding, dilation=dilation)
         self.act1 = nn.SiLU()
-        
+
         self.adaLN2 = AdaLN(hidden_dim, cond_dim)
         self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=padding, dilation=dilation)
-        
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor, h_potential: torch.Tensor, k_attractors: torch.Tensor) -> torch.Tensor:
+        nn.init.normal_(self.conv2.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        h_potential: torch.Tensor,
+        k_attractors: torch.Tensor,
+        k_val: torch.Tensor = None,
+    ):
         residual = x
-        
+
         # 1. Inject Time
         t_spatial = self.time_proj(t_emb).unsqueeze(1)
         x = x + t_spatial
-        
+
         # 2. Inject Momentum (Macroscopic Wind via AdaLN)
         x = self.adaLN1(x, h_potential)
-        
+
         # 3. Inject Knowledge Attractor (Orthogonal Gravity)
+        force = None
         if k_attractors is not None:
-            force = self.attractor(x, k_attractors)
-            x = x + force
-        
+            force = self.attractor(x, k_attractors, k_val=k_val)
+            x = x + (15.0 * self.attractor_gate) * force
+
         # 4. Sculpt Geometry (1D Conv)
         x = x.transpose(1, 2)
         x = self.conv1(x)
         x = x.transpose(1, 2)
         x = self.act1(x)
-        
+
         x = self.adaLN2(x, h_potential)
         x = x.transpose(1, 2)
         x = self.conv2(x)
         x = x.transpose(1, 2)
-        
-        return residual + x
+
+        return residual + x, force
+
 
 class FlowMatching1DUnet(nn.Module):
     """
-    Vector Field Predictor for OT-CFM.
-    Dual-Brain Architecture: Driven by Legendre macroscopic potential curve (HiPPO/Mamba),
-    1D sinusoidal positional coordinates, and orthogonal knowledge attractors.
+    Vector Field Predictor for OT-CFM (Right Brain / Motor Cortex).
+    Driven by a 2D Sentence Vector `h_potential: (B, 1024)` (unpacked via 16-mode shifted Legendre
+    basis + position-aware residual adapter), 1D sinusoidal positional coordinates, and orthogonal
+    knowledge attractors `k_attractors: (B, L_k, 1024)`.
     Includes built-in Adaptive Manifold Auto-Calibration (manifold_mean & manifold_std).
     """
-    def __init__(self, hidden_dim: int = 1024, cond_dim: int = 1024, num_layers: int = 6):
+    def __init__(
+        self,
+        hidden_dim: int = 1024,
+        cond_dim: int = 1024,
+        num_layers: int = 6,
+        num_subbands: int = 16,
+    ):
         super().__init__()
+        if hidden_dim % num_subbands != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_subbands ({num_subbands})")
+
         self.hidden_dim = hidden_dim
+        self.cond_dim = cond_dim
+        self.num_subbands = num_subbands
+        self.d_sub = hidden_dim // num_subbands
+
         self.t_embedder = TimestepEmbedder(hidden_dim)
-        
+
+        # 2D Sentence Vector Legendre Unpacker (matches HiPPOOracleCUDA seed=42 QR basis)
+        ortho_mix = build_deterministic_ortho_mix(hidden_dim, seed=42)
+        self.register_buffer("ortho_mix", ortho_mix)
+
+        self.sent_wave_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        nn.init.normal_(self.sent_wave_proj[-1].weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.sent_wave_proj[-1].bias)
+
         self.blocks = nn.ModuleList([
             Gated1DResBlock(
-                hidden_dim=hidden_dim, 
-                cond_dim=cond_dim, 
-                kernel_size=5, 
+                hidden_dim=hidden_dim,
+                cond_dim=cond_dim,
+                kernel_size=5,
                 dilation=2**(i % 4)
             ) for i in range(num_layers)
         ])
-        
+
         self.final_norm = AdaLN(hidden_dim, cond_dim)
+        # Full-rank 1024x1024 projection head for full-vocabulary Chinese generation
         self.final_proj = nn.Linear(hidden_dim, hidden_dim)
+        with torch.no_grad():
+            self.final_proj.weight.mul_(0.01)
+            nn.init.zeros_(self.final_proj.bias)
+        self.x_t_gate = nn.Parameter(torch.ones(hidden_dim))
 
         # In-Model Adaptive Manifold Auto-Calibration Buffers (persisted in unet.pt)
         self.register_buffer("manifold_mean", torch.tensor(0.0, dtype=torch.float32))
@@ -150,6 +221,63 @@ class FlowMatching1DUnet(nn.Module):
         self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
 
         self._pos_cache = {}
+        self._basis_cache = {}
+
+    def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Computes the first K = self.num_subbands (16) orthonormal shifted Legendre polynomials P_k(tau)
+        evaluated at tau_l = (l + 0.5) / L in (0, 1) for l = 0..L-1, with sum_l basis[k, l]^2 == 1.0.
+        """
+        key = (L, device, dtype)
+        if key in self._basis_cache:
+            return self._basis_cache[key]
+
+        K = self.num_subbands
+        tau = (torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))
+        u = 2.0 * tau - 1.0
+
+        polys = []
+        for k in range(K):
+            if k == 0:
+                p_k = torch.ones_like(u)
+            elif k == 1:
+                p_k = u
+            else:
+                p_k = ((2.0 * k - 1.0) * u * polys[-1] - (k - 1.0) * polys[-2]) / float(k)
+            polys.append(p_k)
+
+        raw_basis = torch.stack(polys, dim=0)  # (K, L)
+
+        ortho_rows = []
+        for k in range(K):
+            v = raw_basis[k]
+            if k < L:
+                for prev in ortho_rows:
+                    v = v - torch.dot(v, prev) * prev
+            norm = v.norm(p=2).clamp(min=1e-6)
+            ortho_rows.append(v / norm)
+
+        basis = torch.stack(ortho_rows, dim=0).to(dtype=dtype)
+        self._basis_cache[key] = basis
+        return basis
+
+    def unpack_sentence_vector(self, z_sent: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """
+        Unpacks a 2D Sentence Vector `z_sent` of shape `(B, D)` into a rank-16 smooth Legendre
+        temporal wave `h_wave` of shape `(B, seq_len, D)`.
+        """
+        B, D = z_sent.shape
+        K = self.num_subbands
+        d_sub = self.d_sub
+
+        z_sub = z_sent.reshape(B, K, d_sub)
+        basis = self._get_legendre_basis(seq_len, z_sent.device, z_sent.dtype)  # (K, seq_len)
+
+        x_mixed_rec = torch.einsum("bkd,kl->blkd", z_sub, basis) * math.sqrt(K)
+        x_mixed_rec = x_mixed_rec.reshape(B, seq_len, D)
+
+        ortho_T = self.ortho_mix.to(device=z_sent.device, dtype=z_sent.dtype).T
+        return torch.matmul(x_mixed_rec, ortho_T)
 
     def _get_pos_emb(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -161,12 +289,12 @@ class FlowMatching1DUnet(nn.Module):
             return self._pos_cache[key]
 
         half_dim = self.hidden_dim // 2
-        pos = torch.arange(seq_len, dtype=torch.float32, device=device).unsqueeze(1) # (L, 1)
+        pos = torch.arange(seq_len, dtype=torch.float32, device=device).unsqueeze(1)  # (L, 1)
         div_term = torch.exp(
             torch.arange(half_dim, dtype=torch.float32, device=device) * (-math.log(10000.0) / max(half_dim - 1, 1))
-        ).unsqueeze(0) # (1, D/2)
+        ).unsqueeze(0)  # (1, D/2)
         angles = pos * div_term
-        pos_emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).unsqueeze(0).to(dtype=dtype) # (1, L, D)
+        pos_emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).unsqueeze(0).to(dtype=dtype)  # (1, L, D)
         self._pos_cache[key] = pos_emb
         return pos_emb
 
@@ -221,28 +349,50 @@ class FlowMatching1DUnet(nn.Module):
         std = self.manifold_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-5)
         return x * std + mean
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, h_potential: torch.Tensor, k_attractors: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        h_potential: torch.Tensor,
+        k_attractors: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         x_t: (B, L, D) - Current state of the normalized trajectory
         t: (B,) - Timesteps in [0, 1]
-        h_potential: (B, L, D) or (B, D) - Legendre polynomial potential curve (from HiPPO or Mamba)
-        k_attractors: (B, L_k, D) - Knowledge stream coordinates (e.g. Prompt Phase 1 output)
+        h_potential: (B, D) 2D Sentence Vector (or legacy (B, L, D) 3D trajectory)
+        k_attractors: (B, L_k, D) - Knowledge/Context stream coordinates
         """
         B, L, D = x_t.shape
         t_emb = self.t_embedder(t)
-        
+
         pos_x = self._get_pos_emb(L, x_t.device, x_t.dtype)
-        x = x_t + 0.1 * pos_x
+
+        if h_potential.dim() == 2:
+            h_pot = h_potential.to(device=x_t.device, dtype=x_t.dtype)
+            h_wave = self.unpack_sentence_vector(h_pot, L)
+            h_global = h_pot.unsqueeze(1).expand(B, L, D)
+            h_cond = h_wave + 0.5 * h_global + self.sent_wave_proj(
+                torch.cat([h_wave, h_global + pos_x], dim=-1)
+            )
+            x = h_wave + 0.05 * pos_x + 0.05 * x_t
+        else:
+            h_cond = h_potential
+            x = h_cond + 0.05 * pos_x + 0.05 * x_t
 
         k_pos = None
         if k_attractors is not None:
             pos_k = self._get_pos_emb(k_attractors.shape[1], k_attractors.device, k_attractors.dtype)
-            k_pos = k_attractors + 0.1 * pos_k
-        
+            k_pos = k_attractors + 0.02 * pos_k
+
+        attractor_acc = torch.zeros_like(x_t)
         for block in self.blocks:
-            x = block(x, t_emb, h_potential, k_pos)
-            
-        x = self.final_norm(x, h_potential)
-        v_pred = self.final_proj(x)
-        
+            x, force = block(x, t_emb, h_cond, k_pos, k_val=k_attractors)
+            if force is not None:
+                attractor_acc = attractor_acc + (30.0 * block.attractor_gate) * force
+
+        x_normed = self.final_norm(x, h_cond)
+        x_1_hat = self.final_proj(x_normed) + attractor_acc
+        denom = (1.0 - t.to(device=x_t.device, dtype=x_t.dtype)).clamp(min=0.05)[:, None, None]
+        v_pred = (x_1_hat - self.x_t_gate * x_t) / denom
+
         return v_pred
