@@ -17,18 +17,16 @@ Core Architectural Rules:
      All knowledge streams are kept completely natural (no `【经典原句】` or `【表结构】` prefixes)
      so the Left-Brain Mamba Planner learns to distinguish poetry, code, equations, encyclopedia
      facts, and narrative lore purely from continuous manifold geometry.
-  2. Strict Zero-Overlap ("No Cheating"):
-     `knowledge` (K+ and K-) and `target` have 0% verbatim sentence/clause overlap:
-     - Case A (Structured / Multi-Field Records): Separate `input`/`context`/`schema`/`equation`/`source`
-       goes into `knowledge` (K+), `instruction`/`question` into `prompt`, and `output`/`target` into `target`.
-     - Case B (Disjoint Clause Split for Plain Pair Records): Partitions `target` (or multi-part `prompt`)
-       into strictly disjoint premise clauses (K+) and continuation clauses (`target`), removing K+ from `target`.
+  2. Relaxed Clause-Disjoint / Entity-Overlap Allowed ("No Full-Sentence Cheating, Entities Preserved"):
+     `is_non_cheating_knowledge(k, target)` prevents full-sentence verbatim copying while
+     explicitly allowing short entities, table/column names, equations, numbers, and API signatures
+     to overlap naturally between `knowledge` (K+) and `target` for `CopyPointerHead` learning.
   3. Dual Execution Modes:
      - `--mode hf_stream` (or `--stream_hf`): Streams directly from HuggingFace across the 6 non-cheating
        Channel-1 domains (`grounded_instruct`, `code_api`, `classical_quote`, `encyclopedia_rag`,
        `math_rule`, `literature_lore`).
      - `--mode local_file`: Converts an existing local JSONL corpus (`omni_corpus.jsonl` or
-       `moss_dialogues.jsonl`) using the strict zero-overlap split.
+       `moss_dialogues.jsonl`) using the relaxed clause-disjoint split.
 """
 
 import os
@@ -60,6 +58,43 @@ _FALLBACK_DISTRACTORS = [
     "光合作用是绿色植物利用叶绿素吸收光能将二氧化碳转化为有机物的过程",
     "牛顿第一定律指出物体在不受外力作用时总保持静止或匀速直线运动状态",
 ]
+
+_STRIP_PUNCT_RE = re.compile(r"^[\s,，.。!！?？;；:：、\"'“”‘’()（）\[\]【】]+|[\s,，.。!！?？;；:：、\"'“”‘’()（）\[\]【】]+$")
+
+
+def is_non_cheating_knowledge(k: str, target: str) -> bool:
+    """
+    Relaxed Clause-Disjoint / Entity-Overlap Allowed validation:
+      - Strips leading/trailing whitespace and punctuation from `k` and `target`.
+      - Rejects empty strings, exact verbatim equality (`k_clean == tgt_clean`),
+        or cases where `target` is wholly contained inside `k` (`tgt_clean in k_clean and len(tgt_clean) >= 12`).
+      - When `k_clean in tgt_clean`:
+          * Rejects ONLY if `len(k_clean) >= 24` AND `len(k_clean) >= 0.4 * len(tgt_clean)`
+            (i.e. a full long sentence/clause verbatim copy).
+          * ALLOWS short entities, table/column names, equations, numbers, API signatures,
+            and short clauses (`len(k_clean) < 24` or `< 40%` of target) to naturally overlap
+            between `knowledge` (K+) and `target` so `CopyPointerHead` receives rich copy supervision!
+    """
+    if not k or not target or not isinstance(k, str) or not isinstance(target, str):
+        return False
+
+    k_clean = _STRIP_PUNCT_RE.sub("", k.strip())
+    tgt_clean = _STRIP_PUNCT_RE.sub("", target.strip())
+
+    if not k_clean or not tgt_clean:
+        return False
+
+    if k_clean == tgt_clean:
+        return False
+
+    if tgt_clean in k_clean and len(tgt_clean) >= 12:
+        return False
+
+    if k_clean in tgt_clean:
+        if len(k_clean) >= 24 and len(k_clean) >= 0.4 * len(tgt_clean):
+            return False
+
+    return True
 
 
 def clean_text(text: Optional[str]) -> str:
@@ -190,10 +225,10 @@ def disjoint_split_target_clauses(
     min_remaining_len: int = 12,
 ) -> Tuple[List[str], str]:
     """
-    Partitions `target_text` into two strictly DISJOINT sets:
+    Partitions `target_text` into two disjoint clause spans:
       - `k_plus`: 1-2 leading premise/background clauses extracted as positive knowledge (K+)
-      - `new_target`: the remaining continuation clauses with `k_plus` completely removed.
-    Guarantees 0% verbatim sentence/clause overlap between `k_plus` and `new_target`.
+      - `new_target`: the remaining continuation clauses with `k_plus` removed.
+    Uses `is_non_cheating_knowledge(k, rem_text)` so shared entities/numbers are allowed.
     """
     text = clean_text(target_text)
     if not text:
@@ -220,7 +255,7 @@ def disjoint_split_target_clauses(
             ]
             k_plus = [
                 k for k in raw_k
-                if k and k not in rem_text and rem_text not in k
+                if k and is_non_cheating_knowledge(k, rem_text)
             ]
             if k_plus:
                 return k_plus, rem_text
@@ -246,7 +281,7 @@ def disjoint_split_target_clauses(
             ]
             k_plus = [
                 k for k in raw_k
-                if len(k) >= 6 and k not in rem_text and rem_text not in k
+                if len(k) >= 6 and is_non_cheating_knowledge(k, rem_text)
             ]
             if k_plus:
                 return k_plus, rem_text
@@ -265,7 +300,7 @@ def stream_domain1_grounded_instruct(
     Domain 1 (`grounded_instruct`):
     Sources: `BelleGroup/train_1M_CN` & `silk-road/alpaca-data-gpt4-chinese`
     Filters records where `input` is non-empty (>= 15 chars):
-      prompt = instruction, K+ = [input], target = output (zero overlap).
+      prompt = instruction, K+ = [input], target = output (entity overlap allowed).
     """
     from datasets import load_dataset
     sources = ["BelleGroup/train_1M_CN", "silk-road/alpaca-data-gpt4-chinese"]
@@ -283,7 +318,7 @@ def stream_domain1_grounded_instruct(
                     k_clauses = extract_factual_clauses(inp, min_len=8, max_len=max_clause_len)
                     if not k_clauses:
                         k_clauses = [inp[:max_clause_len]]
-                    k_plus = [k for k in k_clauses[:2] if k not in out and out not in k]
+                    k_plus = [k for k in k_clauses[:2] if is_non_cheating_knowledge(k, out)]
                     if k_plus:
                         yield {
                             "domain": "grounded_instruct",
@@ -306,7 +341,8 @@ def stream_domain2_code_api(
     Domain 2 (`code_api`):
     Sources: `b-mc2/sql-create-context` & `sahil2801/CodeAlpaca-20k` / `theblackcat102/evol-codealpaca-v1`
       - SQL: prompt = question, K+ = [context], target = answer
-      - CodeAlpaca: where `input` is non-empty (`K+ = [input]`) or disjoint signature (`K+`) vs body (`target`).
+      - CodeAlpaca: where `input` is non-empty (`K+ = [input]`, allowing variable/identifier overlap with `out`)
+        or disjoint signature (`K+`) vs body (`target`).
     """
     from datasets import load_dataset
     sql_target = max(1, max_samples // 2)
@@ -322,7 +358,7 @@ def stream_domain2_code_api(
             ans = clean_text(item.get("answer", ""))
             if len(q) >= 5 and len(ctx) >= 10 and len(ans) >= 8:
                 parts = [p.strip()[:max_clause_len] for p in re.split(r"[;\n]+", ctx) if p.strip()]
-                k_plus = [p for p in (parts or [ctx[:max_clause_len]])[:2] if p not in ans and ans not in p]
+                k_plus = [p for p in (parts or [ctx[:max_clause_len]])[:2] if is_non_cheating_knowledge(p, ans)]
                 if k_plus:
                     yield {
                         "domain": "code_api",
@@ -350,7 +386,7 @@ def stream_domain2_code_api(
                 out = clean_text(item.get("output", ""))
                 if len(instr) < 5 or len(out) < 15:
                     continue
-                if len(inp) >= 8 and inp not in out and out not in inp:
+                if len(inp) >= 4 and is_non_cheating_knowledge(inp, out):
                     k_plus = [inp[:max_clause_len]]
                     target_code = out[:350]
                 else:
@@ -359,7 +395,7 @@ def stream_domain2_code_api(
                         continue
                     sig_line = lines[0].strip()[:max_clause_len]
                     body_code = "\n".join(lines[1:]).strip()[:350]
-                    if len(sig_line) < 6 or len(body_code) < 10 or sig_line in body_code:
+                    if len(sig_line) < 6 or len(body_code) < 10 or not is_non_cheating_knowledge(sig_line, body_code):
                         continue
                     k_plus = [sig_line]
                     target_code = body_code
@@ -384,7 +420,7 @@ def stream_domain3_classical_quote(
     Domain 3 (`classical_quote`):
     Sources: `gujilab/chinese-classical-corpus` & `Lifan-Z/Chinese-poetries-txt` / `erhwenkuo/poetry-chinese-zhtw`
       - Classical translation: prompt = instruction, K+ = [source], target = target
-      - Poetry: prompt = title + author, K+ = [opening couplet], target = subsequent couplets (disjoint).
+      - Poetry: prompt = title + author, K+ = [opening couplet], target = subsequent couplets.
     """
     from datasets import load_dataset
     half = max(1, max_samples // 2)
@@ -397,7 +433,7 @@ def stream_domain3_classical_quote(
             instr = clean_text(item.get("instruction", "")) or "请阐释并译述该古文名句："
             src = clean_text(item.get("source", ""))
             tgt = clean_text(item.get("target", ""))
-            if len(src) >= 6 and len(tgt) >= 10 and src not in tgt and tgt not in src:
+            if len(src) >= 6 and len(tgt) >= 10 and is_non_cheating_knowledge(src, tgt):
                 yield {
                     "domain": "classical_quote",
                     "prompt": instr,
@@ -433,7 +469,7 @@ def stream_domain3_classical_quote(
                     continue
                 opening = re.sub(r"[。！？；\n]+$", "", couplets[0]).strip()[:max_clause_len]
                 continuation = "".join(couplets[1:]).strip()[:300]
-                if len(opening) < 6 or len(continuation) < 10 or opening in continuation:
+                if len(opening) < 6 or len(continuation) < 10 or not is_non_cheating_knowledge(opening, continuation):
                     continue
                 prompt_str = f"{title}（{author}）" if (title and author) else (title or "古诗文续写与赏析")
                 yield {
@@ -456,7 +492,7 @@ def stream_domain4_encyclopedia_rag(
     """
     Domain 4 (`encyclopedia_rag`):
     Sources: `pleisto/wikipedia-cn-20230720-filtered` & `wangrui6/Zhihu-KOL`
-    Splits multi-sentence/multi-paragraph articles into strictly DISJOINT sets:
+    Splits multi-sentence/multi-paragraph articles into disjoint clause spans:
       Paragraph 1 / premise clauses -> K+, topic/question -> prompt, Paragraph 2 / continuation -> target.
     """
     from datasets import load_dataset
@@ -532,7 +568,9 @@ def stream_domain5_math_rule(
     """
     Domain 5 (`math_rule`):
     Source: `MU-NLPC/calc-ape210k`
-      prompt = question_chinese, K+ = [equation], target = chain_of_thought / solution (zero overlap).
+      prompt = question_chinese, K+ = [equation], target = chain_of_thought / solution.
+      Keeps `cot` intact (without stripping `eq`) so numbers and formulas in `eq` naturally
+      overlap with `ans`, only checking `is_non_cheating_knowledge(eq, ans)`.
     """
     from datasets import load_dataset
     print(">>> [5/6 math_rule] Streaming MU-NLPC/calc-ape210k...")
@@ -547,14 +585,13 @@ def stream_domain5_math_rule(
             if len(q) < 5 or not eq:
                 continue
             if cot and len(cot) >= 15:
-                # Ensure raw equation string is not duplicated verbatim in target
-                cleaned_cot = cot.replace(eq, "").strip(" ，,。；;")
-                ans = f"{cleaned_cot}，最终求解结果为{res}。" if res else f"{cleaned_cot}。"
+                intact_cot = cot.strip(" ，,。；;")
+                ans = f"{intact_cot}，最终求解结果为{res}。" if res else f"{intact_cot}。"
             elif res:
-                ans = f"综合题设数量关系逐步推导，可计算得出最终结果为{res}。"
+                ans = f"依题设等量关系列式 {eq} 逐步推导，可计算得出最终结果为{res}。"
             else:
                 continue
-            if eq not in ans and ans not in eq and len(ans) >= 15:
+            if len(ans) >= 15 and is_non_cheating_knowledge(eq, ans):
                 yield {
                     "domain": "math_rule",
                     "prompt": q,
@@ -575,8 +612,10 @@ def stream_domain6_literature_lore(
     """
     Domain 6 (`literature_lore`):
     Sources: `wdndev/webnovel-chinese` / `jetaudio/chinese_web_novels`
-    Splits 3-part narrative chunks into strictly DISJOINT segments:
-      Part 1 (scene/character setup) -> K+, Part 2 (opening line) -> prompt, Part 3 (continuation) -> target.
+    Splits narrative chunks (`text[:1200]`, requiring `len(sents) >= 4`) into:
+      - Part 1 (scene/character lore setup, `sents[0]`) -> K+
+      - Part 2 (2 to 4 sentences of rich narrative context, ~120-380 chars) -> prompt
+      - Part 3 (remaining continuation sentences, `[:350]`) -> target.
     """
     from datasets import load_dataset
     count = 0
@@ -588,20 +627,25 @@ def stream_domain6_literature_lore(
             ds = load_dataset(cname, split="train", streaming=True)
             for item in ds:
                 text = clean_text(item.get("text", item.get("content", "")))
-                if not text or len(text) < 90:
+                if not text or len(text) < 120:
                     continue
-                sents = [s.strip() for s in re.findall(r"[^。！？；\n]+[。！？；\n]*", text[:600]) if len(s.strip()) >= 10]
-                if len(sents) < 3:
+                sents = [
+                    s.strip()
+                    for s in re.findall(r"[^。！？；\n]+[。！？；\n]*", text[:1200])
+                    if len(s.strip()) >= 10
+                ]
+                if len(sents) < 4:
                     continue
                 part1_lore = re.sub(r"[。！？；\n]+$", "", sents[0]).strip()[:max_clause_len]
-                part2_prompt = sents[1].strip()[:150]
-                part3_target = "".join(sents[2:]).strip()[:320]
+                # Take 2 to 4 sentences for rich narrative prompt context (~120-380 chars)
+                prompt_end_idx = min(5, max(3, len(sents) - 2))
+                part2_prompt = "".join(sents[1:prompt_end_idx]).strip()[:380]
+                part3_target = "".join(sents[prompt_end_idx:]).strip()[:350]
                 if (
                     len(part1_lore) >= 10
-                    and len(part2_prompt) >= 8
+                    and len(part2_prompt) >= 20
                     and len(part3_target) >= 20
-                    and part1_lore not in part3_target
-                    and part3_target not in part1_lore
+                    and is_non_cheating_knowledge(part1_lore, part3_target)
                 ):
                     yield {
                         "domain": "literature_lore",
@@ -662,7 +706,7 @@ def stream_hf_6domain_knowledge_corpus(
                 k_plus = [
                     clean_text(k)[:max_clause_len]
                     for k in raw_item.get("k_plus", [])
-                    if clean_text(k) and clean_text(k) not in target and target not in clean_text(k)
+                    if clean_text(k) and is_non_cheating_knowledge(clean_text(k), target)
                 ]
 
                 dom_pool = rolling_domain_pool.setdefault(domain, [])
@@ -739,7 +783,7 @@ def stream_hf_6domain_knowledge_corpus(
 
 
 # =========================================================================
-# Local File Zero-Overlap Converter
+# Local File Converter
 # =========================================================================
 
 def _extract_raw_record(item: Dict[str, Any], max_clause_len: int = 126) -> Optional[Dict[str, Any]]:
@@ -792,12 +836,12 @@ def _extract_raw_record(item: Dict[str, Any], max_clause_len: int = 126) -> Opti
             for x in existing_know
             if x is not None and clean_text(str(x))
         ]
-        cleaned = [c for c in cleaned if c not in target_str and target_str not in c]
+        cleaned = [c for c in cleaned if is_non_cheating_knowledge(c, target_str)]
         if cleaned:
             parsed_know = cleaned
     elif isinstance(existing_know, str) and clean_text(existing_know):
         s = clean_text(existing_know)[:max_clause_len]
-        if s not in target_str and target_str not in s:
+        if is_non_cheating_knowledge(s, target_str):
             parsed_know = [s]
 
     if parsed_know is None:
@@ -812,11 +856,11 @@ def _extract_raw_record(item: Dict[str, Any], max_clause_len: int = 126) -> Opti
                 continue
             if len(clean_text(val_s)) >= 6:
                 s = clean_text(val_s)
-                if s not in target_str and target_str not in s:
+                if is_non_cheating_knowledge(s, target_str):
                     clauses = extract_factual_clauses(s, min_len=6, max_len=max_clause_len)
                     if not clauses:
                         clauses = [s[:max_clause_len]]
-                    clauses = [c for c in clauses if c not in target_str and target_str not in c]
+                    clauses = [c for c in clauses if is_non_cheating_knowledge(c, target_str)]
                     if clauses:
                         parsed_know = clauses
                         break
@@ -841,7 +885,7 @@ def build_phase5_knowledge_corpus(
 ) -> Dict[str, Any]:
     """
     Reads local `input_path` JSONL, groups factual clauses by domain, and writes out
-    `output_path` JSONL with multi-stream `knowledge` arrays and 0% verbatim target overlap.
+    `output_path` JSONL with multi-stream `knowledge` arrays using `is_non_cheating_knowledge`.
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input JSONL file not found: {input_path}")
@@ -915,7 +959,7 @@ def build_phase5_knowledge_corpus(
             if existing_know:
                 k_plus = [
                     k for k in existing_know[:max_pos_allowed]
-                    if k and k not in target and target not in k
+                    if k and is_non_cheating_knowledge(k, target)
                 ]
                 rem = max_know_streams - len(k_plus)
                 k_minus: List[str] = []
@@ -946,7 +990,7 @@ def build_phase5_knowledge_corpus(
                 prompt = new_prompt
                 k_plus = [
                     k for k in ref_streams[:max_pos_allowed]
-                    if k and k not in target and target not in k
+                    if k and is_non_cheating_knowledge(k, target)
                 ]
                 rem = max_know_streams - len(k_plus)
                 k_minus = []
@@ -1027,7 +1071,7 @@ def build_phase5_knowledge_corpus(
 
                 k_streams = [
                     k for k in (k_plus + k_minus)[:max_know_streams]
-                    if k and k not in target and target not in k
+                    if k and is_non_cheating_knowledge(k, target)
                 ]
                 rng.shuffle(k_streams)
                 count_synthesized += 1

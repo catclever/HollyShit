@@ -8,6 +8,57 @@ import torch
 from torch.utils.data import Dataset
 
 
+CANONICAL_DOMAINS = [
+    "grounded_instruct",
+    "code_api",
+    "classical_quote",
+    "encyclopedia_rag",
+    "math_rule",
+    "literature_lore",
+    "general",
+]
+DOMAIN_TO_ID = {d: i for i, d in enumerate(CANONICAL_DOMAINS)}
+ID_TO_DOMAIN = {i: d for i, d in enumerate(CANONICAL_DOMAINS)}
+
+
+_STRIP_PUNCT_RE = re.compile(r"^[\s,，.。!！?？;；:：、\"'“”‘’()（）\[\]【】]+|[\s,，.。!！?？;；:：、\"'“”‘’()（）\[\]【】]+$")
+
+
+def is_non_cheating_knowledge(k: str, target: str) -> bool:
+    """
+    Relaxed Clause-Disjoint / Entity-Overlap Allowed validation:
+      - Strips leading/trailing whitespace and punctuation from `k` and `target`.
+      - Rejects empty strings, exact verbatim equality (`k_clean == tgt_clean`),
+        or cases where `target` is wholly contained inside `k` (`tgt_clean in k_clean and len(tgt_clean) >= 12`).
+      - When `k_clean in tgt_clean`:
+          * Rejects ONLY if `len(k_clean) >= 24` AND `len(k_clean) >= 0.4 * len(tgt_clean)`
+            (i.e. a full long sentence/clause verbatim copy).
+          * ALLOWS short entities, table/column names, equations, numbers, API signatures,
+            and short clauses (`len(k_clean) < 24` or `< 40%` of target) to naturally overlap
+            between `knowledge` (K+) and `target` so `CopyPointerHead` receives rich copy supervision!
+    """
+    if not k or not target or not isinstance(k, str) or not isinstance(target, str):
+        return False
+
+    k_clean = _STRIP_PUNCT_RE.sub("", k.strip())
+    tgt_clean = _STRIP_PUNCT_RE.sub("", target.strip())
+
+    if not k_clean or not tgt_clean:
+        return False
+
+    if k_clean == tgt_clean:
+        return False
+
+    if tgt_clean in k_clean and len(tgt_clean) >= 12:
+        return False
+
+    if k_clean in tgt_clean:
+        if len(k_clean) >= 24 and len(k_clean) >= 0.4 * len(tgt_clean):
+            return False
+
+    return True
+
+
 def extract_factual_clauses(
     text: str,
     min_len: int = 12,
@@ -122,10 +173,11 @@ def disjoint_split_target_clauses(
     min_remaining_len: int = 12,
 ) -> Tuple[List[str], str]:
     """
-    Partitions `target_text` into two strictly DISJOINT parts:
+    Partitions `target_text` into two disjoint clause spans:
       - `k_plus`: 1-2 leading premise/background clauses extracted as positive knowledge (K+)
-      - `new_target`: the remaining continuation text with `k_plus` completely removed.
-    Guarantees 0% verbatim overlap between `k_plus` and `new_target`.
+      - `new_target`: the remaining continuation text with `k_plus` removed.
+    Uses `is_non_cheating_knowledge(k, rem_text)` so shared entity names or numbers across
+    sentences are preserved while preventing full-sentence duplication.
     """
     text = target_text.strip()
     if not text:
@@ -138,7 +190,6 @@ def disjoint_split_target_clauses(
         if s.strip()
     ]
     if len(sentence_spans) >= 2:
-        # Decide whether we can take 1 or 2 premise sentences while leaving enough continuation
         num_take = 1
         if len(sentence_spans) >= 4 and max_pos >= 2:
             rem_if_2 = "".join(sentence_spans[2:]).strip()
@@ -153,7 +204,7 @@ def disjoint_split_target_clauses(
             ]
             k_plus = [
                 k for k in raw_k
-                if k and k not in rem_text and rem_text not in k
+                if k and is_non_cheating_knowledge(k, rem_text)
             ]
             if k_plus:
                 return k_plus, rem_text
@@ -179,12 +230,12 @@ def disjoint_split_target_clauses(
             ]
             k_plus = [
                 k for k in raw_k
-                if len(k) >= 6 and k not in rem_text and rem_text not in k
+                if len(k) >= 6 and is_non_cheating_knowledge(k, rem_text)
             ]
             if k_plus:
                 return k_plus, rem_text
 
-    # 3. If indivisible, return empty K+ and intact target so zero overlap is still guaranteed
+    # 3. If indivisible, return empty K+ and intact target
     return [], text
 
 
@@ -192,12 +243,13 @@ class MultiStreamKnowledgeDataset(Dataset):
     """
     Phase 5 Multi-Stream Knowledge Dataset for Dual-Brain Mamba Planner + Flow Matching.
 
-    Returns a 3-tuple (w_context, w_knowledge, w_target):
+    When `return_domain_id=False` (default), returns a 3-tuple `(w_context, w_knowledge, w_target)`:
       - w_context:   LongTensor of shape (context_len,)
       - w_knowledge: LongTensor of shape (max_know_streams, know_seq_len)
       - w_target:    LongTensor of shape (seq_len,)
+    When `return_domain_id=True`, returns a 4-tuple `(w_context, w_knowledge, w_target, domain_id)`.
 
-    Enforces strict 0% verbatim overlap between `knowledge` streams and `target`:
+    Enforces non-cheating clause disjointness while allowing natural entity/identifier/equation overlap:
       - Case A (Structured / Multi-Field Records): Extracts `input`/`context`/`schema`/`equation`/`source`
         into `knowledge` (K+), `instruction`/`question` into `prompt`, and `output`/`target` into `target`.
       - Case B (Disjoint Clause Split for Plain Pair Records): Partitions `target` (or multi-sentence `prompt`)
@@ -238,6 +290,7 @@ class MultiStreamKnowledgeDataset(Dataset):
         max_samples: Optional[int] = None,
         min_target_len: int = 30,
         auto_extract_knowledge: bool = True,
+        return_domain_id: bool = False,
         seed: int = 42,
         verbose: bool = True,
     ):
@@ -252,6 +305,7 @@ class MultiStreamKnowledgeDataset(Dataset):
         self.max_samples = max_samples
         self.min_target_len = min_target_len
         self.auto_extract_knowledge = auto_extract_knowledge
+        self.return_domain_id = return_domain_id
         self.seed = seed
         self.verbose = verbose
 
@@ -309,13 +363,13 @@ class MultiStreamKnowledgeDataset(Dataset):
                     for k in raw_know
                     if k is not None and str(k).strip()
                 ]
-                cleaned = [k for k in cleaned if k and k not in target_text and target_text not in k]
+                cleaned = [k for k in cleaned if k and is_non_cheating_knowledge(k, target_text)]
                 return cleaned[: self.max_know_streams]
             if isinstance(raw_know, str):
                 s = self._strip_artificial_tags(raw_know)
                 if not s:
                     return None
-                if s not in target_text and target_text not in s:
+                if is_non_cheating_knowledge(s, target_text):
                     return [s[:max_clause_len]][: self.max_know_streams]
 
         # 2. Case A: Multi-field record with separate `input`/`context`/`schema`/`equation`/`source` field
@@ -331,11 +385,11 @@ class MultiStreamKnowledgeDataset(Dataset):
                 continue
             if len(val_s) >= 6:
                 s = self._strip_artificial_tags(val_s)
-                if s and s not in target_text and target_text not in s:
+                if s and is_non_cheating_knowledge(s, target_text):
                     clauses = extract_factual_clauses(s, min_len=6, max_len=max_clause_len)
                     if not clauses:
                         clauses = [s[:max_clause_len]]
-                    clauses = [c for c in clauses if c not in target_text and target_text not in c]
+                    clauses = [c for c in clauses if is_non_cheating_knowledge(c, target_text)]
                     if clauses:
                         return clauses[: self.max_know_streams]
 
@@ -574,8 +628,7 @@ class MultiStreamKnowledgeDataset(Dataset):
     ) -> Tuple[str, List[str], str]:
         """
         Deterministically synthesizes (effective_prompt, knowledge_streams, effective_target)
-        for plain records without an explicit `knowledge` field, guaranteeing 0% verbatim
-        overlap between `knowledge_streams` and `effective_target`:
+        for plain records without an explicit `knowledge` field:
           - 25% probability: Empty knowledge stream (`[]`), original prompt and target intact.
           - 75% probability:
             * Case A: If `prompt_text` contains structured context/schema/input, extract it into K+
@@ -610,7 +663,7 @@ class MultiStreamKnowledgeDataset(Dataset):
             cand_prompt, cand_k_plus = structured
             cand_k_plus = [
                 k for k in cand_k_plus
-                if k and k not in effective_target and effective_target not in k
+                if k and is_non_cheating_knowledge(k, effective_target)
             ]
             if cand_k_plus:
                 effective_prompt = cand_prompt
@@ -642,7 +695,7 @@ class MultiStreamKnowledgeDataset(Dataset):
 
         combined = [
             k for k in (k_plus + k_minus)[: self.max_know_streams]
-            if k and k not in effective_target and effective_target not in k
+            if k and is_non_cheating_knowledge(k, effective_target)
         ]
         rng.shuffle(combined)
         return effective_prompt, combined, effective_target
@@ -670,7 +723,12 @@ class MultiStreamKnowledgeDataset(Dataset):
             ids.append(self.eos_token_id)
         return self._pad_trunc(ids, self.know_seq_len)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self, idx: int
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         prompt_text, target_text, explicit_know, domain = self.samples[idx]
 
         if explicit_know is not None:
@@ -678,7 +736,7 @@ class MultiStreamKnowledgeDataset(Dataset):
             effective_target = target_text
             active_know_strs = [
                 k for k in explicit_know[: self.max_know_streams]
-                if k and k not in effective_target and effective_target not in k
+                if k and is_non_cheating_knowledge(k, effective_target)
             ]
         elif self.auto_extract_knowledge:
             effective_prompt, active_know_strs, effective_target = self._synthesize_disjoint_knowledge(
@@ -709,8 +767,12 @@ class MultiStreamKnowledgeDataset(Dataset):
             self.seq_len,
         )
 
-        return (
-            torch.tensor(w_context_ids, dtype=torch.long),
-            torch.tensor(w_know_matrix, dtype=torch.long),
-            torch.tensor(w_target_ids, dtype=torch.long),
-        )
+        w_ctx_t = torch.tensor(w_context_ids, dtype=torch.long)
+        w_know_t = torch.tensor(w_know_matrix, dtype=torch.long)
+        w_tgt_t = torch.tensor(w_target_ids, dtype=torch.long)
+
+        if self.return_domain_id:
+            domain_id = DOMAIN_TO_ID.get(domain, DOMAIN_TO_ID["general"])
+            return w_ctx_t, w_know_t, w_tgt_t, torch.tensor(domain_id, dtype=torch.long)
+
+        return w_ctx_t, w_know_t, w_tgt_t

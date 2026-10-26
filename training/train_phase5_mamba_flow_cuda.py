@@ -1,8 +1,11 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
+import math
 import glob
+import random
 import inspect
+from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,31 +19,102 @@ from training.core.char_tokenizer import CharTokenizer
 from training.data.dialogue_dataset import GenericPairDataset
 
 try:
-    from training.data.knowledge_dataset import MultiStreamKnowledgeDataset
+    from training.data.knowledge_dataset import (
+        MultiStreamKnowledgeDataset,
+        CANONICAL_DOMAINS,
+        DOMAIN_TO_ID,
+        ID_TO_DOMAIN,
+    )
 except ImportError:
-    try:
-        from training.data.knowledge_dataset_008 import MultiStreamKnowledgeDataset
-    except ImportError:
-        MultiStreamKnowledgeDataset = None
+    MultiStreamKnowledgeDataset = None
+    CANONICAL_DOMAINS = [
+        "grounded_instruct",
+        "code_api",
+        "classical_quote",
+        "encyclopedia_rag",
+        "math_rule",
+        "literature_lore",
+        "general",
+    ]
+    DOMAIN_TO_ID = {d: i for i, d in enumerate(CANONICAL_DOMAINS)}
+    ID_TO_DOMAIN = {i: d for i, d in enumerate(CANONICAL_DOMAINS)}
 
-try:
-    from model.flow_mamba import MultiStreamMambaPlanner, MambaReader
-except ImportError:
-    from model.flow_mamba_013 import MultiStreamMambaPlanner, MambaReader
+from model.flow_mamba import MultiStreamMambaPlanner, MambaReader
 
 from model.hippo_oracle import HiPPOOracleCUDA
 from model.flow_unet_cuda import FlowMatching1DUnet
-
-try:
-    from model.loss_mamba_cfm import mamba_cfm_loss
-except ImportError:
-    from model.loss_mamba_cfm_013 import mamba_cfm_loss
+from model.loss_mamba_cfm import mamba_cfm_loss
 
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 from torch.utils.data import DataLoader
+
+
+def get_warmup_cosine_scheduler(
+    optimizer: optim.Optimizer,
+    warmup_steps: int,
+    max_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> optim.lr_scheduler.LambdaLR:
+    """
+    Linear warmup from 0 -> 1 over `warmup_steps`, followed by cosine decay down to `min_lr_ratio`
+    at `max_steps` (and clamped at `min_lr_ratio` beyond `max_steps`).
+    """
+    warmup_steps = max(0, int(warmup_steps))
+    max_steps = max(1, int(max_steps))
+    min_lr_ratio = float(min_lr_ratio)
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        if current_step >= max_steps:
+            return min_lr_ratio
+        decay_steps = max(1, max_steps - warmup_steps)
+        progress = float(current_step - warmup_steps) / float(decay_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def select_fixed_benchmark_indices(dataset, seed: int = 42, max_domains: int = 6) -> List[Tuple[str, int]]:
+    """
+    Deterministically selects 1 representative sample index per available domain (up to `max_domains`)
+    using a fixed random seed (`42`) so qualitative ODE and validation comparisons are identical across runs.
+    """
+    rng = random.Random(seed)
+    domain_to_indices: Dict[str, List[int]] = {}
+
+    if hasattr(dataset, "samples") and isinstance(dataset.samples, list):
+        for idx, rec in enumerate(dataset.samples):
+            if isinstance(rec, tuple) and len(rec) >= 4:
+                dom = str(rec[3] or "general")
+                has_know = rec[2] is not None and len(rec[2]) > 0
+            else:
+                dom = "general"
+                has_know = False
+            domain_to_indices.setdefault(dom, []).append((idx, has_know))
+    else:
+        n = min(len(dataset), max_domains)
+        return [("general", i) for i in range(n)]
+
+    selected: List[Tuple[str, int]] = []
+    ordered_domains = [d for d in CANONICAL_DOMAINS if d in domain_to_indices]
+    for d in sorted(domain_to_indices.keys()):
+        if d not in ordered_domains:
+            ordered_domains.append(d)
+
+    for dom in ordered_domains[:max_domains]:
+        cands = domain_to_indices[dom]
+        with_know = [idx for idx, hk in cands if hk]
+        pool = with_know if with_know else [idx for idx, _ in cands]
+        chosen_idx = rng.choice(pool)
+        selected.append((dom, chosen_idx))
+
+    return selected
 
 
 def find_latest_unet_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
@@ -107,7 +181,6 @@ def find_compatible_mamba_ckpt(mamba, out_dir, prefix="phase5_mamba_flow", devic
             continue
 
         step = -1
-        # Extract global_step from dataloader json or step regex
         for file in os.listdir(d_path):
             if file.endswith(".json") and "dataloader" in file:
                 try:
@@ -196,14 +269,21 @@ def build_fixed_length_attractors(
     x_knowledge_norm: torch.Tensor = None,
     knowledge_mask: torch.Tensor = None,
     seq_len: int = 512,
-) -> torch.Tensor:
+    attractor_mode: str = "full",
+) -> Optional[torch.Tensor]:
     """
-    Builds a fixed-length (B, seq_len, D) attractor tensor matching Phase 4 FlowMatching1DUnet's
-    exact training distribution (`k_attractors = unet.normalize(x_prompt)` of length `seq_len=512`).
-    Places valid context tokens + active valid knowledge tokens into the front of a (B, seq_len, D)
-    buffer padded with normalized <PAD> embeddings from `x_context_norm` up to `seq_len`.
+    Builds a fixed-length (B, seq_len, D) attractor tensor for Phase 4 FlowMatching1DUnet:
+      - `attractor_mode == "none"`: returns `None`
+      - `attractor_mode == "prompt_only"`: only normalized prompt tokens matching Phase 4's exact training distribution
+      - `attractor_mode == "full"`: valid context tokens + active valid knowledge tokens padded to `seq_len`
     """
+    if attractor_mode == "none":
+        return None
+
     B, L_c, D = x_context_norm.shape
+    if attractor_mode == "prompt_only" and L_c == seq_len:
+        return x_context_norm
+
     pad_vec = x_context_norm[:, -1:, :].expand(B, seq_len, D).clone()
     attractor_buf = pad_vec.clone()
 
@@ -214,7 +294,7 @@ def build_fixed_length_attractors(
         else:
             pieces.append(x_context_norm[b])
 
-        if x_knowledge_norm is not None:
+        if attractor_mode == "full" and x_knowledge_norm is not None:
             if knowledge_mask is not None:
                 k_mask_b = knowledge_mask[b].bool()
                 if k_mask_b.any():
@@ -241,6 +321,7 @@ def sample_euler_ode(
     steps=10,
     seq_len=256,
     device='cuda',
+    attractor_mode: str = "full",
 ):
     """
     Closed-Loop Two-Stage Euler ODE Integrator:
@@ -248,12 +329,17 @@ def sample_euler_ode(
     - Stage 2 (`mamba.forward_canvas`) is called at each Euler step i in [0, steps-1] to dynamically
       articulate `h_potential(X_t, t)` and `v_mamba(X_t, t)` from the current trajectory state `x`,
       blending `v_pred = 0.8 * v_unet + 0.2 * v_mamba`.
-    - Gracefully falls back to static `h_potential` when `mamba` or `macro_state` is None.
+    - Respects `attractor_mode` in `{"full", "prompt_only", "none"}`.
     """
     B = x_prompt.shape[0]
     D = x_prompt.shape[-1]
-    if k_attractors_norm is None:
-        k_attractors_norm = unet.normalize(x_prompt)
+    if attractor_mode == "none":
+        k_attr_used = None
+    elif attractor_mode == "prompt_only":
+        k_attr_used = unet.normalize(x_prompt)
+    else:
+        k_attr_used = k_attractors_norm if k_attractors_norm is not None else unet.normalize(x_prompt)
+
     x = torch.randn((B, seq_len, D), device=device, dtype=x_prompt.dtype)
     dt = 1.0 / steps
     for i in range(steps):
@@ -261,12 +347,143 @@ def sample_euler_ode(
         t_tensor = torch.full((B,), t_val, device=device, dtype=torch.float32)
         if mamba is not None and macro_state is not None:
             h_pot_t, v_mamba = mamba.forward_canvas(x, t_tensor, macro_state, return_velocity=True)
-            v_unet = unet(x, t_tensor, h_potential=h_pot_t, k_attractors=k_attractors_norm)
+            v_unet = unet(x, t_tensor, h_potential=h_pot_t, k_attractors=k_attr_used)
             v_pred = 0.8 * v_unet + 0.2 * v_mamba
         else:
-            v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=k_attractors_norm)
+            v_pred = unet(x, t_tensor, h_potential=h_potential, k_attractors=k_attr_used)
         x = x + v_pred * dt
     return unet.denormalize(x)
+
+
+@torch.no_grad()
+def run_attractor_ablation_benchmark(
+    mamba,
+    unet,
+    encoder,
+    hippo_oracle,
+    translator,
+    tokenizer,
+    dataset,
+    benchmark_samples: List[Tuple[str, int]],
+    args,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+):
+    """
+    Runs fixed cross-domain benchmark samples under all 3 attractor modes (`full`, `prompt_only`, `none`),
+    prints a side-by-side comparison table of `||x_gen - h_potential||`, `||x_gen - x_target||`,
+    and decoded text for each mode.
+    """
+    mamba.eval()
+    unet.eval()
+    print("\n" + "=" * 88)
+    print("🔬 [Attractor Mode Ablation Benchmark] Comparing 'full' vs 'prompt_only' vs 'none'")
+    print("=" * 88)
+
+    for dom_name, sample_idx in benchmark_samples:
+        item = dataset[sample_idx]
+        if len(item) >= 3:
+            w_t, w_know, w_tgt = item[0], item[1], item[2]
+            w_know = w_know.unsqueeze(0).to(device)
+        else:
+            w_t, w_tgt = item[0], item[1]
+            w_know = None
+
+        w_t = w_t.unsqueeze(0).to(device)
+        w_tgt = w_tgt.unsqueeze(0).to(device)
+        ctx_mask = (w_t != tokenizer.pad_token_id)
+        tgt_mask = (w_tgt != tokenizer.pad_token_id)
+
+        x_ctx = encode_tokens(encoder, w_t)
+        x_tgt = encode_tokens(encoder, w_tgt)
+        if w_know is not None:
+            x_know, know_mask = encode_knowledge_streams(encoder, w_know, tokenizer.pad_token_id)
+        else:
+            x_know, know_mask = None, None
+
+        if int(unet.calib_steps.item()) == 0:
+            unet.calibrate_manifold(x_tgt, valid_mask=tgt_mask)
+
+        x_ctx_norm = unet.normalize(x_ctx)
+        x_tgt_norm = unet.normalize(x_tgt)
+        x_know_norm = unet.normalize(x_know) if x_know is not None else None
+        h_target = hippo_oracle(x_tgt_norm, return_sequence=True)
+
+        prompt_str = tokenizer.decode(w_t[0].tolist(), skip_special_tokens=True)
+        know_texts = []
+        if w_know is not None:
+            for m_i in range(w_know.shape[1]):
+                m_ids = w_know[0, m_i].tolist()
+                if any(tid != tokenizer.pad_token_id for tid in m_ids):
+                    know_texts.append(tokenizer.decode(m_ids, skip_special_tokens=True))
+        know_summary = " | ".join(know_texts) if know_texts else "<None>"
+        ref_text = (
+            decode_with_eos_marker(tokenizer, translator.decode_greedy(x_tgt.float())[0].tolist())
+            if translator is not None
+            else tokenizer.decode(w_tgt[0].tolist(), skip_special_tokens=True)
+        )
+
+        print(f"\n📌 Domain: [{dom_name}] (Sample #{sample_idx})")
+        print(f"   Prompt:    {prompt_str[:120]}")
+        print(f"   Knowledge: {know_summary[:140]}")
+        print(f"   Target:    {ref_text[:140]}")
+        print(f"   {'Mode':<14} | {'||x_gen_norm - h_pot||':<22} | {'||x_gen_norm - h_tgt||':<22} | Generated Preview")
+        print("   " + "-" * 84)
+
+        for mode in ["full", "prompt_only", "none"]:
+            torch.manual_seed(42)
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                macro_state = mamba.encode_macro(
+                    x_context=x_ctx_norm,
+                    valid_mask=ctx_mask,
+                    x_knowledge=x_know_norm,
+                    knowledge_mask=know_mask,
+                    target_len=args.seq_len,
+                    rho_override=args.verbosity_rho,
+                )
+                h_pot_final, _ = mamba.forward_canvas(
+                    h_target,
+                    torch.ones((1,), device=device, dtype=torch.float32),
+                    macro_state,
+                    return_velocity=True,
+                )
+                k_attr = build_fixed_length_attractors(
+                    x_context_norm=x_ctx_norm,
+                    context_mask=ctx_mask,
+                    x_knowledge_norm=x_know_norm,
+                    knowledge_mask=know_mask,
+                    seq_len=args.seq_len,
+                    attractor_mode=mode,
+                )
+                x_gen = sample_euler_ode(
+                    unet=unet,
+                    x_prompt=x_ctx,
+                    h_potential=macro_state["h_macro_potential"],
+                    k_attractors_norm=k_attr,
+                    mamba=mamba,
+                    macro_state=macro_state,
+                    steps=args.euler_steps,
+                    seq_len=args.seq_len,
+                    device=device,
+                    attractor_mode=mode,
+                )
+
+            x_gen_norm = unet.normalize(x_gen.float())
+            valid_f = tgt_mask.float().unsqueeze(-1)
+            denom = (valid_f.sum() * x_gen_norm.shape[-1]).clamp(min=1.0)
+            dist_pot = torch.sqrt(((x_gen_norm - h_pot_final.float()) ** 2 * valid_f).sum() / denom).item()
+            dist_tgt = torch.sqrt(((x_gen_norm - h_target.float()) ** 2 * valid_f).sum() / denom).item()
+
+            if translator is not None:
+                gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
+                gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
+            else:
+                gen_text = "<Translator not loaded>"
+
+            print(f"   {mode:<14} | {dist_pot:<22.4f} | {dist_tgt:<22.4f} | {gen_text[:80]}")
+
+    print("=" * 88 + "\n")
 
 
 def train():
@@ -297,7 +514,22 @@ def train():
     parser.add_argument("--know_drop_prob", type=float, default=0.15, help="Curriculum knowledge stream dropout probability during training")
     parser.add_argument("--verbosity_rho", type=float, default=None, help="Optional float in (0, 1] for manual verbosity control during evaluation")
     parser.add_argument("--auto_resume", dest="auto_resume", action="store_true", help="Automatically find and resume from the latest checkpoint (alias for --continue)")
-    parser.set_defaults(ckpt_prefix="phase5_mamba_flow", batch_size=64, save_steps=1000)
+    parser.add_argument("--max_steps", type=int, default=50000, help="Cosine LR decay horizon (if > 0, else epochs * len(dataloader))")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Minimum LR ratio at end of cosine decay as fraction of --lr")
+    parser.add_argument("--ema_decay", type=float, default=0.98, help="EMA smoothing factor for training logs")
+    parser.add_argument(
+        "--attractor_mode",
+        type=str,
+        default="full",
+        choices=["full", "prompt_only", "none"],
+        help="Controls k_attractors passed to Phase 4 unet during Euler ODE sampling",
+    )
+    parser.add_argument(
+        "--run_attractor_ablation",
+        action="store_true",
+        help="Run fixed cross-domain benchmark under all 3 attractor modes (full, prompt_only, none) and exit",
+    )
+    parser.set_defaults(ckpt_prefix="phase5_mamba_flow", batch_size=64, save_steps=1000, warmup_steps=1000)
 
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -330,9 +562,10 @@ def train():
 
     tokenizer = CharTokenizer()
 
-    # 1. Dataset Selection (Multi-Stream Knowledge Dataset with graceful fallback)
+    # 1. Dataset Selection (Multi-Stream Knowledge Dataset with return_domain_id=True)
     if MultiStreamKnowledgeDataset is not None and not args.disable_multistream:
-        dataset = MultiStreamKnowledgeDataset(
+        sig = inspect.signature(MultiStreamKnowledgeDataset.__init__)
+        ds_kwargs = dict(
             data_path=args.data_path,
             tokenizer=tokenizer,
             seq_len=args.seq_len,
@@ -344,6 +577,9 @@ def train():
             min_target_len=args.min_target_len,
             verbose=True,
         )
+        if "return_domain_id" in sig.parameters:
+            ds_kwargs["return_domain_id"] = True
+        dataset = MultiStreamKnowledgeDataset(**ds_kwargs)
     else:
         if not args.disable_multistream:
             print("⚠️ MultiStreamKnowledgeDataset not found; falling back to GenericPairDataset.")
@@ -358,6 +594,12 @@ def train():
             verbose=True,
         )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    # Select fixed cross-domain benchmark samples once (deterministic seed 42)
+    fixed_benchmark_samples = select_fixed_benchmark_indices(dataset, seed=42, max_domains=6)
+    if fixed_benchmark_samples:
+        bench_desc = ", ".join(f"{dom}:#{idx}" for dom, idx in fixed_benchmark_samples)
+        print(f"📌 Fixed Cross-Domain Benchmark Samples (seed=42): {bench_desc}")
 
     # 2. Phase 1 Encoder (Frozen Continuous Geometric Mapper)
     encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
@@ -424,18 +666,30 @@ def train():
     ).to(device)
     optimizer = optim.AdamW(mamba.parameters(), lr=args.lr)
 
+    total_horizon_steps = args.max_steps if args.max_steps > 0 else max(1, args.epochs * len(dataloader))
+    scheduler = get_warmup_cosine_scheduler(
+        optimizer=optimizer,
+        warmup_steps=args.warmup_steps,
+        max_steps=total_horizon_steps,
+        min_lr_ratio=args.min_lr_ratio,
+    )
+
     checkpointer = Checkpointer(out_dir=args.out_dir, prefix=args.ckpt_prefix, keep_last_k=args.keep_last_k)
     checkpointer.register_model("mamba", mamba)
     checkpointer.register_optimizer("engine_opt", optimizer)
+    checkpointer.register_optimizer("lr_sched", scheduler)
     checkpointer.register_args(args)
 
-    if args.auto_resume:
-        compat_path, compat_step = find_compatible_mamba_ckpt(
-            mamba=mamba,
-            out_dir=args.out_dir,
-            prefix=args.ckpt_prefix,
-            device=device,
-        )
+    if args.auto_resume or args.resume_from:
+        if args.resume_from and os.path.isdir(args.resume_from):
+            compat_path, compat_step = args.resume_from, 0
+        else:
+            compat_path, compat_step = find_compatible_mamba_ckpt(
+                mamba=mamba,
+                out_dir=args.out_dir,
+                prefix=args.ckpt_prefix,
+                device=device,
+            )
         if compat_path:
             try:
                 loaded_step = checkpointer.load(compat_path)
@@ -444,6 +698,10 @@ def train():
                     checkpointer.set_step(global_step)
                 else:
                     checkpointer.current_step = global_step
+                # Ensure scheduler is synchronized with global_step even if lr_sched.pt didn't exist in older checkpoints
+                sched_file = os.path.join(compat_path, "lr_sched.pt")
+                if not os.path.exists(sched_file) and global_step > 0:
+                    scheduler.step(global_step)
                 print(f"✅ Successfully resumed training from step {global_step} ({compat_path})")
             except Exception as e:
                 print(f"⚠️ Error loading checkpoint state ({e}). Starting fresh from step 0!")
@@ -453,7 +711,14 @@ def train():
                 else:
                     checkpointer.current_step = 0
                 optimizer = optim.AdamW(mamba.parameters(), lr=args.lr)
+                scheduler = get_warmup_cosine_scheduler(
+                    optimizer=optimizer,
+                    warmup_steps=args.warmup_steps,
+                    max_steps=total_horizon_steps,
+                    min_lr_ratio=args.min_lr_ratio,
+                )
                 checkpointer.register_optimizer("engine_opt", optimizer)
+                checkpointer.register_optimizer("lr_sched", scheduler)
         else:
             print(f"ℹ️ No compatible checkpoints found in '{args.out_dir}'. Starting fresh from step 0!")
             global_step = 0
@@ -467,21 +732,72 @@ def train():
             checkpointer.set_step(0)
         else:
             checkpointer.current_step = 0
+
+    if args.run_attractor_ablation:
+        run_attractor_ablation_benchmark(
+            mamba=mamba,
+            unet=unet,
+            encoder=encoder,
+            hippo_oracle=hippo_oracle,
+            translator=translator,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            benchmark_samples=fixed_benchmark_samples,
+            args=args,
+            device=device,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
+        return
+
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
         f"🚀 Starting Phase 5 Closed-Loop Multi-Stream Mamba Planner Training "
-        f"(Layers={args.mamba_layers}, Beats={args.num_beats}, MaxKnowStreams={args.max_know_streams})..."
+        f"(Layers={args.mamba_layers}, Beats={args.num_beats}, MaxKnowStreams={args.max_know_streams}, "
+        f"Warmup={args.warmup_steps}, MaxSteps={total_horizon_steps}, AttractorMode={args.attractor_mode})..."
     )
 
     optimizer.zero_grad(set_to_none=True)
+
+    # EMA & 50-step Window Accumulators
+    ema_state: Dict[str, Optional[float]] = {
+        "total": None,
+        "pot": None,
+        "pot_raw": None,
+        "cfm": None,
+        "macro": None,
+        "len": None,
+        "copy_prob": None,
+    }
+    alpha_ema = float(args.ema_decay)
+
+    def _update_ema(key: str, val: float) -> float:
+        if math.isnan(val) or math.isinf(val):
+            return ema_state[key] if ema_state[key] is not None else 0.0
+        if ema_state[key] is None:
+            ema_state[key] = val
+        else:
+            ema_state[key] = alpha_ema * ema_state[key] + (1.0 - alpha_ema) * val
+        return ema_state[key]
+
+    win_bucket_sum = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    win_bucket_cnt = {"low": 0, "mid": 0, "high": 0}
+    win_domain_sum: Dict[int, float] = {}
+    win_domain_cnt: Dict[int, int] = {}
+    eval_rotation_counter = 0
 
     for epoch in range(start_epoch, args.epochs):
         resumed_loader = checkpointer.wrap_dataloader(dataloader, epoch, global_step)
         mamba.train()
 
         for batch_idx, batch_data in enumerate(resumed_loader):
-            if len(batch_data) == 3:
+            domain_ids = None
+            if len(batch_data) == 4:
+                w_t, w_know, w_tgt, domain_ids = batch_data
+                w_know = w_know.to(device)
+                domain_ids = domain_ids.to(device)
+            elif len(batch_data) == 3:
                 w_t, w_know, w_tgt = batch_data
                 w_know = w_know.to(device)
             else:
@@ -568,105 +884,244 @@ def train():
                     torch.nn.utils.clip_grad_norm_(mamba.parameters(), 1.0)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
 
             global_step += 1
             if hasattr(checkpointer, "set_step"):
                 checkpointer.set_step(global_step)
             else:
                 checkpointer.current_step = global_step
+
+            # Update EMA and Window Trackers
+            raw_total = loss.item()
+            raw_pot = metrics["loss_potential"].item()
+            raw_pot_unweighted = (
+                metrics["loss_potential_raw"].item()
+                if "loss_potential_raw" in metrics
+                else raw_pot
+            )
+            raw_cfm = metrics["loss_cfm"].item() if "loss_cfm" in metrics else 0.0
+            raw_macro = metrics["loss_macro"].item() if "loss_macro" in metrics else 0.0
+            raw_len = metrics["loss_len"].item() if "loss_len" in metrics else 0.0
+            raw_copy = metrics["copy_prob_mean"].item() if "copy_prob_mean" in metrics else 0.0
+
+            ema_total = _update_ema("total", raw_total)
+            ema_pot = _update_ema("pot", raw_pot)
+            ema_pot_raw = _update_ema("pot_raw", raw_pot_unweighted)
+            ema_cfm = _update_ema("cfm", raw_cfm)
+            ema_macro = _update_ema("macro", raw_macro)
+            ema_len = _update_ema("len", raw_len)
+            ema_copy = _update_ema("copy_prob", raw_copy)
+
+            for b_key, m_key in [("low", "pot_t_low"), ("mid", "pot_t_mid"), ("high", "pot_t_high")]:
+                if m_key in metrics:
+                    v = metrics[m_key].item()
+                    if not math.isnan(v) and v >= 0.0:
+                        win_bucket_sum[b_key] += v
+                        win_bucket_cnt[b_key] += 1
+
+            if domain_ids is not None and "per_sample_pot" in metrics:
+                ps_pot = metrics["per_sample_pot"].detach().cpu().tolist()
+                dom_list = domain_ids.detach().cpu().tolist()
+                for d_id, p_val in zip(dom_list, ps_pot):
+                    win_domain_sum[d_id] = win_domain_sum.get(d_id, 0.0) + float(p_val)
+                    win_domain_cnt[d_id] = win_domain_cnt.get(d_id, 0) + 1
+
             if global_step % 50 == 0:
                 scale_factor = 1.0 / unet.manifold_std.item()
-                cfm_val = metrics["loss_cfm"].item() if "loss_cfm" in metrics else 0.0
-                macro_val = metrics["loss_macro"].item() if "loss_macro" in metrics else 0.0
+                cur_lr = optimizer.param_groups[0]["lr"]
+
+                def _fmt_bucket(k: str) -> str:
+                    if win_bucket_cnt[k] > 0:
+                        return f"{win_bucket_sum[k] / win_bucket_cnt[k]:.4f}"
+                    return "n/a"
+
                 print(
-                    f"Epoch {epoch+1} | Step {global_step} | "
-                    f"Total Loss: {loss.item():.4f} (Pot: {metrics['loss_potential'].item():.4f}, "
-                    f"CFM: {cfm_val:.4f}, Macro: {macro_val:.4f}, "
-                    f"Len: {metrics['loss_len'].item():.4f}, "
-                    f"Rho: {metrics['rho_pred_mean'].item():.2f}/{metrics['rho_true_mean'].item():.2f}) | "
+                    f"Epoch {epoch+1} | Step {global_step} | LR: {cur_lr:.2e} | "
+                    f"EMA Loss: {ema_total:.4f} (Raw: {raw_total:.4f}) | "
+                    f"Pot(t²): {ema_pot:.4f} (Raw: {ema_pot_raw:.4f}) | "
+                    f"CFM: {ema_cfm:.4f} | Macro: {ema_macro:.4f} | "
+                    f"Len: {ema_len:.4f} | CopyProb: {ema_copy:.3f} | "
+                    f"Rho: {metrics['rho_pred_mean'].item():.2f}/{metrics['rho_true_mean'].item():.2f} | "
                     f"Scale: {scale_factor:.2f}x"
                 )
+                print(
+                    f"   ├─ t-Buckets Pot MSE: t<0.3: {_fmt_bucket('low')} | "
+                    f"0.3≤t<0.7: {_fmt_bucket('mid')} | "
+                    f"t≥0.7: {_fmt_bucket('high')}"
+                )
+                if win_domain_cnt:
+                    dom_parts = []
+                    for d_id in sorted(win_domain_cnt.keys()):
+                        d_name = ID_TO_DOMAIN.get(d_id, f"dom_{d_id}")
+                        d_mean = win_domain_sum[d_id] / max(1, win_domain_cnt[d_id])
+                        dom_parts.append(f"{d_name}: {d_mean:.4f}")
+                    print(f"   └─ Domain Pot MSE:    {' | '.join(dom_parts)}")
 
-            # Periodic Dual-Brain Closed-Loop End-to-End Qualitative Evaluation
-            if translator is not None and unet is not None and (global_step == 50 or global_step % args.eval_interval == 0):
+                # Reset 50-step window accumulators
+                win_bucket_sum = {"low": 0.0, "mid": 0.0, "high": 0.0}
+                win_bucket_cnt = {"low": 0, "mid": 0, "high": 0}
+                win_domain_sum.clear()
+                win_domain_cnt.clear()
+
+            # Periodic Dual-Brain Closed-Loop End-to-End Fixed Cross-Domain Evaluation
+            if unet is not None and (global_step == 50 or global_step % args.eval_interval == 0):
                 mamba.eval()
                 with torch.no_grad():
-                    p_sample = x_context[:1]
-                    p_mask_sample = context_mask[:1]
-                    tgt_sample = x_target[:1]
+                    # 1. Compute mean validation pot_mse and copy_prob across fixed cross-domain benchmark samples
+                    val_pot_list = []
+                    val_copy_list = []
+                    bench_records = []
 
-                    x_context_norm = unet.normalize(p_sample)
-                    if x_knowledge is not None:
-                        k_sample = x_knowledge[:1]
-                        k_mask_sample = knowledge_mask[:1]
-                        x_knowledge_norm = unet.normalize(k_sample)
-                    else:
-                        x_knowledge_norm = None
-                        k_mask_sample = None
+                    for dom_name, s_idx in fixed_benchmark_samples:
+                        s_item = dataset[s_idx]
+                        if len(s_item) >= 3:
+                            b_wt, b_wknow, b_wtgt = s_item[0], s_item[1], s_item[2]
+                            b_wknow = b_wknow.unsqueeze(0).to(device)
+                        else:
+                            b_wt, b_wtgt = s_item[0], s_item[1]
+                            b_wknow = None
 
-                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        # Stage 1: Encode Macro Narrative Beats ONCE per dialogue turn
-                        macro_state = mamba.encode_macro(
-                            x_context=x_context_norm,
-                            valid_mask=p_mask_sample,
-                            x_knowledge=x_knowledge_norm,
-                            knowledge_mask=k_mask_sample,
-                            target_len=args.seq_len,
-                            rho_override=args.verbosity_rho,
-                        )
-                        eval_aux = macro_state["aux_dict"]
-                        h_potential = macro_state["h_macro_potential"]
+                        b_wt = b_wt.unsqueeze(0).to(device)
+                        b_wtgt = b_wtgt.unsqueeze(0).to(device)
+                        b_ctx_mask = (b_wt != tokenizer.pad_token_id)
+                        b_tgt_mask = (b_wtgt != tokenizer.pad_token_id)
 
-                        # Build fixed-length (1, seq_len, D) attractors matching Phase 4 Unet's training distribution
-                        k_attractors_norm = build_fixed_length_attractors(
-                            x_context_norm=x_context_norm,
-                            context_mask=p_mask_sample,
-                            x_knowledge_norm=x_knowledge_norm,
-                            knowledge_mask=k_mask_sample,
-                            seq_len=args.seq_len,
-                        )
+                        b_x_ctx = encode_tokens(encoder, b_wt)
+                        b_x_tgt = encode_tokens(encoder, b_wtgt)
+                        if b_wknow is not None:
+                            b_x_know, b_know_mask = encode_knowledge_streams(
+                                encoder, b_wknow, tokenizer.pad_token_id
+                            )
+                        else:
+                            b_x_know, b_know_mask = None, None
 
-                        # Stage 2: Closed-Loop Euler ODE Integration with dynamic mamba.forward_canvas(x_t, t)
-                        x_gen = sample_euler_ode(
-                            unet=unet,
-                            x_prompt=p_sample,
-                            h_potential=h_potential,
-                            k_attractors_norm=k_attractors_norm,
-                            mamba=mamba,
-                            macro_state=macro_state,
-                            steps=args.euler_steps,
-                            seq_len=args.seq_len,
-                            device=device,
-                        )
+                        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            _, b_metrics = mamba_cfm_loss(
+                                mamba=mamba,
+                                hippo_oracle=hippo_oracle,
+                                x_context=b_x_ctx,
+                                x_target=b_x_tgt,
+                                unet=unet,
+                                context_mask=b_ctx_mask,
+                                target_mask=b_tgt_mask,
+                                x_knowledge=b_x_know,
+                                knowledge_mask=b_know_mask,
+                                pad_loss_weight=args.pad_loss_weight,
+                                know_drop_prob=0.0,
+                                verbosity_hint_prob=0.0,
+                                t=torch.tensor([0.75], device=device, dtype=torch.float32),
+                                return_sequence=True,
+                                return_metrics=True,
+                            )
+                        val_pot_list.append(b_metrics["loss_potential_raw"].item())
+                        val_copy_list.append(b_metrics["copy_prob_mean"].item())
+                        bench_records.append((
+                            dom_name, s_idx, b_wt, b_wknow, b_wtgt,
+                            b_ctx_mask, b_tgt_mask, b_x_ctx, b_x_tgt, b_x_know, b_know_mask
+                        ))
 
-                    gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
-                    gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
+                    mean_val_pot = sum(val_pot_list) / max(1, len(val_pot_list))
+                    mean_val_copy = sum(val_copy_list) / max(1, len(val_copy_list))
 
-                    ref_tokens = translator.decode_greedy(tgt_sample.float())[0].tolist()
-                    ref_text = decode_with_eos_marker(tokenizer, ref_tokens)
+                    print("\n" + "=" * 72)
+                    print(
+                        f"🧠 [Step {global_step}] Fixed Cross-Domain Benchmark "
+                        f"(Val Pot MSE @ t=0.75: {mean_val_pot:.4f} | Val CopyProb: {mean_val_copy:.3f} | "
+                        f"AttractorMode: {args.attractor_mode})"
+                    )
 
-                    prompt_text = tokenizer.decode(w_t[0].tolist(), skip_special_tokens=True)
+                    # Pick up to 2 samples for Euler ODE generation: anchor domain (code_api / grounded_instruct) + 1 rotating domain
+                    if translator is not None and bench_records:
+                        ode_indices = [0]
+                        for i_r, rec_r in enumerate(bench_records):
+                            if rec_r[0] in ("code_api", "grounded_instruct"):
+                                ode_indices[0] = i_r
+                                break
+                        if len(bench_records) > 1:
+                            rot_idx = eval_rotation_counter % len(bench_records)
+                            if rot_idx == ode_indices[0]:
+                                rot_idx = (rot_idx + 1) % len(bench_records)
+                            ode_indices.append(rot_idx)
+                        eval_rotation_counter += 1
 
-                    know_texts = []
-                    if w_know is not None:
-                        for m_idx in range(w_know.shape[1]):
-                            m_ids = w_know[0, m_idx].tolist()
-                            if any(tid != tokenizer.pad_token_id for tid in m_ids):
-                                know_texts.append(tokenizer.decode(m_ids, skip_special_tokens=True))
-                    know_summary = " | ".join(know_texts) if know_texts else "<None>"
+                        for sel_i in ode_indices:
+                            (
+                                dom_name, s_idx, b_wt, b_wknow, b_wtgt,
+                                b_ctx_mask, b_tgt_mask, b_x_ctx, b_x_tgt, b_x_know, b_know_mask
+                            ) = bench_records[sel_i]
 
-                    rho_pred_val = eval_aux["rho_pred"][0].item()
-                    rho_used_val = eval_aux["rho_used"][0].item()
-                    est_chars = int(round(rho_used_val * args.seq_len))
+                            x_context_norm = unet.normalize(b_x_ctx)
+                            x_knowledge_norm = unet.normalize(b_x_know) if b_x_know is not None else None
 
-                    print("\n" + "="*60)
-                    print(f"🧠 [Step {global_step}] Phase 5 Closed-Loop Dual-Brain Euler ODE Test ({args.euler_steps} steps)")
-                    print(f"Prompt:                      {prompt_text}")
-                    print(f"Knowledge Streams (Active):  {know_summary}")
-                    print(f"Pred Verbosity (rho -> len): rho_pred={rho_pred_val:.2f} (used={rho_used_val:.2f} -> ~{est_chars} chars)")
-                    print(f"Target:                      {ref_text}")
-                    print(f"Mamba+Unet Generated:        {gen_text}")
-                    print("="*60 + "\n")
+                            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                                macro_state = mamba.encode_macro(
+                                    x_context=x_context_norm,
+                                    valid_mask=b_ctx_mask,
+                                    x_knowledge=x_knowledge_norm,
+                                    knowledge_mask=b_know_mask,
+                                    target_len=args.seq_len,
+                                    rho_override=args.verbosity_rho,
+                                )
+                                eval_aux = macro_state["aux_dict"]
+                                h_potential = macro_state["h_macro_potential"]
+
+                                k_attractors_norm = build_fixed_length_attractors(
+                                    x_context_norm=x_context_norm,
+                                    context_mask=b_ctx_mask,
+                                    x_knowledge_norm=x_knowledge_norm,
+                                    knowledge_mask=b_know_mask,
+                                    seq_len=args.seq_len,
+                                    attractor_mode=args.attractor_mode,
+                                )
+
+                                x_gen = sample_euler_ode(
+                                    unet=unet,
+                                    x_prompt=b_x_ctx,
+                                    h_potential=h_potential,
+                                    k_attractors_norm=k_attractors_norm,
+                                    mamba=mamba,
+                                    macro_state=macro_state,
+                                    steps=args.euler_steps,
+                                    seq_len=args.seq_len,
+                                    device=device,
+                                    attractor_mode=args.attractor_mode,
+                                )
+
+                            gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
+                            gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
+
+                            ref_tokens = translator.decode_greedy(b_x_tgt.float())[0].tolist()
+                            ref_text = decode_with_eos_marker(tokenizer, ref_tokens)
+
+                            prompt_text = tokenizer.decode(b_wt[0].tolist(), skip_special_tokens=True)
+
+                            know_texts = []
+                            if b_wknow is not None:
+                                for m_idx in range(b_wknow.shape[1]):
+                                    m_ids = b_wknow[0, m_idx].tolist()
+                                    if any(tid != tokenizer.pad_token_id for tid in m_ids):
+                                        know_texts.append(tokenizer.decode(m_ids, skip_special_tokens=True))
+                            know_summary = " | ".join(know_texts) if know_texts else "<None>"
+
+                            rho_pred_val = eval_aux["rho_pred"][0].item()
+                            rho_used_val = eval_aux["rho_used"][0].item()
+                            copy_prob_val = (
+                                eval_aux["copy_prob"][0].item()
+                                if "copy_prob" in eval_aux
+                                else 0.0
+                            )
+                            est_chars = int(round(rho_used_val * args.seq_len))
+
+                            print("-" * 72)
+                            print(f"Domain [{dom_name}] (Sample #{s_idx}) | CopyProb: {copy_prob_val:.3f}")
+                            print(f"Prompt:                      {prompt_text}")
+                            print(f"Knowledge Streams (Active):  {know_summary}")
+                            print(f"Pred Verbosity (rho -> len): rho_pred={rho_pred_val:.2f} (used={rho_used_val:.2f} -> ~{est_chars} chars)")
+                            print(f"Target:                      {ref_text}")
+                            print(f"Mamba+Unet Generated:        {gen_text}")
+
+                    print("=" * 72 + "\n")
 
                 mamba.train()
                 if torch.cuda.is_available():

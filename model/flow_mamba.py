@@ -267,6 +267,133 @@ class OrthogonalKnowledgeResonance(nn.Module):
         return out
 
 
+class CopyPointerHead(nn.Module):
+    """
+    Lightweight Low-Rank Copy Pointer Head for Canvas Layers (No Auxiliary CE, No Value Projection):
+      - Low-rank addressing in R^{d_ptr} (d_ptr = 64) with depthwise 3-gram local context on keys (`key_conv`)
+        so multi-character entities (e.g. `table_name_43`, `toronto`, equations) carry local n-gram signatures.
+      - Learnable "no-copy" sink slot (`sink_key`, `sink_bias = 1.5`) so non-copying is the default when no
+        knowledge token matches, preserving strict zero-pollution when k_tokens is empty or all masked.
+      - Identity Value Transport (`torch.bmm(p_copy, k_val_masked)` with NO `v_proj` matrix):
+        Directly transports pure normalized Phase 1 token embeddings onto `h_potential` via convex
+        pointer-generator interpolation `(1 - alpha) * h_canvas + alpha * copied_vec` where
+        `alpha = sigmoid(out_gate) * (1 - p_sink)`.
+    """
+    def __init__(self, d_model: int = 1024, d_ptr: int = 64):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ptr = d_ptr
+
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_k = nn.LayerNorm(d_model)
+        self.key_conv = nn.Conv1d(
+            d_model,
+            d_model,
+            kernel_size=3,
+            padding=1,
+            groups=d_model,
+            bias=False,
+        )
+        # Initialize depthwise conv with small normal weights so local 3-gram context is gentle at step 0
+        nn.init.normal_(self.key_conv.weight, mean=0.0, std=0.05)
+
+        self.q_proj = nn.Linear(d_model, d_ptr, bias=False)
+        self.k_proj = nn.Linear(d_model, d_ptr, bias=False)
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+
+        self.sink_key = nn.Parameter(torch.zeros(1, 1, d_ptr))
+        self.sink_bias = nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
+        self.log_scale = nn.Parameter(
+            torch.tensor(math.log(1.0 / math.sqrt(d_ptr)), dtype=torch.float32)
+        )
+        self.out_gate = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+
+    def forward(
+        self,
+        h_canvas: torch.Tensor,
+        k_tokens: Optional[torch.Tensor],
+        k_mask: Optional[torch.Tensor] = None,
+        k_val: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L_q, D = h_canvas.shape
+        device = h_canvas.device
+        dtype = h_canvas.dtype
+
+        if k_tokens is None or k_tokens.shape[1] == 0:
+            return h_canvas, torch.zeros(B, device=device, dtype=torch.float32)
+
+        if k_tokens.dim() == 4:
+            _, M, L_k_sub, _ = k_tokens.shape
+            L_k = M * L_k_sub
+            k_tokens = k_tokens.reshape(B, L_k, D)
+            if k_val is not None and k_val.dim() == 4:
+                k_val = k_val.reshape(B, L_k, D)
+            if k_mask is not None and k_mask.dim() == 3:
+                k_mask = k_mask.reshape(B, L_k)
+        else:
+            L_k = k_tokens.shape[1]
+
+        if k_mask is not None:
+            k_mask_bool = k_mask.bool()
+            if not k_mask_bool.any():
+                return h_canvas, torch.zeros(B, device=device, dtype=torch.float32)
+            mask_f = k_mask_bool.unsqueeze(-1).to(dtype=dtype)
+            has_any = k_mask_bool.any(dim=1).view(B, 1, 1).to(dtype=dtype)
+        else:
+            k_mask_bool = None
+            mask_f = torch.ones((B, L_k, 1), device=device, dtype=dtype)
+            has_any = torch.ones((B, 1, 1), device=device, dtype=dtype)
+
+        k_key_masked = k_tokens.to(dtype=dtype) * mask_f
+        k_val_source = k_val.to(dtype=dtype) if k_val is not None else k_tokens.to(dtype=dtype)
+        k_val_masked = k_val_source * mask_f
+
+        # Local 3-gram context keys via depthwise 1D conv
+        k_conv = self.key_conv(k_key_masked.transpose(1, 2)).transpose(1, 2) * mask_f
+        k_local = k_key_masked + 0.5 * k_conv
+
+        # Low-rank queries and keys: (B, L_q, d_ptr) and (B, L_k, d_ptr)
+        q = self.q_proj(self.norm_q(h_canvas))
+        k = self.k_proj(self.norm_k(k_local)) * mask_f
+
+        min_scale = 1.0 / math.sqrt(self.d_ptr)
+        scale = self.log_scale.exp().clamp(min=min_scale, max=20.0).to(dtype=q.dtype)
+        logits_k = torch.bmm(q, k.transpose(1, 2)) * scale  # (B, L_q, L_k)
+
+        if k_mask_bool is not None:
+            logits_k = logits_k.masked_fill(~k_mask_bool.unsqueeze(1), -1e4)
+            active_count = k_mask_bool.float().sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1.0)  # (B, 1, 1)
+        else:
+            active_count = torch.tensor(float(max(L_k, 1)), device=device, dtype=torch.float32).view(1, 1, 1)
+        log_active = torch.log(active_count).to(dtype=q.dtype)
+
+        sink_k = self.sink_key.to(dtype=q.dtype).expand(B, -1, -1)  # (B, 1, d_ptr)
+        logit_sink = (
+            torch.bmm(q, sink_k.transpose(1, 2)) * scale
+            + self.sink_bias.to(dtype=q.dtype)
+            + log_active
+        )  # (B, L_q, 1)
+
+        logits_all = torch.cat([logit_sink, logits_k], dim=-1)  # (B, L_q, 1 + L_k)
+        probs = F.softmax(logits_all.float(), dim=-1).to(dtype=dtype)
+
+        p_sink = probs[:, :, :1]                  # (B, L_q, 1)
+        p_copy = probs[:, :, 1:] * has_any        # (B, L_q, L_k)
+
+        # Identity Value Transport (NO v_proj): directly transport pure Phase 1 manifold vectors
+        copied_vec = torch.bmm(p_copy, k_val_masked)  # (B, L_q, D)
+
+        copy_prob = (1.0 - p_sink) * has_any  # (B, L_q, 1)
+        g = torch.sigmoid(self.out_gate).to(dtype=dtype)
+        alpha = g * copy_prob  # (B, L_q, 1)
+
+        # Convex pointer-generator interpolation: preserves exact manifold scale and strict zero-pollution
+        h_out = (1.0 - alpha) * h_canvas + alpha * copied_vec
+        copy_prob_mean = copy_prob.squeeze(-1).float().mean(dim=-1)  # (B,)
+        return h_out, copy_prob_mean
+
+
 class TimeWarpedLegendreExpander(nn.Module):
     """
     Expands K_beats (e.g., 32) macroscopic narrative beats into a full-resolution 3D canvas
@@ -507,7 +634,8 @@ class MultiStreamMambaPlanner(nn.Module):
        Injects strictly 1-step right-shifted causal prefix state `x_t_prev` (position l ONLY observes
        indices 0 .. l-1, NEVER index l!) weighted by the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)`
        + macro-centered causal innovation + continuous timestep `t_emb` into the 3-layer causal `canvas_layers`
-       stack, outputting the refined trajectory `h_potential(X_t, t)` and instantaneous OT-CFM velocity
+       stack (equipped with low-rank `CopyPointerHead` for exact identity value transport from knowledge streams),
+       outputting the refined trajectory `h_potential(X_t, t)` and instantaneous OT-CFM velocity
        vector field `v_mamba(X_t, t)`.
     """
     def __init__(
@@ -519,6 +647,7 @@ class MultiStreamMambaPlanner(nn.Module):
         num_layers: int = 6,
         num_beats: int = 32,
         num_canvas_layers: Optional[int] = None,
+        d_ptr: int = 64,
     ):
         super().__init__()
         self.d_model = d_model
@@ -617,6 +746,9 @@ class MultiStreamMambaPlanner(nn.Module):
         self.canvas_know_resonance = nn.ModuleList([
             OrthogonalKnowledgeResonance(d_model, init_gate=0.05) for _ in range(self.num_canvas_layers)
         ])
+        self.canvas_copy_pointers = nn.ModuleList([
+            CopyPointerHead(d_model=d_model, d_ptr=d_ptr) for _ in range(self.num_canvas_layers)
+        ])
         self.canvas_final_norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02)
@@ -633,20 +765,29 @@ class MultiStreamMambaPlanner(nn.Module):
         knowledge_mask: Optional[torch.Tensor],
         batch_size: int,
         device: torch.device,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Flattens multi-stream knowledge into:
+          - `k_pool`: position-enriched knowledge keys `(B, L_k_total, D)` for addressing
+          - `k_mask`: boolean validity mask `(B, L_k_total)`
+          - `k_raw`: pure normalized Phase 1 manifold embeddings `(B, L_k_total, D)` WITHOUT
+                     positional distortion for exact identity value transport in `CopyPointerHead`!
+        """
         if x_knowledge is None:
-            return None, None
+            return None, None, None
 
         if x_knowledge.dim() == 4:
             B, M, L_k, D = x_knowledge.shape
             pos_k = self.expander._get_pos_emb(L_k, device, x_knowledge.dtype).unsqueeze(1)  # (1, 1, L_k, D)
             stream_pos = self.expander._get_pos_emb(M, device, x_knowledge.dtype).unsqueeze(2)  # (1, M, 1, D)
-            x_k_pos = x_knowledge + 0.2 * pos_k + 0.1 * stream_pos
+            x_k_pos = x_knowledge + 0.15 * pos_k + 0.1 * stream_pos
             k_pool = x_k_pos.reshape(B, M * L_k, D)
+            k_raw = x_knowledge.reshape(B, M * L_k, D)
         elif x_knowledge.dim() == 3:
             B, L_know, D = x_knowledge.shape
             pos_k = self.expander._get_pos_emb(L_know, device, x_knowledge.dtype)
-            k_pool = x_knowledge + 0.2 * pos_k
+            k_pool = x_knowledge + 0.15 * pos_k
+            k_raw = x_knowledge
         else:
             raise ValueError(f"Expected x_knowledge to have 3 or 4 dims, got shape {x_knowledge.shape}")
 
@@ -661,8 +802,10 @@ class MultiStreamMambaPlanner(nn.Module):
         else:
             k_mask = torch.ones((batch_size, k_pool.shape[1]), dtype=torch.bool, device=device)
 
-        k_pool = k_pool * k_mask.unsqueeze(-1).to(dtype=k_pool.dtype)
-        return k_pool, k_mask
+        mask_f = k_mask.unsqueeze(-1).to(dtype=k_pool.dtype)
+        k_pool = k_pool * mask_f
+        k_raw = k_raw * mask_f
+        return k_pool, k_mask, k_raw
 
     def encode_macro(
         self,
@@ -681,7 +824,7 @@ class MultiStreamMambaPlanner(nn.Module):
         B, L_c, D = x_context.shape
         out_len = int(target_len) if target_len is not None else L_c
 
-        k_pool, k_mask = self._flatten_knowledge(x_knowledge, knowledge_mask, B, x_context.device)
+        k_pool, k_mask, k_raw = self._flatten_knowledge(x_knowledge, knowledge_mask, B, x_context.device)
 
         # Add sinusoidal positional encoding to x_context before processing
         pos_ctx = self.expander._get_pos_emb(L_c, x_context.device, x_context.dtype)
@@ -792,11 +935,19 @@ class MultiStreamMambaPlanner(nn.Module):
         pad_tail = self.expander.pad_tail_emb.to(dtype=h_canvas_macro.dtype)
         slot_carrier = self.expander._get_slot_carrier(out_len, x_context.device, h_canvas_macro.dtype)
 
+        # Copy pointer keys (with 0.15 * pos_k) and pure manifold values (k_raw without positional offset)
+        copy_k_key = k_pool
+        copy_k_val = k_raw
+        copy_k_mask = k_mask
+
         return {
             "h_ctx": h_ctx,
             "valid_mask_bool": valid_mask_bool,
             "k_pool": k_pool,
             "k_mask": k_mask,
+            "copy_k_key": copy_k_key,
+            "copy_k_val": copy_k_val,
+            "copy_k_mask": copy_k_mask,
             "h_summary_clean": h_summary_clean,
             "beats": beats,
             "h_canvas_macro": h_canvas_macro,
@@ -821,7 +972,7 @@ class MultiStreamMambaPlanner(nn.Module):
         so position l ONLY observes causal prefix `x_t[:, :l, :]` (strictly 0.0 intra-step leakage!),
         applies the Bayesian Wiener filter `w_wiener(t) = t / (t^2 + (1-t)^2)` (which is 0.0 at t=0.0,
         preventing white-noise amplification at Euler step 0), and runs the 3-layer causal `canvas_layers`
-        stack to articulate `h_potential(X_t, t)` and `v_mamba(X_t, t)`.
+        stack + `CopyPointerHead` to articulate `h_potential(X_t, t)` and `v_mamba(X_t, t)`.
         """
         h_canvas_macro = macro_state["h_canvas_macro"]
         horizon_gate = macro_state["horizon_gate"]
@@ -831,6 +982,9 @@ class MultiStreamMambaPlanner(nn.Module):
         valid_mask_bool = macro_state["valid_mask_bool"]
         k_pool = macro_state["k_pool"]
         k_mask = macro_state["k_mask"]
+        copy_k_key = macro_state.get("copy_k_key", k_pool)
+        copy_k_val = macro_state.get("copy_k_val", k_pool)
+        copy_k_mask = macro_state.get("copy_k_mask", k_mask)
 
         B, L, D = h_canvas_macro.shape
         device = h_canvas_macro.device
@@ -883,6 +1037,7 @@ class MultiStreamMambaPlanner(nn.Module):
             + t_proj_shared
         )
 
+        copy_probs = []
         for j in range(self.num_canvas_layers):
             t_gate_j = self.canvas_t_gates[j].to(dtype=dtype)
             normed_c = self.canvas_norms[j](h_canvas + t_gate_j * t_proj_shared)
@@ -890,6 +1045,18 @@ class MultiStreamMambaPlanner(nn.Module):
             h_canvas = self.canvas_ctx_resonance[j](h_canvas, h_ctx, stream_mask=valid_mask_bool)
             if k_pool is not None:
                 h_canvas = self.canvas_know_resonance[j](h_canvas, k_pool, stream_mask=k_mask)
+            h_canvas, cp_j = self.canvas_copy_pointers[j](
+                h_canvas, copy_k_key, k_mask=copy_k_mask, k_val=copy_k_val
+            )
+            copy_probs.append(cp_j)
+
+        if copy_probs:
+            copy_prob_mean = torch.stack(copy_probs, dim=0).mean(dim=0)  # (B,)
+        else:
+            copy_prob_mean = torch.zeros(B, device=device, dtype=torch.float32)
+
+        if "aux_dict" in macro_state and isinstance(macro_state["aux_dict"], dict):
+            macro_state["aux_dict"]["copy_prob"] = copy_prob_mean
 
         h_normed = self.canvas_final_norm(h_canvas)
         h_branch_slot = self.canvas_slot_proj(z_branch * (4.0 * slot_carrier))
