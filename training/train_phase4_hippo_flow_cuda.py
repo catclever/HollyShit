@@ -198,7 +198,7 @@ def train():
     parser.set_defaults(
         seq_len=128,
         warmup_steps=500,
-        ckpt_prefix="phase4_hippo_flow",
+        ckpt_prefix="phase4_sentvec_flow",
         batch_size=64,
         save_steps=1000,
     )

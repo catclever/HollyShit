@@ -123,19 +123,20 @@ def find_latest_unet_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
         if not bdir or not os.path.exists(bdir):
             continue
         for d in os.listdir(bdir):
-            if ("phase4_omni_flow" in d or "phase4_hippo_flow" in d) and "step_" in d:
+            if ("phase4_sentvec_flow" in d or "phase4_omni_flow" in d or "phase4_hippo_flow" in d) and "step_" in d:
                 full_dir = os.path.join(bdir, d)
                 pt_file = os.path.join(full_dir, "unet.pt")
                 if os.path.isfile(pt_file):
                     try:
                         step_str = d.split("step_")[-1].replace("_emergency", "")
                         step = int(step_str)
-                        candidates.append((step, pt_file))
+                        priority = 1 if "phase4_sentvec_flow" in d else 0
+                        candidates.append((priority, step, pt_file))
                     except ValueError:
                         pass
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return candidates[0][2]
     return None
 
 
