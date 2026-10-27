@@ -18,15 +18,9 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 
 from training.core.char_tokenizer import CharTokenizer
 
-# Import Phase 4 version 020 modules (with fallback)
-try:
-    from model.hippo_oracle_020 import HiPPOOracleCUDA
-    from model.flow_unet_cuda_020 import FlowMatching1DUnet
-    from model.loss_hippo_cfm_020 import hippo_cfm_loss
-except ImportError:
-    from model.hippo_oracle import HiPPOOracleCUDA
-    from model.flow_unet_cuda import FlowMatching1DUnet
-    from model.loss_hippo_cfm import hippo_cfm_loss
+from model.hippo_oracle import HiPPOOracleCUDA
+from model.flow_unet_cuda import FlowMatching1DUnet
+from model.loss_hippo_cfm import hippo_cfm_loss
 
 try:
     from training.data.dialogue_dataset import GenericPairDataset
@@ -240,7 +234,7 @@ def train():
         else "data/Basic_ZH/moss_dialogues.jsonl"
     )
 
-    parser = get_training_parser("Phase 4 HiPPO 2D Sentence Vector + Flow Match Engine (CUDA 020)")
+    parser = get_training_parser("Phase 4 HiPPO 2D Sentence Vector + Flow Match Engine (CUDA 021)")
     parser.add_argument("--data_path", type=str, default=default_data_path, help="Path to dialogue/knowledge dataset (file, dir, or glob)")
     parser.add_argument("--prompt_seq_len", type=int, default=256, help="Max token length for Prompt + Knowledge k_attractors")
     parser.add_argument("--prompt_key", type=str, default=None, help="Explicit prompt key in dataset items")
@@ -356,7 +350,7 @@ def train():
     hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=16).to(device)
     hippo_oracle.eval()
 
-    # 5. Flow Match Unet (Trainable Right Brain 020)
+    # 5. Flow Match Unet (Trainable Right Brain 021)
     unet = FlowMatching1DUnet(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=16).to(device)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
 
@@ -407,7 +401,7 @@ def train():
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
-        f"🚀 Starting Phase 4 2D Sentence Vector + Stable Flow Match Training (020) "
+        f"🚀 Starting Phase 4 2D Sentence Vector + Sign-Aligned Flow Match Training (021) "
         f"(seq_len={args.seq_len}, prompt_seq_len={args.prompt_seq_len}, "
         f"attractor_prob={args.attractor_prob:.2f}, warmup={args.warmup_steps})..."
     )
@@ -442,14 +436,30 @@ def train():
                     norm_std = (norm_x[valid_mask] if valid_mask.any() else norm_x).std().item()
                     scale_factor = 1.0 / unet.manifold_std.item()
                     valid_pct = valid_mask.float().mean().item() * 100.0
-                    z_check = hippo_oracle(norm_x, return_sequence=False, valid_mask=valid_mask)
+                    z_check = hippo_oracle(
+                        norm_x,
+                        return_sequence=False,
+                        valid_mask=valid_mask,
+                        subspace_proj=unet.subspace_proj,
+                    )
+                    h_wave_check = unet.unpack_sentence_vector(z_check, args.seq_len)
+                    wave_cos = (
+                        torch.nn.functional.cosine_similarity(
+                            norm_x[valid_mask].float(), h_wave_check[valid_mask].float(), dim=-1
+                        )
+                        .mean()
+                        .item()
+                        if valid_mask.any()
+                        else 0.0
+                    )
                     print(
                         f"📊 Manifold Geometry Check (Valid Tokens: {valid_pct:.1f}%) -> "
                         f"Raw Mean: {mean_val:.4f}, Raw Valid Std: {std_val:.4f}"
                     )
                     print(
                         f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | "
-                        f"Normalized Valid Std: {norm_std:.4f} | 2D Z_sent Shape: {tuple(z_check.shape)} (Std: {z_check.std().item():.4f})"
+                        f"Normalized Valid Std: {norm_std:.4f} | 2D Z_sent Shape: {tuple(z_check.shape)} "
+                        f"(Std: {z_check.std().item():.4f}, Unpacked Wave Cos: {wave_cos:.4f})"
                     )
 
             p_attractor = float(args.attractor_prob)
@@ -523,7 +533,12 @@ def train():
                         tgt_sample = encode_tokens(encoder, w_t_s)
                         tgt_sample_norm = unet.normalize(tgt_sample)
 
-                        z_sent = hippo_oracle(tgt_sample_norm, return_sequence=False, valid_mask=tgt_valid_mask)
+                        z_sent = hippo_oracle(
+                            tgt_sample_norm,
+                            return_sequence=False,
+                            valid_mask=tgt_valid_mask,
+                            subspace_proj=unet.subspace_proj,
+                        )
 
                         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                             x_gen = sample_euler_ode(

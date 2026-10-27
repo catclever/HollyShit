@@ -41,10 +41,13 @@ class HiPPOOracleCUDA(nn.Module):
     """
     Frozen HiPPO-LegS Sentence Vector Bottleneck & State-Space Operator (0 trainable params).
     - Default mode (`return_sequence=False`): Projects a 3D token trajectory `x_seq` of shape `(B, L, D)`
-      into a strictly 2D Sentence Vector `z_sent` of shape `(B, D)` by mixing all `D=1024` channels
-      across `K=16` orthogonal Legendre temporal sub-bands (`d_sub = 64` dims per polynomial degree `k=0..15`).
-      With sample-adaptive Legendre projection on the valid span, sequences of any length (15 to 128)
-      span the full [0, 1] harmonic range, PAD tokens contribute exactly 0, and z_sent maintains unit variance.
+      into a strictly 2D Sentence Vector `z_sent` of shape `(B, D)` by projecting all `L` positions
+      (with `<PAD>` positions strictly zeroed via `valid_mask`) onto a fixed warped Legendre basis
+      `basis` of shape `(K=16, L)` across all `d_sub=64` principal channels (`16 x 64 = 1024`).
+      Guarantees:
+      1. 1:1 coordinate lock with `unpack_sentence_vector(z_sent, L)` (zero positional stretching/shift);
+      2. Full-spectrum `K=16` Legendre harmonic coverage on every one of the 64 subspace channels;
+      3. Strict `<PAD>` zeroing and unit per-sentence standard deviation (`Std == 1.0`).
     - Legacy sequence mode (`return_sequence=True`): Returns the 3D causal Toeplitz trajectory `(B, L, D)`.
     """
 
@@ -87,9 +90,10 @@ class HiPPOOracleCUDA(nn.Module):
         torch.manual_seed(42)
         self.register_buffer("proj_out", torch.randn(N, 1) / np.sqrt(N))
 
-        # Fixed deterministic orthogonal channel-mixing matrix (D, D) with seed=42
+        # Fixed deterministic orthogonal channel-mixing matrix (D, D) and 64-D principal subspace (D, d_sub)
         ortho_mix = build_deterministic_ortho_mix(hidden_dim, seed=42)
         self.register_buffer("ortho_mix", ortho_mix)
+        self.register_buffer("subspace_proj", ortho_mix[:, : self.d_sub].contiguous())
 
         # Caches for basis and causal Toeplitz kernel
         self._kernel_cache = {}
@@ -97,17 +101,17 @@ class HiPPOOracleCUDA(nn.Module):
 
     def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Computes the first K = self.num_subbands (16) orthonormal shifted Legendre polynomials P_k(tau)
-        evaluated at midpoint coordinates tau_l = (l + 0.5) / L in (0, 1) for l = 0..L-1,
-        normalized so that sum_{l=0}^{L-1} basis[k, l]^2 == 1.0 (equivalently 1/L sum_l P_k(tau_l)^2 == 1.0).
-        Returns `basis` of shape (K, L).
+        Computes the first K = self.num_subbands (16) discrete-orthonormal warped Legendre polynomials
+        evaluated on the fixed sequence window [0, L-1] with front-concentrated midpoint coordinates
+        tau_l = ((l + 0.5) / L) ** 0.65 in (0, 1), orthonormalized via two-pass Gram-Schmidt so that
+        basis @ basis.T == I_K. Returns `basis` of shape (K, L).
         """
         key = (L, device, dtype)
         if key in self._basis_cache:
             return self._basis_cache[key]
 
         K = self.num_subbands
-        tau = (torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))
+        tau = ((torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))) ** 0.65
         u = 2.0 * tau - 1.0  # Mapped to (-1, 1)
 
         polys = []
@@ -122,13 +126,14 @@ class HiPPOOracleCUDA(nn.Module):
 
         raw_basis = torch.stack(polys, dim=0)  # (K, L)
 
-        # Discrete Gram-Schmidt orthogonalization + unit L2 row normalization (sum_l basis[k, l]^2 == 1.0)
+        # Two-pass discrete Gram-Schmidt orthogonalization + unit L2 row normalization
         ortho_rows = []
         for k in range(K):
             v = raw_basis[k]
             if k < L:
-                for prev in ortho_rows:
-                    v = v - torch.dot(v, prev) * prev
+                for _ in range(2):
+                    for prev in ortho_rows:
+                        v = v - torch.dot(v, prev) * prev
             norm = v.norm(p=2).clamp(min=1e-6)
             ortho_rows.append(v / norm)
 
@@ -141,61 +146,49 @@ class HiPPOOracleCUDA(nn.Module):
         self,
         x_seq: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
+        subspace_proj: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Projects 3D sequence `x_seq` of shape `(B, L, D)` into a strictly 2D Sentence Vector
         `z_sent` of shape `(B, D)` (`(B, 1024)`):
-          1. Masks out <PAD> positions if valid_mask is provided:
+          1. Strictly zeros out <PAD> positions if valid_mask is provided:
              `x_masked = x_seq * valid_mask.unsqueeze(-1).to(x_seq.dtype)`;
-          2. Computes per-sequence valid lengths: `valid_lens = valid_mask.sum(dim=-1).clamp(min=1)`;
-          3. Evaluates sample-adaptive Legendre basis on the valid span [0, L_v-1] for each sample b,
-             guaranteeing valid characters span the full domain [0, 1] of all 16 Legendre harmonics,
-             and PAD positions contribute strictly 0;
-          4. Mixes all D channels across K=16 sub-bands via `self.ortho_mix`;
-          5. Reshapes `(B, K, d_sub)` -> `(B, D)` with unit variance (`Std ≈ 1.0`).
+          2. Projects `x_masked` onto the 64-D principal subspace `proj` (`(1024, 64)`):
+             `x_low = torch.matmul(x_masked, proj)` (`(B, L, 64)`);
+          3. Projects all 64 subspace channels onto all K=16 fixed-coordinate Legendre modes `(16, L)`:
+             `z_sub = torch.einsum("kl,bld->bkd", basis, x_low)` (`(B, 16, 64)`);
+          4. Reshapes `(B, 16, 64)` -> `(B, 1024)` and normalizes per-sentence to unit `Std == 1.0`.
         """
         B_size, L, D = x_seq.shape
-        K = self.num_subbands
-        d_sub = self.d_sub
-
-        ortho = self.ortho_mix.to(device=x_seq.device, dtype=x_seq.dtype)
 
         if valid_mask is not None:
             mask_f = valid_mask.unsqueeze(-1).to(x_seq.dtype)
             x_masked = x_seq * mask_f
-            valid_lens = valid_mask.sum(dim=-1).clamp(min=1)  # (B,)
         else:
             x_masked = x_seq
-            valid_lens = None
 
-        x_mixed = torch.matmul(x_masked, ortho).reshape(B_size, L, K, d_sub)
+        proj = (subspace_proj if subspace_proj is not None else self.subspace_proj).to(
+            device=x_seq.device, dtype=x_seq.dtype
+        )
+        x_low = torch.matmul(x_masked, proj)  # (B, L, d_sub)
 
-        # Build sample-adaptive Legendre basis on the valid span
-        if valid_lens is None:
-            basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype)  # (K, L)
-            z_sub = torch.einsum("kl,blkd->bkd", basis, x_mixed)  # (B, K, d_sub)
-        else:
-            min_l = int(valid_lens.min().item())
-            max_l = int(valid_lens.max().item())
-            if min_l == max_l and min_l == L:
-                basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype)
-                z_sub = torch.einsum("kl,blkd->bkd", basis, x_mixed)
-            else:
-                basis_batch = torch.zeros((B_size, K, L), device=x_seq.device, dtype=x_seq.dtype)
-                for b in range(B_size):
-                    L_v = int(valid_lens[b].item())
-                    L_v = min(L_v, L)
-                    b_mat = self._get_legendre_basis(L_v, x_seq.device, x_seq.dtype)  # (K, L_v)
-                    basis_batch[b, :, :L_v] = b_mat
-                z_sub = torch.einsum("bkl,blkd->bkd", basis_batch, x_mixed)
+        basis = self._get_legendre_basis(L, x_seq.device, x_seq.dtype)  # (K, L)
+        z_sub = torch.einsum("kl,bld->bkd", basis, x_low)  # (B, K, d_sub)
 
-        z_sent = z_sub.reshape(B_size, D)  # (B, D)
+        z_raw = z_sub.reshape(B_size, D)  # (B, D)
+        z_std = z_raw.float().std(dim=-1, keepdim=True).clamp(min=1e-5).to(x_seq.dtype)
+        z_sent = z_raw / z_std
         return z_sent
 
     @torch.no_grad()
-    def reconstruct_macro_wave(self, z_sent: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def reconstruct_macro_wave(
+        self,
+        z_sent: torch.Tensor,
+        seq_len: int,
+        subspace_proj: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Reconstructs the rank-16 smooth Legendre guide wave of shape `(B, seq_len, D)`
+        Reconstructs the full-spectrum 16-mode Legendre guide wave of shape `(B, seq_len, D)`
         from a 2D Sentence Vector `z_sent` of shape `(B, D)` via the exact transpose operation.
         """
         B_size, D = z_sent.shape
@@ -205,11 +198,11 @@ class HiPPOOracleCUDA(nn.Module):
         z_sub = z_sent.reshape(B_size, K, d_sub)
         basis = self._get_legendre_basis(seq_len, z_sent.device, z_sent.dtype)  # (K, seq_len)
 
-        x_mixed_rec = torch.einsum("bkd,kl->blkd", z_sub, basis) * math.sqrt(K)
-        x_mixed_rec = x_mixed_rec.reshape(B_size, seq_len, D)
-
-        ortho_T = self.ortho_mix.to(device=z_sent.device, dtype=z_sent.dtype).T
-        return torch.matmul(x_mixed_rec, ortho_T)
+        x_low_rec = torch.einsum("bkd,kl->bld", z_sub, basis) * math.sqrt(K)  # (B, seq_len, d_sub)
+        proj = (subspace_proj if subspace_proj is not None else self.subspace_proj).to(
+            device=z_sent.device, dtype=z_sent.dtype
+        )
+        return torch.matmul(x_low_rec, proj.T)
 
     def _get_causal_hippo_kernel(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -247,6 +240,7 @@ class HiPPOOracleCUDA(nn.Module):
         x_seq: torch.Tensor,
         return_sequence: bool = False,
         valid_mask: Optional[torch.Tensor] = None,
+        subspace_proj: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         x_seq: (Batch, Length, D)
@@ -256,7 +250,9 @@ class HiPPOOracleCUDA(nn.Module):
           - If True (legacy 3D mode): returns `(Batch, Length, D)` causal Toeplitz HiPPO trajectory.
         """
         if not return_sequence:
-            return self.encode_sentence_vector(x_seq, valid_mask=valid_mask)
+            return self.encode_sentence_vector(
+                x_seq, valid_mask=valid_mask, subspace_proj=subspace_proj
+            )
 
         B_size, L, D = x_seq.shape
         K = self._get_causal_hippo_kernel(L, x_seq.device, x_seq.dtype)  # (L, L)

@@ -14,7 +14,7 @@ def hippo_cfm_loss(
     return_metrics: bool = False,
 ):
     """
-    Phase 4 Loss: Train Flow Match Unet (Right Brain) using the 2D Sentence Vector Bottleneck
+    Phase 4 Loss (021): Train Flow Match Unet (Right Brain) using the 2D Sentence Vector Bottleneck
     (`z_sent` of shape `(B, D)`) from HiPPOOracleCUDA + Orthogonal Knowledge Attractors `k_attractors`.
 
     x_prompt: (B, L_p, D) Raw continuous embeddings of the context + knowledge (used as k_attractors)
@@ -36,14 +36,19 @@ def hippo_cfm_loss(
         x_prompt_norm = unet.normalize(x_prompt)
 
         # 1. Oracle: Extract strictly 2D Sentence Vector bottleneck z_sent of shape (B, D)
-        z_sent = hippo_oracle(x_target_norm, return_sequence=False, valid_mask=valid_mask)
+        z_sent = hippo_oracle(
+            x_target_norm,
+            return_sequence=False,
+            valid_mask=valid_mask,
+            subspace_proj=unet.subspace_proj,
+        )
         assert z_sent.dim() == 2 and z_sent.shape == (B, D), (
             f"Expected 2D sentence vector z_sent of shape {(B, D)}, got {z_sent.shape}"
         )
 
     # 2. Setup Symmetric Flow Matching Trajectory (Both X_1 and X_0 have Std = 1.0)
-    # Sample t ~ Uniform(0, 1) spanning the full continuous unit interval
-    t = torch.rand((B,), device=device, dtype=x_target_norm.dtype)
+    # Sample t ~ Uniform(0, 0.95) so 1.0 - t >= 0.05 holds identically everywhere
+    t = torch.rand((B,), device=device, dtype=x_target_norm.dtype) * 0.95
     t_expand = t[:, None, None]  # (B, 1, 1)
     x_0 = torch.randn_like(x_target_norm)
     x_t = t_expand * x_target_norm + (1.0 - t_expand) * x_0
@@ -55,7 +60,10 @@ def hippo_cfm_loss(
     v_pred = unet(x_t, t, h_potential=z_sent, k_attractors=k_attractors, k_mask=k_mask)
 
     # 4. Mask-Weighted Flow Matching Velocity MSE Loss
-    sq_err = (v_pred - v_target) ** 2
+    # Weight by denom^2 = (1 - t)^2 so (denom * (v_pred - v_target))^2 == (x_1_hat - x_target_norm)^2,
+    # eliminating 1/(1-t)^2 gradient explosion near t -> 1 while keeping exact OT-CFM velocity for Euler ODE.
+    denom = (1.0 - t_expand).clamp(min=0.05)
+    sq_err = (denom * (v_pred - v_target)) ** 2
     if valid_mask is not None:
         mask_f = valid_mask.to(dtype=sq_err.dtype).unsqueeze(-1)  # (B, L, 1)
         weights = mask_f + (1.0 - mask_f) * pad_loss_weight
@@ -66,7 +74,7 @@ def hippo_cfm_loss(
         loss_valid_raw = loss_vel
 
     # 5. Implied Endpoint Prediction & Valid-Token Cosine Direction Loss
-    x_1_hat = x_t + (1.0 - t_expand) * v_pred
+    x_1_hat = x_t + denom * v_pred
     cos_sim = F.cosine_similarity(x_1_hat.float(), x_target_norm.float(), dim=-1, eps=1e-6)
     cos_err = 1.0 - cos_sim
     if valid_mask is not None and valid_mask.any():

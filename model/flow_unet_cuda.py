@@ -123,8 +123,8 @@ class Gated1DResBlock(nn.Module):
 
         self.adaLN1 = AdaLN(hidden_dim, cond_dim)
         self.attractor = OrthogonalAttractor(hidden_dim)
-        # Initialized to 0.0 so Step 0 starts prior to attractor lock-in, then opens smoothly via gradient descent
-        self.attractor_gate = nn.Parameter(torch.zeros(hidden_dim))
+        # Initialized to 0.1 so Step 0 gently engages k_attractors and opens smoothly via gradient descent
+        self.attractor_gate = nn.Parameter(torch.full((hidden_dim,), 0.1))
 
         padding = ((kernel_size - 1) * dilation) // 2
         self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=padding, dilation=dilation)
@@ -174,13 +174,15 @@ class Gated1DResBlock(nn.Module):
 
 class FlowMatching1DUnet(nn.Module):
     """
-    Standard Stable Vector Field Predictor for OT-CFM (Right Brain / Motor Cortex).
-    - Driven by a 2D Sentence Vector `h_potential: (B, 1024)` (unpacked via 16-mode shifted Legendre
-      basis + position-aware residual adapter) as `h_cond`.
-    - Primary generative path driven directly by `x_t`: `x = x_t + 0.1 * pos_x`.
-    - Knowledge attractors with `<PAD>` key masking injected smoothly into the residual stream.
-    - Velocity output: `v_pred = self.final_proj(x_normed)` without 1/(1-t) division or x_t subtraction.
-    - Includes built-in Adaptive Manifold Auto-Calibration (manifold_mean & manifold_std).
+    Sign-Aligned Velocity Predictor for OT-CFM (Right Brain / Motor Cortex 021):
+    - Driven by a 2D Sentence Vector `h_potential: (B, 1024)` unpacked into a full-spectrum
+      16-mode Legendre trajectory `h_wave: (B, L, 1024)` over the 64-D principal manifold subspace.
+    - Internal residual stream anchored in the +x_1 manifold: `x = h_wave + 0.2 * x_t + 0.1 * pos_x`
+      so `OrthogonalAttractor` immediately locks onto `k_attractors` even at t=0.
+    - Sign-aligned velocity parameterization: `v_pred = (h_wave - x_t) + self.final_proj(x_normed)`
+      (analytically supplies -x_0 via -x_t and learns +x_1 residual in the exact same + sign convention
+      as +k_attractors, with zero 1/(1-t) singularity).
+    - Includes built-in Adaptive Manifold Auto-Calibration (`manifold_mean`, `manifold_std`, `subspace_proj`).
     """
     def __init__(
         self,
@@ -203,6 +205,7 @@ class FlowMatching1DUnet(nn.Module):
         # 2D Sentence Vector Legendre Unpacker (matches HiPPOOracleCUDA seed=42 QR basis)
         ortho_mix = build_deterministic_ortho_mix(hidden_dim, seed=42)
         self.register_buffer("ortho_mix", ortho_mix)
+        self.register_buffer("subspace_proj", ortho_mix[:, : self.d_sub].contiguous())
 
         self.sent_wave_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -222,7 +225,7 @@ class FlowMatching1DUnet(nn.Module):
         ])
 
         self.final_norm = AdaLN(hidden_dim, cond_dim)
-        # Full-rank 1024x1024 projection head for velocity output
+        # Full-rank 1024x1024 projection head for velocity residual output
         self.final_proj = nn.Linear(hidden_dim, hidden_dim)
         with torch.no_grad():
             self.final_proj.weight.mul_(0.01)
@@ -238,15 +241,17 @@ class FlowMatching1DUnet(nn.Module):
 
     def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Computes the first K = self.num_subbands (16) orthonormal shifted Legendre polynomials P_k(tau)
-        evaluated at tau_l = (l + 0.5) / L in (0, 1) for l = 0..L-1, with sum_l basis[k, l]^2 == 1.0.
+        Computes the first K = self.num_subbands (16) discrete-orthonormal warped Legendre polynomials
+        evaluated on the fixed sequence window [0, L-1] with front-concentrated midpoint coordinates
+        tau_l = ((l + 0.5) / L) ** 0.65 in (0, 1), orthonormalized via two-pass Gram-Schmidt so that
+        basis @ basis.T == I_K. Bit-for-bit identical to HiPPOOracleCUDA._get_legendre_basis.
         """
         key = (L, device, dtype)
         if key in self._basis_cache:
             return self._basis_cache[key]
 
         K = self.num_subbands
-        tau = (torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))
+        tau = ((torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))) ** 0.65
         u = 2.0 * tau - 1.0
 
         polys = []
@@ -265,8 +270,9 @@ class FlowMatching1DUnet(nn.Module):
         for k in range(K):
             v = raw_basis[k]
             if k < L:
-                for prev in ortho_rows:
-                    v = v - torch.dot(v, prev) * prev
+                for _ in range(2):
+                    for prev in ortho_rows:
+                        v = v - torch.dot(v, prev) * prev
             norm = v.norm(p=2).clamp(min=1e-6)
             ortho_rows.append(v / norm)
 
@@ -276,8 +282,9 @@ class FlowMatching1DUnet(nn.Module):
 
     def unpack_sentence_vector(self, z_sent: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        Unpacks a 2D Sentence Vector `z_sent` of shape `(B, D)` into a rank-16 smooth Legendre
-        temporal wave `h_wave` of shape `(B, seq_len, D)`.
+        Unpacks a 2D Sentence Vector `z_sent` of shape `(B, D)` into a full-spectrum 16-mode Legendre
+        temporal wave `h_wave` of shape `(B, seq_len, D)` over the 64-D principal subspace.
+        Scaled by sqrt(K) so total Parseval energy matches the K=16 orthonormal modes on the valid span.
         """
         B, D = z_sent.shape
         K = self.num_subbands
@@ -286,11 +293,9 @@ class FlowMatching1DUnet(nn.Module):
         z_sub = z_sent.reshape(B, K, d_sub)
         basis = self._get_legendre_basis(seq_len, z_sent.device, z_sent.dtype)  # (K, seq_len)
 
-        x_mixed_rec = torch.einsum("bkd,kl->blkd", z_sub, basis) * math.sqrt(K)
-        x_mixed_rec = x_mixed_rec.reshape(B, seq_len, D)
-
-        ortho_T = self.ortho_mix.to(device=z_sent.device, dtype=z_sent.dtype).T
-        return torch.matmul(x_mixed_rec, ortho_T)
+        x_low_rec = torch.einsum("bkd,kl->bld", z_sub, basis) * math.sqrt(K)  # (B, seq_len, d_sub)
+        proj = self.subspace_proj.to(device=z_sent.device, dtype=z_sent.dtype)  # (D, d_sub)
+        return torch.matmul(x_low_rec, proj.T)
 
     def _get_pos_emb(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -320,11 +325,12 @@ class FlowMatching1DUnet(nn.Module):
         momentum: float = 0.05
     ) -> bool:
         """
-        Online EMA Auto-Calibration for target manifold scale:
+        Online EMA Auto-Calibration for target manifold scale + Step-0 Principal Subspace Calibration:
         - Strictly computes mean and std over valid (non-PAD) tokens when valid_mask is provided,
           preventing high-padding short sequences from shrinking manifold_std.
-        - Step 0: Directly initializes manifold_mean and manifold_std from the first batch.
-        - Steps 1 .. max_calib_steps-1: Smooths estimate via EMA.
+        - Step 0: Initializes manifold_mean, manifold_std, and calibrates the 64-D principal subspace
+          `self.subspace_proj` via eigendecomposition of the normalized valid token covariance.
+        - Steps 1 .. max_calib_steps-1: Smooths manifold_mean and manifold_std via EMA.
         - Step >= max_calib_steps: Locks coordinate scale permanently for stable flow training.
         """
         step = int(self.calib_steps.item())
@@ -337,12 +343,28 @@ class FlowMatching1DUnet(nn.Module):
             batch_mean = valid_tokens.mean()
             batch_std = valid_tokens.std().clamp(min=1e-5)
         else:
+            valid_tokens = None
             batch_mean = x_float.mean()
             batch_std = x_float.std().clamp(min=1e-5)
 
         if step == 0:
             self.manifold_mean.copy_(batch_mean)
             self.manifold_std.copy_(batch_std)
+
+            v_tokens = valid_tokens if (valid_mask is not None and valid_mask.any()) else x_float.reshape(-1, self.hidden_dim)
+            if v_tokens.shape[0] >= 2:
+                v_centered = (v_tokens - batch_mean) / batch_std
+                cov = torch.matmul(v_centered.T, v_centered) / float(max(v_centered.shape[0], 1))
+                # Add tiny diagonal jitter for numerical stability before eigh (on CPU for universal device support)
+                cov_cpu = cov.cpu() + 1e-6 * torch.eye(self.hidden_dim, dtype=cov.dtype)
+                _, eigvecs_cpu = torch.linalg.eigh(cov_cpu)
+                top_vecs = eigvecs_cpu[:, -self.d_sub:].flip(-1).contiguous().to(device=cov.device, dtype=cov.dtype)
+                # Deterministic column sign convention
+                max_abs_idx = top_vecs.abs().argmax(dim=0, keepdim=True)
+                col_signs = torch.sign(torch.gather(top_vecs, 0, max_abs_idx))
+                col_signs = torch.where(col_signs == 0, torch.ones_like(col_signs), col_signs)
+                top_vecs = top_vecs * col_signs
+                self.subspace_proj.copy_(top_vecs)
         else:
             self.manifold_mean.lerp_(batch_mean, momentum)
             self.manifold_std.lerp_(batch_std, momentum)
@@ -371,11 +393,10 @@ class FlowMatching1DUnet(nn.Module):
         k_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Standard Stable Velocity Field Predictor for OT-CFM:
-        - Primary generative path: driven by x_t! `x = x_t + 0.1 * pos_x`
-        - Condition path: `h_cond = h_wave + 0.5 * h_global + sent_wave_proj(...)`
-        - Velocity output: simply `v_pred = self.final_proj(x_normed)`!
-        - Completely free of /(1-t) division and x_t_gate * x_t subtraction.
+        Sign-Aligned Velocity Field Predictor for OT-CFM:
+        - Unpacks 2D `z_sent` into full-spectrum 16-mode Legendre trajectory `h_wave` (`(B, L, D)`).
+        - Initializes internal stream `x = h_wave + 0.2 * x_t + 0.1 * pos_x` in the +x_1 manifold.
+        - Predicts velocity as `v_pred = (h_wave - x_t) + self.final_proj(x_normed)`.
         """
         B, L, D = x_t.shape
         t_emb = self.t_embedder(t)
@@ -390,10 +411,11 @@ class FlowMatching1DUnet(nn.Module):
                 torch.cat([h_wave, h_global + pos_x], dim=-1)
             )
         else:
-            h_cond = h_potential
+            h_wave = h_potential.to(device=x_t.device, dtype=x_t.dtype)
+            h_cond = h_wave
 
-        # Primary generative trajectory driven by x_t!
-        x = x_t + 0.1 * pos_x
+        # Anchor internal residual stream in the +x_1 manifold so OrthogonalAttractor locks on at t=0
+        x = h_wave + 0.2 * x_t + 0.1 * pos_x
 
         k_pos = None
         if k_attractors is not None:
@@ -404,6 +426,9 @@ class FlowMatching1DUnet(nn.Module):
             x = block(x, t_emb, h_cond, k_attractors=k_pos, k_val=k_attractors, k_mask=k_mask)
 
         x_normed = self.final_norm(x, h_cond)
-        v_pred = self.final_proj(x_normed)
+        x_1_hat = h_wave + self.final_proj(x_normed)
+        t_expand = t.view(B, 1, 1).to(dtype=x_t.dtype)
+        denom = (1.0 - t_expand).clamp(min=0.05)
+        v_pred = (x_1_hat - x_t) / denom
 
         return v_pred
