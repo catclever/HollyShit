@@ -58,6 +58,13 @@ _STRIP_PUNCT_RE = re.compile(
 _PUNCT_SPLIT_RE = re.compile(r"[\s,，.。!！?？;；:：、\"'“”‘’()（）\[\]【】<>《》—\-/\\|]+")
 _LEADING_TAG_RE = re.compile(r"^\s*【[^】]{1,20}】[：:\s]*")
 
+_REORDERED_BOILERPLATE_RE = re.compile(
+    r"([^。！？；\n]+?)，\s*(?:划重点|先说结论|直接说结论)[：:]\s*([^。！？；\n]+?)([。！？；]|$)"
+)
+_FORUM_BOILERPLATE_RE = re.compile(
+    r"(^|[。！？；\n]\s*)(?:划重点[：:]|先说结论[：:]|直接说结论[：:]|谢邀[，。！,.\s]*|泻药[，。！,.\s]*|答[：:])\s*"
+)
+
 _STOPWORD_CHARS = set("的了在是有和与或等中为对从到以及而但并把被让将给按于及其")
 _STOPWORD_BIGRAMS = {
     "包括", "的是", "是在", "了一", "可以", "进行", "通过", "使用", "一个", "这个", "那个",
@@ -72,8 +79,9 @@ _STOPWORD_BIGRAMS = {
 
 def clean_text(text: Optional[str]) -> str:
     """
-    Cleans whitespace and strips all artificial `【...】` bracket tags so the model
-    never relies on synthetic bracket prefixes.
+    Cleans whitespace, strips all artificial `【...】` bracket tags, and removes
+    forum/QA boilerplate prefixes (`划重点：`, `先说结论：`, `谢邀，`, etc.) while
+    preserving the factual content that follows.
     """
     if not text or not isinstance(text, str):
         return ""
@@ -87,6 +95,16 @@ def clean_text(text: Optional[str]) -> str:
     # Unwrap any remaining inline `【...】` brackets into plain text
     text = re.sub(r"【([^】]*)】", r"\1", text)
     text = text.replace("【", "").replace("】", "")
+    # Restore any pre-reordered `，划重点： <lead>` spans and strip forum boilerplate prefixes
+    text = _REORDERED_BOILERPLATE_RE.sub(
+        lambda m: f"{m.group(2).strip()}，{m.group(1).strip()}{m.group(3)}",
+        text,
+    )
+    while True:
+        next_text = _FORUM_BOILERPLATE_RE.sub(r"\1", text)
+        if next_text == text:
+            break
+        text = next_text
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -96,11 +114,73 @@ def _ensure_sentence_end_punct(text: str) -> str:
     text = clean_text(text)
     if not text:
         return text
+    text = re.sub(r"([。！？.!?;；]){2,}$", r"\1", text)
     if re.search(r"[。！？.!?;；\"'”’）\)]$", text):
         return text
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
     text = re.sub(r"[,，、:：]+$", "", text).strip()
     return text + ("。" if has_cjk else ".")
+
+
+def _trim_context_at_boundary(text: str, max_chars: int) -> str:
+    """
+    Trims `text` to at most `max_chars` characters at a natural sentence or clause
+    boundary and ensures terminal punctuation (`。`/`.`), avoiding mid-word cuts.
+    """
+    text = text.strip()
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+
+    window = text[:max_chars].strip()
+    for punct in ["。", "！", "？", "；", "\n"]:
+        pos = window.rfind(punct)
+        if pos >= max(16, int(max_chars * 0.45)):
+            return window[: pos + 1].strip()
+
+    reserve_one = text[: max(1, max_chars - 1)].strip()
+    for punct in ["，", ",", "、", "："]:
+        pos = reserve_one.rfind(punct)
+        if pos >= max(12, int(max_chars * 0.35)):
+            prefix = reserve_one[:pos].strip()
+            has_cjk = bool(re.search(r"[\u4e00-\u9fff]", prefix))
+            return prefix + ("。" if has_cjk else ".")
+
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", reserve_one))
+    if has_cjk and max_chars >= 4:
+        return re.sub(r"[，,、：:；;\s]+$", "", reserve_one) + "。"
+    return window
+
+
+def _format_question_clean(question: str, max_q_chars: int = 100) -> str:
+    """
+    Formats a question string up to `max_q_chars` without mid-sentence truncation,
+    cutting at the last clause boundary if `len(question) > max_q_chars` and ensuring
+    terminal question/sentence punctuation.
+    """
+    q = clean_text(question)
+    if not q:
+        return ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", q))
+    q_end = "？" if has_cjk else "?"
+
+    if len(q) > max_q_chars:
+        window = q[: max_q_chars - 1].strip()
+        cut_pos = -1
+        for punct in ["？", "?", "。", "！", "；", "，", ","]:
+            pos = window.rfind(punct)
+            if pos >= max(10, int(max_q_chars * 0.4)):
+                cut_pos = pos
+                break
+        if cut_pos > 0:
+            q = window[:cut_pos].strip()
+        else:
+            q = window
+
+    if not re.search(r"[。！？?!.：:”’）\)]$", q):
+        q = re.sub(r"[，,、；;]+$", "", q).strip() + q_end
+    return q
 
 
 def _extract_content_bigrams(text: str) -> Set[str]:
@@ -229,16 +309,10 @@ def extract_factual_clauses(
 
 def _reorder_clauses_for_grounding(text: str) -> str:
     """
-    Reorders comma-separated sub-clauses within a sentence so that all entity words
-    are preserved as grounding context while shifting token offsets and avoiding
-    verbatim full-sentence identity.
+    Cleans trailing sentence punctuation while preserving the natural chronological
+    and syntactic order of comma-separated sub-clauses.
     """
-    cleaned = clean_text(re.sub(r"[。！？；\n]+$", "", text))
-    parts = [p.strip() for p in re.split(r"[，,；;]+", cleaned) if p.strip()]
-    if len(parts) >= 2:
-        reordered = parts[1:] + parts[:1]
-        return "，".join(reordered)
-    return cleaned
+    return clean_text(re.sub(r"[。！？；\n]+$", "", text))
 
 
 def try_split_structured_prompt(
@@ -332,7 +406,7 @@ def try_split_classical_text(
                 instr = clean_text(str(item_or_text.get("instruction", "") or ""))
                 if not instr or instr == s_val:
                     instr = "请将上述文言文译为现代汉语并阐释其意："
-                prompt = f"古文原文：{s_val[:max_src_len]}\n{instr}"
+                prompt = f"古文原文：{_trim_context_at_boundary(s_val, max_src_len)}\n{instr}"
                 target = _ensure_sentence_end_punct(t_val[:max_tgt_len])
                 if is_non_cheating_grounded_pair(prompt, target):
                     return prompt, target
@@ -344,10 +418,10 @@ def try_split_classical_text(
             split_res = try_split_structured_prompt(instr_val)
             if split_res is not None:
                 q_str, k_list = split_res
-                ctx_str = "。".join(k_list)[:max_src_len]
+                ctx_str = _trim_context_at_boundary("。".join(k_list), max_src_len)
                 prompt = f"{ctx_str}\n{q_str}"
             else:
-                prompt = f"古文原文：{instr_val[:max_src_len]}\n请译为现代汉语："
+                prompt = f"古文原文：{_trim_context_at_boundary(instr_val, max_src_len)}\n请译为现代汉语："
             target = _ensure_sentence_end_punct(out_val[:max_tgt_len])
             if is_non_cheating_grounded_pair(prompt, target):
                 return prompt, target
@@ -383,7 +457,7 @@ def try_split_classical_text(
         src_part = clean_text(marker_match.group(1))
         tgt_part = clean_text(marker_match.group(2))
         if len(src_part) >= 6 and len(tgt_part) >= 8 and src_part != tgt_part:
-            prompt = f"古文原文：{src_part[:max_src_len]}\n请将上述古文译为现代汉语："
+            prompt = f"古文原文：{_trim_context_at_boundary(src_part, max_src_len)}\n请将上述古文译为现代汉语："
             target = _ensure_sentence_end_punct(tgt_part[:max_tgt_len])
             if is_non_cheating_grounded_pair(prompt, target):
                 return prompt, target
@@ -396,9 +470,8 @@ def try_split_classical_text(
     clauses = extract_factual_clauses(cleaned_raw, min_len=8, max_len=90)
     if len(clauses) >= 2:
         target_clause = _ensure_sentence_end_punct(clauses[0][:max_tgt_len])
-        reordered_first = _reorder_clauses_for_grounding(clauses[0])
-        rest_clauses = "。".join(clauses[1:4])
-        supporting_ctx = f"{rest_clauses}。{reordered_first}。"[:max_src_len]
+        natural_clauses = [_reorder_clauses_for_grounding(c) for c in clauses[:4]]
+        supporting_ctx = _trim_context_at_boundary("。".join(natural_clauses) + "。", max_src_len)
         title_hint = f"（出自《{title}》）" if title else ""
         prompt = f"古籍语段{title_hint}：{supporting_ctx}\n请根据上述古文材料提炼核心首句："
         if is_non_cheating_grounded_pair(prompt, target_clause) and has_substantive_overlap(prompt, target_clause, min_bigrams=2):
@@ -415,15 +488,15 @@ def build_grounded_instruct_pair(
     instruction: str,
     input_text: str,
     output_text: str,
-    max_prompt_chars: int = 235,
+    max_prompt_chars: int = 240,
     max_target_chars: int = 220,
 ) -> Optional[Tuple[str, str]]:
     """
     Domain 1 helper:
       - Recognizes structured multi-line prompts via `try_split_structured_prompt(instr)`
         when `input_text` is empty.
-      - Places `inp` FIRST (`f"{inp}\\n{instr}"`) so grounding material is never truncated
-        by `prompt_seq_len=256`.
+      - Places `inp` FIRST (`f"{inp}\\n{instr}"`) and keeps `instr` intact at the bottom
+        while trimming `inp` at a clause boundary within the remaining budget.
       - Requires either `len(inp) >= 8` with content overlap or `>= 2` shared content bigrams
         between `prompt` and `output_text`.
     """
@@ -442,11 +515,12 @@ def build_grounded_instruct_pair(
             instr = q_str
 
     if inp:
-        inp_trimmed = inp[: max(80, max_prompt_chars - min(len(instr), 90) - 2)].strip()
-        instr_trimmed = instr[: max(30, max_prompt_chars - len(inp_trimmed) - 1)].strip()
-        prompt = f"{inp_trimmed}\n{instr_trimmed}".strip()
+        instr_clean = _format_question_clean(instr, max_q_chars=100) if len(instr) > 100 else instr
+        inp_budget = max(60, max_prompt_chars - len(instr_clean) - 1)
+        inp_trimmed = _trim_context_at_boundary(inp, inp_budget)
+        prompt = f"{inp_trimmed}\n{instr_clean}".strip()
     else:
-        prompt = instr[:max_prompt_chars].strip()
+        prompt = _trim_context_at_boundary(instr, max_prompt_chars)
 
     target = _ensure_sentence_end_punct(out[:max_target_chars])
 
@@ -486,12 +560,14 @@ def build_mrc_grounded_pair(
     raw_ans: str,
     max_window_chars: int = 200,
     max_target_chars: int = 120,
+    max_prompt_chars: int = 240,
 ) -> Optional[Tuple[str, str]]:
     """
     Domain 2 MRC helper:
-      - Extracts a `<= 200`-char context window around the answer span so `context_window`
-        fits inside `prompt_seq_len=256`.
-      - Formats `prompt = f"{context_window}\\n问题：{question}"`.
+      - Preserves the complete question `q` (up to 100 chars, never cut mid-phrase at 45 chars).
+      - Dynamically computes `ctx_budget = max(60, min(max_window_chars, max_prompt_chars - len(q_suffix)))`
+        around the answer span so `prompt = f"{context_window}\\n问题：{q_clean}"` fits inside
+        `prompt_seq_len=256` with the question 100% intact.
       - Uses the full sentence from `context` containing the answer (or `answer` if
         `len(answer) >= 10`) so `target` is always a complete clause (`10 <= len(target) <= 120`).
     """
@@ -567,25 +643,29 @@ def build_mrc_grounded_pair(
     if not (10 <= len(target) <= max_target_chars):
         return None
 
+    q_clean = _format_question_clean(q, max_q_chars=100)
+    q_suffix = f"\n问题：{q_clean}"
+    eff_win_cap = max(60, min(max_window_chars, max_prompt_chars - len(q_suffix)))
+
     tgt_clean = _STRIP_PUNCT_RE.sub("", target)
     t_pos = ctx.find(tgt_clean)
     if t_pos < 0:
         t_pos = max(0, ans_pos)
     t_end = min(len(ctx), t_pos + len(tgt_clean))
 
-    win_cap = min(max_window_chars, len(ctx))
+    win_cap = min(eff_win_cap, len(ctx))
     span_len = max(1, t_end - t_pos)
     extra_room = max(0, win_cap - span_len)
-    lead_room = min(t_pos, max(16, extra_room // 2))
+    lead_room = min(t_pos, max(12, extra_room // 2))
     win_start = max(0, t_pos - lead_room)
     win_end = min(len(ctx), win_start + win_cap)
     win_start = max(0, win_end - win_cap)
 
     context_window = ctx[win_start:win_end].strip()
-    if len(context_window) > max_window_chars:
-        context_window = context_window[:max_window_chars].strip()
+    if len(context_window) > eff_win_cap:
+        context_window = context_window[:eff_win_cap].strip()
 
-    prompt = f"{context_window}\n问题：{q[:45]}"
+    prompt = f"{context_window}{q_suffix}"
     if not is_non_cheating_grounded_pair(prompt, target):
         return None
 
@@ -602,8 +682,8 @@ def build_grounded_wiki_pair(
     Domain 2 Wikipedia helper:
       - Splits the Wikipedia entry (`completion`) into sentences.
       - Takes the first 1-2 core sentences as `target` (`15 <= len(target) <= 120`).
-      - Constructs `prompt` from supporting context sentences + reordered factual clauses
-        from the entry + question (`f"{supporting_context}\\n请根据以上资料概括{title}："`).
+      - Constructs `prompt` from supporting context sentences in natural chronological order
+        (`参考资料：...`) + question (`f"{supporting_context}\\n请根据以上资料概括{title}："`).
     """
     clean_title = clean_text(title)
     clean_body = clean_text(completion)
@@ -636,21 +716,15 @@ def build_grounded_wiki_pair(
     if not (15 <= len(target) <= max_target_chars):
         return None
 
-    reordered_core = _reorder_clauses_for_grounding(target)
-    other_sents = [re.sub(r"[。！？；\n]+$", "", s) for s in sentences[1:4] if s != target]
-    if other_sents:
-        supporting_raw = "。".join(other_sents[:2]) + "。" + reordered_core + "。"
-    else:
-        supporting_raw = reordered_core + "。"
+    natural_sents = [_reorder_clauses_for_grounding(s) for s in sentences[:4] if _reorder_clauses_for_grounding(s)]
+    supporting_raw = "参考资料：" + "。".join(natural_sents) + "。"
 
     topic_label = clean_title if clean_title else "该词条"
     question_suffix = f"\n请根据以上资料概括{topic_label[:20]}："
     ctx_budget = max(60, max_prompt_chars - len(question_suffix))
-    supporting_context = supporting_raw[:ctx_budget].strip()
+    supporting_context = _trim_context_at_boundary(supporting_raw, ctx_budget)
 
     prompt = f"{supporting_context}{question_suffix}"
-    if len(prompt) > max_prompt_chars:
-        prompt = prompt[:max_prompt_chars]
 
     if not is_non_cheating_grounded_pair(prompt, target):
         return None
@@ -669,8 +743,10 @@ def build_grounded_zhihu_pair(
     """
     Domain 2 Zhihu helper:
       - Selects answers with multiple clauses (`len >= 60`).
-      - Places supporting context clauses + question in `prompt`, and the core
-        conclusion/summary clause in `target` (`15 <= len(target) <= 120`).
+      - Keeps supporting clauses in their natural chronological order (`背景资料：...`)
+        so antecedents always precede pronouns.
+      - Preserves the complete question `q` (up to 100 chars, never truncated at 45 chars)
+        and trims background context to `ctx_budget = max_prompt_chars - len(q_suffix)`.
     """
     q = clean_text(question)
     a = clean_text(answer)
@@ -685,13 +761,14 @@ def build_grounded_zhihu_pair(
     if not (15 <= len(target) <= max_target_chars):
         return None
 
-    reordered_lead = _reorder_clauses_for_grounding(clauses[0])
-    supporting_parts = clauses[1:4] + [reordered_lead]
-    supporting_str = "。".join(supporting_parts) + "。"
+    natural_parts = [_reorder_clauses_for_grounding(c) for c in clauses[:4] if _reorder_clauses_for_grounding(c)]
+    supporting_str = "背景资料：" + "。".join(natural_parts) + "。"
 
-    q_suffix = f"\n问题：{q[:45]}"
+    q_clean = _format_question_clean(q, max_q_chars=100)
+    q_suffix = f"\n问题：{q_clean}"
     ctx_budget = max(60, max_prompt_chars - len(q_suffix))
-    prompt = f"{supporting_str[:ctx_budget].strip()}{q_suffix}"
+    supporting_trimmed = _trim_context_at_boundary(supporting_str, ctx_budget)
+    prompt = f"{supporting_trimmed}{q_suffix}"
 
     if not is_non_cheating_grounded_pair(prompt, target):
         return None
@@ -708,11 +785,11 @@ def build_grounded_literature_pair(
 ) -> Optional[Tuple[str, str]]:
     """
     Domain 3 Literature & Narrative Summarization helper:
-      - Extracts a passage of 3-5 sentences (`100..240` chars).
+      - Extracts a passage of 3-5 sentences (`100..240` chars) in natural chronological order.
       - Selects a key sentence from the passage that shares character/place entities
         with the rest of the passage as `target` (`15 <= len(target) <= 120`).
-      - Places the surrounding passage context + reordered key clauses + narrative prompt
-        in `prompt` at a shifted offset so `prompt` and `target` do not start at the same token.
+      - Places the passage context (`叙事片段：...`) + narrative prompt in `prompt`
+        so sentence chronology is preserved and `prompt` and `target` do not start at the same token.
     """
     cleaned = clean_text(text)
     if len(cleaned) < 80:
@@ -722,8 +799,8 @@ def build_grounded_literature_pair(
     if len(clauses) < 3:
         return None
 
-    passage_clauses = clauses[:5]
-    best_idx = 1
+    passage_clauses = clauses[:4]
+    best_idx = 0
     best_overlap = -1
     for i in range(len(passage_clauses)):
         cand = passage_clauses[i]
@@ -731,7 +808,7 @@ def build_grounded_literature_pair(
             continue
         others_text = "。".join(passage_clauses[:i] + passage_clauses[i + 1 :])
         ov = len(_extract_content_bigrams(cand) & _extract_content_bigrams(others_text))
-        score = ov * 2 + (1 if i >= 1 else 0)
+        score = ov * 2 + (1 if i <= 1 else 0)
         if score > best_overlap:
             best_overlap = score
             best_idx = i
@@ -741,13 +818,13 @@ def build_grounded_literature_pair(
     if not (15 <= len(target) <= max_target_chars):
         return None
 
-    surrounding = [passage_clauses[i] for i in range(len(passage_clauses)) if i != best_idx]
-    reordered_target = _reorder_clauses_for_grounding(target_raw)
-    context_body = "。".join(surrounding[:3] + [reordered_target]) + "。"
+    natural_clauses = [_reorder_clauses_for_grounding(c) for c in passage_clauses if _reorder_clauses_for_grounding(c)]
+    context_body = "叙事片段：" + "。".join(natural_clauses) + "。"
 
     suffix = "\n请根据上述叙事片段提炼关键情节："
-    ctx_budget = max(80, min(205, max_prompt_chars - len(suffix)))
-    prompt = f"{context_body[:ctx_budget].strip()}{suffix}"
+    ctx_budget = max(80, max_prompt_chars - len(suffix))
+    trimmed_body = _trim_context_at_boundary(context_body, ctx_budget)
+    prompt = f"{trimmed_body}{suffix}"
 
     if not is_non_cheating_grounded_pair(prompt, target):
         return None
@@ -812,12 +889,16 @@ def build_grounded_poetry_pair(
     """
     Domain 6 Classical Poetry helper:
       - Zero `【...】` bracket tags.
-      - Places grounded poem context + title/author in `prompt` and verse/clause in `target`.
+      - Keeps couplets in their natural order in `prompt` and preserves the trailing question intact.
     """
     clean_title = clean_text(title)
     clean_author = clean_text(author)
     if isinstance(content, list):
-        raw_content = "。".join(clean_text(str(x)) for x in content if clean_text(str(x)))
+        raw_content = "。".join(
+            re.sub(r"[。！？；\n]+$", "", clean_text(str(x)))
+            for x in content
+            if clean_text(str(x))
+        ) + "。"
     else:
         raw_content = clean_text(str(content))
 
@@ -832,14 +913,13 @@ def build_grounded_poetry_pair(
     if len(couplets) < 2:
         return None
 
-    target_idx = 1 if len(couplets) >= 2 else 0
+    target_idx = 0
     target = _ensure_sentence_end_punct(couplets[target_idx][:max_target_chars])
     if not (10 <= len(target) <= max_target_chars):
         return None
 
-    other_couplets = [re.sub(r"[。！？；\n]+$", "", c) for i, c in enumerate(couplets[:4]) if i != target_idx]
-    reordered_verse = _reorder_clauses_for_grounding(couplets[target_idx])
-    poem_ctx = "。".join(other_couplets + [reordered_verse]) + "。"
+    natural_couplets = [_reorder_clauses_for_grounding(c) for c in couplets[:4] if _reorder_clauses_for_grounding(c)]
+    poem_ctx = "。".join(natural_couplets) + "。"
 
     meta_parts = []
     if clean_title:
@@ -848,8 +928,10 @@ def build_grounded_poetry_pair(
         meta_parts.append(f"作者：{clean_author}")
     meta_header = "，".join(meta_parts) if meta_parts else "古典诗词鉴赏"
 
-    prompt = f"{meta_header}。关联诗句与意境：{poem_ctx[:150]}\n请写出该诗对应的核心诗句："
-    prompt = prompt[:max_prompt_chars]
+    suffix = "\n请写出该诗对应的核心诗句："
+    ctx_budget = max(60, max_prompt_chars - len(suffix))
+    header_and_ctx = _trim_context_at_boundary(f"{meta_header}。关联诗句与意境：{poem_ctx}", ctx_budget)
+    prompt = f"{header_and_ctx}{suffix}"
 
     if not is_non_cheating_grounded_pair(prompt, target):
         return None
@@ -866,8 +948,8 @@ def build_grounded_news_pair(
     """
     Domain 7 News Summarization helper:
       - Zero `【新闻报道】` bracket tags.
-      - Uses the news lead/body (`<= 220` chars) at a shifted offset in `prompt`
-        and a grounded summary / key factual sentence (`15 <= len(target) <= 120`) in `target`.
+      - Keeps news sentences in their natural chronological order (`新闻背景：...`)
+        and places the lead summary sentence (`15 <= len(target) <= 120`) in `target`.
     """
     cleaned = clean_text(text)
     clean_label = clean_text(label)
@@ -882,14 +964,14 @@ def build_grounded_news_pair(
     if not (15 <= len(target) <= max_target_chars):
         return None
 
-    reordered_lead = _reorder_clauses_for_grounding(clauses[0])
-    body_clauses = clauses[1:4] + [reordered_lead]
-    news_body = "。".join(body_clauses)[:200].strip() + "。"
+    natural_clauses = [_reorder_clauses_for_grounding(c) for c in clauses[:4] if _reorder_clauses_for_grounding(c)]
+    news_body = "新闻背景：" + "。".join(natural_clauses) + "。"
 
     label_hint = f"{clean_label}领域" if clean_label and not clean_label.isdigit() else ""
     suffix = f"\n请根据上述新闻报道概括{label_hint}核心事实："
-    ctx_budget = max(70, min(215, max_prompt_chars - len(suffix)))
-    prompt = f"{news_body[:ctx_budget].strip()}{suffix}"
+    ctx_budget = max(70, max_prompt_chars - len(suffix))
+    trimmed_body = _trim_context_at_boundary(news_body, ctx_budget)
+    prompt = f"{trimmed_body}{suffix}"
 
     if not is_non_cheating_grounded_pair(prompt, target):
         return None
