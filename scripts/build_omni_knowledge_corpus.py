@@ -58,8 +58,10 @@ _STRIP_PUNCT_RE = re.compile(
 _PUNCT_SPLIT_RE = re.compile(r"[\s,，.。!！?？;；:：、\"'“”‘’()（）\[\]【】<>《》—\-/\\|]+")
 _LEADING_TAG_RE = re.compile(r"^\s*【[^】]{1,20}】[：:\s]*")
 
+_REORDERED_BOILERPLATE_KEYWORDS = ("划重点", "先说结论", "直接说结论")
+_FORUM_BOILERPLATE_KEYWORDS = ("划重点", "先说结论", "直接说结论", "谢邀", "泻药", "答：", "答:")
 _REORDERED_BOILERPLATE_RE = re.compile(
-    r"([^。！？；\n]+?)，\s*(?:划重点|先说结论|直接说结论)[：:]\s*([^。！？；\n]+?)([。！？；]|$)"
+    r"(^|[。！？；\n]\s*)([^。！？；\n]{1,300}?)，\s*(?:划重点|先说结论|直接说结论)[：:]\s*([^。！？；\n]{1,200}?)([。！？；]|(?=\n)|$)"
 )
 _FORUM_BOILERPLATE_RE = re.compile(
     r"(^|[。！？；\n]\s*)(?:划重点[：:]|先说结论[：:]|直接说结论[：:]|谢邀[，。！,.\s]*|泻药[，。！,.\s]*|答[：:])\s*"
@@ -96,15 +98,17 @@ def clean_text(text: Optional[str]) -> str:
     text = re.sub(r"【([^】]*)】", r"\1", text)
     text = text.replace("【", "").replace("】", "")
     # Restore any pre-reordered `，划重点： <lead>` spans and strip forum boilerplate prefixes
-    text = _REORDERED_BOILERPLATE_RE.sub(
-        lambda m: f"{m.group(2).strip()}，{m.group(1).strip()}{m.group(3)}",
-        text,
-    )
-    while True:
-        next_text = _FORUM_BOILERPLATE_RE.sub(r"\1", text)
-        if next_text == text:
-            break
-        text = next_text
+    if any(k in text for k in _REORDERED_BOILERPLATE_KEYWORDS):
+        text = _REORDERED_BOILERPLATE_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(3).strip()}，{m.group(2).strip()}{m.group(4)}",
+            text,
+        )
+    if any(k in text for k in _FORUM_BOILERPLATE_KEYWORDS):
+        while True:
+            next_text = _FORUM_BOILERPLATE_RE.sub(r"\1", text)
+            if next_text == text:
+                break
+            text = next_text
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()

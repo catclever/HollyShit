@@ -12,8 +12,10 @@ _PUNCT_SPLIT_RE = re.compile(r"[\s,，.。!！?？;；:：、\"'“”‘’()�
 _LEADING_TAG_RE = re.compile(r"^\s*【[^】]{1,12}】[：:\s]*")
 
 # Forum / QA boilerplate patterns
+_REORDERED_BOILERPLATE_KEYWORDS = ("划重点", "先说结论", "直接说结论")
+_LEADING_BOILERPLATE_KEYWORDS = ("划重点", "先说结论", "直接说结论", "谢邀", "泻药", "答：", "答:")
 _REORDERED_BOILERPLATE_RE = re.compile(
-    r"([^。！？；\n]+?)，\s*(?:划重点|先说结论|直接说结论)[：:]\s*([^。！？；\n]+?)([。！？；]|$)"
+    r"(^|[。！？；\n]\s*)([^。！？；\n]{1,300}?)，\s*(?:划重点|先说结论|直接说结论)[：:]\s*([^。！？；\n]{1,200}?)([。！？；]|(?=\n)|$)"
 )
 _LEADING_BOILERPLATE_RE = re.compile(
     r"(^|[。！？；\n]\s*)(?:划重点[：:]|先说结论[：:]|直接说结论[：:]|谢邀[，。！,.\s]*|泻药[，。！,.\s]*|答[：:])\s*"
@@ -57,33 +59,43 @@ def _clean_forum_boilerplate(text: str) -> str:
     if not cleaned:
         return ""
 
-    # 1. Restore `<rest>，划重点： <lead>` -> `<lead>，<rest>`
-    cleaned = _REORDERED_BOILERPLATE_RE.sub(
-        lambda m: f"{m.group(2).strip()}，{m.group(1).strip()}{m.group(3)}",
-        cleaned,
-    )
+    # 1. Restore `<rest>，划重点： <lead>` -> `<lead>，<rest>` (fast keyword guard + anchored O(L) regex)
+    if any(k in cleaned for k in _REORDERED_BOILERPLATE_KEYWORDS):
+        cleaned = _REORDERED_BOILERPLATE_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(3).strip()}，{m.group(2).strip()}{m.group(4)}",
+            cleaned,
+        )
 
     # 2. Strip leading forum boilerplate prefixes after start-of-string or sentence boundary
-    while True:
-        next_cleaned = _LEADING_BOILERPLATE_RE.sub(r"\1", cleaned)
-        if next_cleaned == cleaned:
-            break
-        cleaned = next_cleaned
+    if any(k in cleaned for k in _LEADING_BOILERPLATE_KEYWORDS):
+        while True:
+            next_cleaned = _LEADING_BOILERPLATE_RE.sub(r"\1", cleaned)
+            if next_cleaned == cleaned:
+                break
+            cleaned = next_cleaned
 
     # 3. Repair dangling truncated question lines (`问题：...`)
-    lines = cleaned.split("\n")
-    for idx, line in enumerate(lines):
-        stripped_line = line.strip()
-        if stripped_line.startswith("问题：") or stripped_line.startswith("问题:"):
-            for pat, repl in _DANGLING_QUESTION_TAIL_RULES:
-                if pat.search(stripped_line):
-                    stripped_line = pat.sub(repl, stripped_line)
-                    break
-            if not re.search(r"[。！？?!.：:”’）\)]$", stripped_line):
-                stripped_line = re.sub(r"[，,、；;]+$", "", stripped_line).strip() + "？"
-            lines[idx] = stripped_line
+    if ("问题：" in cleaned or "问题:" in cleaned) and (
+        "\n" in cleaned or cleaned[-1] not in "。！？?!.：:”’）)"
+    ):
+        lines = cleaned.split("\n")
+        modified = False
+        for idx, line in enumerate(lines):
+            stripped_line = line.strip()
+            if (stripped_line.startswith("问题：") or stripped_line.startswith("问题:")) and (
+                not stripped_line or stripped_line[-1] not in "。！？?!.：:”’）)"
+            ):
+                for pat, repl in _DANGLING_QUESTION_TAIL_RULES:
+                    if pat.search(stripped_line):
+                        stripped_line = pat.sub(repl, stripped_line)
+                        break
+                if not stripped_line or stripped_line[-1] not in "。！？?!.：:”’）)":
+                    stripped_line = re.sub(r"[，,、；;]+$", "", stripped_line).strip() + "？"
+                lines[idx] = stripped_line
+                modified = True
+        if modified:
+            cleaned = "\n".join(lines).strip()
 
-    cleaned = "\n".join(lines).strip()
     return cleaned
 
 
@@ -111,6 +123,13 @@ def _restore_displaced_lead_sentence(base_context: str, target_text: str) -> str
     if not base_context or not target_text:
         return base_context or ""
 
+    # Fast O(1) prefix/substring guard:
+    # 1) If target's lead phrase already appears near the start of base_context, it is already in natural order.
+    # 2) If target's lead 2 chars don't appear in base_context at all, it cannot be a displaced/rotated lead sentence.
+    if len(target_text) >= 5 and len(base_context) >= 5:
+        if target_text[:5] in base_context[:24] or target_text[:2] not in base_context:
+            return base_context
+
     if "\n" in base_context:
         bg_text, q_line = base_context.rsplit("\n", 1)
         bg_text = bg_text.strip()
@@ -122,16 +141,19 @@ def _restore_displaced_lead_sentence(base_context: str, target_text: str) -> str
     if not bg_text:
         return base_context
 
-    t_sents = [s.strip() for s in re.findall(r"[^。！？；\n]+[。！？；]*", target_text.strip()) if s.strip()]
-    if not t_sents:
+    first_match = re.search(r"[^。！？；\n]+[。！？；]*", target_text.strip())
+    if not first_match:
         return base_context
-    t_first = _ensure_sent_punct(t_sents[0])
-    b_t = _extract_content_bigrams(t_first)
-    if not b_t:
+    t_first = _ensure_sent_punct(first_match.group(0).strip())
+    if not t_first:
         return base_context
 
     bg_sents = [s.strip() for s in re.findall(r"[^。！？；\n]+[。！？；]*", bg_text) if s.strip()]
     if not bg_sents:
+        return base_context
+
+    b_t = _extract_content_bigrams(t_first)
+    if not b_t:
         return base_context
 
     # Case A: Single background sentence that had its comma sub-clauses rotated
@@ -146,21 +168,21 @@ def _restore_displaced_lead_sentence(base_context: str, target_text: str) -> str
 
     # Case B: Multi-sentence background where `bg_sents[0]` is NOT `t_first`,
     #         and `bg_sents[-1]` IS the displaced/comma-reordered version of `t_first`.
+    b_last = _extract_content_bigrams(bg_sents[-1])
+    if not b_last:
+        return base_context
+    last_overlap = len(b_last & b_t) / float(max(1, min(len(b_last), len(b_t))))
+    if last_overlap < 0.70:
+        return base_context
+
     b_first = _extract_content_bigrams(bg_sents[0])
     first_overlap = len(b_first & b_t) / float(max(1, min(len(b_first), len(b_t)))) if b_first else 0.0
     if first_overlap >= 0.75:
         return base_context
 
-    b_last = _extract_content_bigrams(bg_sents[-1])
-    if not b_last:
-        return base_context
-    last_overlap = len(b_last & b_t) / float(max(1, min(len(b_last), len(b_t))))
-    if last_overlap >= 0.70:
-        restored_sents = [t_first] + [_ensure_sent_punct(s) for s in bg_sents[:-1]]
-        new_bg = "".join(restored_sents)
-        return f"{new_bg}\n{q_line}" if q_line else new_bg
-
-    return base_context
+    restored_sents = [t_first] + [_ensure_sent_punct(s) for s in bg_sents[:-1]]
+    new_bg = "".join(restored_sents)
+    return f"{new_bg}\n{q_line}" if q_line else new_bg
 
 
 def _trim_at_boundary(text: str, budget: int) -> str:
@@ -196,12 +218,16 @@ def _trim_at_boundary(text: str, budget: int) -> str:
     return window
 
 
-def _trim_context_preserving_question(base_context: str, max_context_chars: int) -> str:
+def _trim_context_preserving_question(
+    base_context: str,
+    max_context_chars: int,
+    already_cleaned: bool = False,
+) -> str:
     """
     Trims `base_context` to fit within `max_context_chars` while keeping the trailing
     question/instruction line (`\\n问题：...` or `\\n请根据...`) 100% intact.
     """
-    base_clean = _clean_forum_boilerplate(base_context or "")
+    base_clean = (base_context or "").strip() if already_cleaned else _clean_forum_boilerplate(base_context or "")
     if not base_clean or max_context_chars <= 0:
         return ""
     if len(base_clean) <= max_context_chars:
@@ -221,6 +247,24 @@ def _trim_context_preserving_question(base_context: str, max_context_chars: int)
     return _trim_at_boundary(base_clean, max_context_chars)
 
 
+_CONTENT_CHAR_TRANS = str.maketrans(
+    {
+        c: " "
+        for c in " \t\n\r,，.。!！?？;；:：、\"'“”‘’()（）[]【】<>《》—-/\\|"
+        + "的了在是有和与或等中为对从到以及而但并把被让将给按于及其"
+    }
+)
+
+
+def _strip_leading_tag_fast(text: str) -> str:
+    s = text.strip()
+    if s.startswith("【"):
+        idx = s.find("】")
+        if 0 < idx <= 13:
+            return s[idx + 1 :].lstrip("：: \t")
+    return s
+
+
 def _extract_content_bigrams(text: str) -> Set[str]:
     """
     Extracts 2-character content substrings from non-punctuation/non-whitespace segments of `text`,
@@ -228,24 +272,19 @@ def _extract_content_bigrams(text: str) -> Set[str]:
     """
     if not text or not isinstance(text, str):
         return set()
-    cleaned = _LEADING_TAG_RE.sub("", text.strip())
-    segments = [seg for seg in _PUNCT_SPLIT_RE.split(cleaned) if seg]
-    bigrams: Set[str] = set()
-    for seg in segments:
-        if len(seg) >= 2:
-            for i in range(len(seg) - 1):
-                bg = seg[i : i + 2]
-                if bg in _STOPWORD_BIGRAMS:
-                    continue
-                if bg[0] in _STOPWORD_CHARS or bg[1] in _STOPWORD_CHARS:
-                    continue
-                bigrams.add(bg)
-    if not bigrams:
-        joined = "".join(c for c in "".join(segments) if c not in _STOPWORD_CHARS)
-        for i in range(len(joined) - 1):
-            bg = joined[i : i + 2]
-            if bg not in _STOPWORD_BIGRAMS:
-                bigrams.add(bg)
+    cleaned = _strip_leading_tag_fast(text)
+    segs = cleaned.translate(_CONTENT_CHAR_TRANS).split()
+    bigrams = {
+        seg[i : i + 2]
+        for seg in segs
+        if len(seg) >= 2
+        for i in range(len(seg) - 1)
+    } - _STOPWORD_BIGRAMS
+    if not bigrams and segs:
+        joined = "".join(segs)
+        bigrams = {
+            joined[i : i + 2] for i in range(len(joined) - 1)
+        } - _STOPWORD_BIGRAMS
     return bigrams
 
 
@@ -272,7 +311,7 @@ def _filter_genuine_knowledge(
     for idx, raw_k in enumerate(knowledge_list):
         if not raw_k or not isinstance(raw_k, str):
             continue
-        k_clean = _LEADING_TAG_RE.sub("", raw_k.strip()).strip()
+        k_clean = _strip_leading_tag_fast(raw_k)
         if not k_clean:
             continue
         k_bigrams = _extract_content_bigrams(k_clean)
@@ -412,9 +451,10 @@ def _split_target_by_punctuation(
         _clean_forum_boilerplate(base_context or ""),
         text,
     )
-    base_clean = _trim_context_preserving_question(raw_base_clean, max_context_chars)
+    base_clean = _trim_context_preserving_question(raw_base_clean, max_context_chars, already_cleaned=True)
 
     pairs: List[Tuple[str, str]] = []
+    cached_trimmed_base: Dict[int, str] = {}
     for i, clause in enumerate(clauses):
         if i == 0:
             curr_context = base_clean
@@ -428,7 +468,11 @@ def _split_target_by_punctuation(
                 hist_budget = min(len(history_str), max(24, min(80, max_context_chars // 3)))
                 kept_hist = history_str[-hist_budget:] if hist_budget > 0 else ""
                 base_budget = max(40, max_context_chars - len(kept_hist) - 1)
-                kept_base = _trim_context_preserving_question(raw_base_clean, base_budget)
+                if base_budget not in cached_trimmed_base:
+                    cached_trimmed_base[base_budget] = _trim_context_preserving_question(
+                        raw_base_clean, base_budget, already_cleaned=True
+                    )
+                kept_base = cached_trimmed_base[base_budget]
                 curr_context = f"{kept_base}\n{kept_hist}".strip() if kept_base else kept_hist[:max_context_chars]
         pairs.append((curr_context, clause))
 
@@ -630,7 +674,7 @@ class GenericPairDataset(Dataset):
 
     def _load_jsonl(self, file_path: str):
         with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_idx, line in enumerate(f, start=1):
                 if self.max_samples and len(self.samples) >= self.max_samples:
                     break
                 line = line.strip()
@@ -645,6 +689,11 @@ class GenericPairDataset(Dataset):
                         self.samples.append(pair)
                 except Exception:
                     continue
+                if self.verbose and line_idx % 50000 == 0:
+                    print(
+                        f"   ... parsed {line_idx:,} JSONL lines -> {len(self.samples):,} single-clause pairs",
+                        flush=True,
+                    )
 
     def _load_json(self, file_path: str):
         with open(file_path, "r", encoding="utf-8") as f:
