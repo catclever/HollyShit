@@ -63,10 +63,15 @@ class AdaLN(nn.Module):
 
 class OrthogonalAttractor(nn.Module):
     """
-    Implements Knowledge Extraction via Dimensional Cosine Resonance.
-    Preserves the shared 1024-D embedding coordinate axes via diagonal `channel_weight`
-    so `h_wave` unpacked from `z_sent` directly resonates with matching token embeddings in `k_attractors`.
-    Masks out <PAD> prompt tokens so target tokens are not overwritten by padding keys.
+    Implements Span-Aware Knowledge & Symbol Extraction via 3-Gram Cosine Resonance
+    plus Exact Single-Char Value Grafting (`ExactSpanPointer`):
+      - Queries `x` and keys `k` incorporate immediate left/right neighbor context via a
+        depthwise 1D convolution (`kernel_size=3, groups=hidden_dim`) gated by `span_mix`,
+        disambiguating repeated characters inside multi-char entities ("布鲁因斯玛") or
+        code identifiers (`user_account_id`).
+      - Values `k_val` remain the pure, un-blurred single-character `TinyCharEncoderCUDA`
+        embeddings so copied characters retain sharp 1024-D dictionary coordinates.
+      - Masks out <PAD> prompt tokens so target tokens are not overwritten by padding keys.
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -75,6 +80,18 @@ class OrthogonalAttractor(nn.Module):
         self.channel_weight = nn.Parameter(torch.ones(hidden_dim))
         self.logit_scale = nn.Parameter(torch.tensor(15.0))
         self.snap_threshold = 0.08
+
+        # Upgrade A: 3-gram local span context mixer for query/key disambiguation
+        self.span_conv = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=1,
+            groups=hidden_dim,
+        )
+        nn.init.normal_(self.span_conv.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.span_conv.bias)
+        self.span_mix = nn.Parameter(torch.tensor(0.25))
 
     def forward(
         self,
@@ -86,14 +103,23 @@ class OrthogonalAttractor(nn.Module):
         """
         x: (B, L_x, D) - Unet's current generative trajectory
         k: (B, L_k, D) - Knowledge attractor keys
-        k_val: (B, L_k, D) - Knowledge attractor values (defaults to k)
+        k_val: (B, L_k, D) - Pure un-blurred single-char attractor values (defaults to k)
         k_mask: (B, L_k) - Boolean mask indicating non-PAD tokens in k (True=valid, False=PAD)
         """
         if k_val is None:
             k_val = k
 
-        q_unit = F.normalize(self.norm_x(x) * self.channel_weight, dim=-1, eps=1e-6)
-        k_unit = F.normalize(self.norm_k(k) * self.channel_weight, dim=-1, eps=1e-6)
+        mix = torch.tanh(self.span_mix)
+        x_span = x + mix * self.span_conv(x.transpose(1, 2)).transpose(1, 2)
+
+        if k_mask is not None:
+            k_clean = k * k_mask.unsqueeze(-1).to(k.dtype)
+        else:
+            k_clean = k
+        k_span = k_clean + mix * self.span_conv(k_clean.transpose(1, 2)).transpose(1, 2)
+
+        q_unit = F.normalize(self.norm_x(x_span) * self.channel_weight, dim=-1, eps=1e-6)
+        k_unit = F.normalize(self.norm_k(k_span) * self.channel_weight, dim=-1, eps=1e-6)
 
         # Cosine Similarity Matrix: (B, L_x, L_k) in [-1, 1]
         sim = torch.bmm(q_unit, k_unit.transpose(1, 2))
@@ -109,6 +135,7 @@ class OrthogonalAttractor(nn.Module):
         scale = self.logit_scale.clamp(min=1.0, max=35.0)
         attn = F.softmax(sim * scale, dim=-1) * gate
 
+        # Exact single-character value copy from un-blurred k_val
         force = torch.bmm(attn, k_val)
         return force
 
@@ -125,6 +152,11 @@ class Gated1DResBlock(nn.Module):
         self.attractor = OrthogonalAttractor(hidden_dim)
         # Initialized to 0.1 so Step 0 gently engages k_attractors and opens smoothly via gradient descent
         self.attractor_gate = nn.Parameter(torch.full((hidden_dim,), 0.1))
+
+        # Upgrade B: Full-Clause Structural Self-Attention (32x32 global syntax & bracket weaver)
+        self.struct_norm = nn.LayerNorm(hidden_dim)
+        self.struct_attn = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
+        self.struct_gate = nn.Parameter(torch.zeros(hidden_dim))
 
         padding = ((kernel_size - 1) * dilation) // 2
         self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=padding, dilation=dilation)
@@ -158,7 +190,12 @@ class Gated1DResBlock(nn.Module):
             force = self.attractor(x, k_attractors, k_val=k_val, k_mask=k_mask)
             x = x + torch.tanh(self.attractor_gate) * force
 
-        # 4. Sculpt Geometry (1D Conv)
+        # 4. Full-Clause Structural Coordination (Global 32x32 Self-Attention for brackets & syntax)
+        x_struct = self.struct_norm(x)
+        attn_out, _ = self.struct_attn(x_struct, x_struct, x_struct, need_weights=False)
+        x = x + torch.tanh(self.struct_gate) * attn_out
+
+        # 5. Sculpt Local Geometry (1D Dilated Conv)
         x = x.transpose(1, 2)
         x = self.conv1(x)
         x = x.transpose(1, 2)
@@ -174,14 +211,15 @@ class Gated1DResBlock(nn.Module):
 
 class FlowMatching1DUnet(nn.Module):
     """
-    Sign-Aligned Velocity Predictor for OT-CFM (Right Brain / Motor Cortex 021):
-    - Driven by a 2D Sentence Vector `h_potential: (B, 1024)` unpacked into a full-spectrum
+    Stateless Universal Left-Brain Crystallizer (`LeftBrainCrystallizer` / `FlowMatching1DUnet` 025):
+    - Unpacks a 2D Punctuation-Clause Vector `h_potential: (B, 1024)` into a full-spectrum
       16-mode Legendre trajectory `h_wave: (B, L, 1024)` over the 64-D principal manifold subspace.
-    - Internal residual stream anchored in the +x_1 manifold: `x = h_wave + 0.2 * x_t + 0.1 * pos_x`
-      so `OrthogonalAttractor` immediately locks onto `k_attractors` even at t=0.
-    - Sign-aligned velocity parameterization: `v_pred = (h_wave - x_t) + self.final_proj(x_normed)`
-      (analytically supplies -x_0 via -x_t and learns +x_1 residual in the exact same + sign convention
-      as +k_attractors, with zero 1/(1-t) singularity).
+      With `seq_len = 32` (10-28 char punctuation clauses), K=16 modes provide ~1:1 full-rank
+      character resolution across the clause.
+    - Combines:
+      1. `unpack_sentence_vector`: Full-rank Legendre wave unpacker;
+      2. `struct_attn` in `Gated1DResBlock`: 32x32 global clause syntax & bracket coordinator;
+      3. Span-aware `OrthogonalAttractor`: 3-gram context matching + exact single-character value copy.
     - Includes built-in Adaptive Manifold Auto-Calibration (`manifold_mean`, `manifold_std`, `subspace_proj`).
     """
     def __init__(
@@ -282,7 +320,7 @@ class FlowMatching1DUnet(nn.Module):
 
     def unpack_sentence_vector(self, z_sent: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        Unpacks a 2D Sentence Vector `z_sent` of shape `(B, D)` into a full-spectrum 16-mode Legendre
+        Unpacks a 2D Clause Vector `z_sent` of shape `(B, D)` into a full-spectrum 16-mode Legendre
         temporal wave `h_wave` of shape `(B, seq_len, D)` over the 64-D principal subspace.
         Scaled by sqrt(K) so total Parseval energy matches the K=16 orthonormal modes on the valid span.
         """
@@ -393,10 +431,10 @@ class FlowMatching1DUnet(nn.Module):
         k_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Sign-Aligned Velocity Field Predictor for OT-CFM:
+        Sign-Aligned Velocity Field Predictor for OT-CFM (`LeftBrainCrystallizer`):
         - Unpacks 2D `z_sent` into full-spectrum 16-mode Legendre trajectory `h_wave` (`(B, L, D)`).
         - Initializes internal stream `x = h_wave + 0.2 * x_t + 0.1 * pos_x` in the +x_1 manifold.
-        - Predicts velocity as `v_pred = (h_wave - x_t) + self.final_proj(x_normed)`.
+        - Predicts velocity via endpoint prediction `x_1_hat = h_wave + self.final_proj(x_normed)`.
         """
         B, L, D = x_t.shape
         t_emb = self.t_embedder(t)
@@ -432,3 +470,7 @@ class FlowMatching1DUnet(nn.Module):
         v_pred = (x_1_hat - x_t) / denom
 
         return v_pred
+
+
+# Canonical alias in the Modular Bicameral Architecture (#025)
+LeftBrainCrystallizer = FlowMatching1DUnet

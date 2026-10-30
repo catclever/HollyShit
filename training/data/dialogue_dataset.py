@@ -40,6 +40,16 @@ _STOPWORD_BIGRAMS = {
     "分组", "词语", "答案", "解析", "结果", "问题", "内容", "信息", "例如", "比如",
 }
 
+_OPEN_TO_CLOSE_BRACKETS = {
+    "（": "）",
+    "(": ")",
+    "【": "】",
+    "[": "]",
+    "《": "》",
+    "“": "”",
+}
+_CLOSE_BRACKETS = set(_OPEN_TO_CLOSE_BRACKETS.values())
+
 
 def _clean_forum_boilerplate(text: str) -> str:
     """
@@ -338,10 +348,114 @@ def _filter_genuine_knowledge(
     return [item[2] for item in top_matches]
 
 
-def _split_overlong_span(span: str, max_clause_chars: int) -> List[str]:
+def _compute_short_paren_mask(text: str, max_short_paren_len: int = 14) -> List[bool]:
     """
-    Splits a single sentence span exceeding `max_clause_chars` by commas `，,`,
-    and hard-slices any still-overlong segment so no returned piece exceeds `max_clause_chars`.
+    Returns a boolean mask of length `len(text)` where `mask[i] == True` means cutting
+    immediately BEFORE index `i` (i.e. `text[:i]` / `text[i:]`) would split inside a closed
+    parenthetical/bracketed span (`（...）`, `(...)`, `【...】`, `[...]`, `《...》`, `“...”`)
+    whose total length is `<= max_short_paren_len`.
+    """
+    n = len(text)
+    in_short_paren = [False] * (n + 1)
+    stack: List[Tuple[str, int]] = []
+    for i, ch in enumerate(text):
+        if ch in _OPEN_TO_CLOSE_BRACKETS:
+            stack.append((_OPEN_TO_CLOSE_BRACKETS[ch], i))
+        elif ch in _CLOSE_BRACKETS and stack:
+            # Find matching opening bracket on stack
+            for s_idx in range(len(stack) - 1, -1, -1):
+                if stack[s_idx][0] == ch:
+                    _, open_pos = stack[s_idx]
+                    del stack[s_idx:]
+                    span_len = i - open_pos + 1
+                    if span_len <= max_short_paren_len:
+                        for cut_idx in range(open_pos + 1, i + 1):
+                            in_short_paren[cut_idx] = True
+                    break
+    return in_short_paren
+
+
+def _split_into_raw_clauses(text: str, short_paren_limit: int = 16) -> List[str]:
+    """
+    Splits `text` into primary punctuation clauses on:
+      - Sentence terminators: `。！？；\\n` (and `.!?;` when not decimal/identifier access)
+      - Clause delimiters: `，,：:`
+    while avoiding splits:
+      1. Inside numeric times/ratios/numbers such as `12:30`, `3.14`, `1,000`, or `::` / `://`;
+      2. Inside unclosed parentheses `（...）` / `(...)` / `[...]` if the parenthetical is short (`<= short_paren_limit`).
+    """
+    n = len(text)
+    if n == 0:
+        return []
+
+    short_paren_cut_mask = _compute_short_paren_mask(text, max_short_paren_len=short_paren_limit)
+    clauses: List[str] = []
+    start = 0
+    i = 0
+
+    while i < n:
+        ch = text[i]
+        is_split = False
+
+        if ch in "。！？；\n":
+            is_split = True
+        elif ch in "，,":
+            prev_is_digit = i > 0 and text[i - 1].isdigit()
+            next_is_digit = (i + 1 < n) and text[i + 1].isdigit()
+            if not (prev_is_digit and next_is_digit) and not short_paren_cut_mask[i + 1]:
+                is_split = True
+        elif ch in "：:":
+            prev_is_digit = i > 0 and text[i - 1].isdigit()
+            next_is_digit = (i + 1 < n) and text[i + 1].isdigit()
+            is_double_colon = (i + 1 < n and text[i + 1] == ":") or (i > 0 and text[i - 1] == ":")
+            is_url = (i + 2 < n) and text[i + 1 : i + 3] == "//"
+            if not (prev_is_digit and next_is_digit) and not is_double_colon and not is_url and not short_paren_cut_mask[i + 1]:
+                is_split = True
+        elif ch in ".!?;":
+            prev_is_alnum = i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+            next_is_alnum = (i + 1 < n) and (text[i + 1].isalnum() or text[i + 1] == "_")
+            if ch == "." and prev_is_alnum and next_is_alnum:
+                is_split = False
+            elif not short_paren_cut_mask[i + 1]:
+                is_split = True
+
+        if is_split:
+            # Consume consecutive closing brackets/quotes/punctuation attached to this boundary
+            end = i + 1
+            while end < n and text[end] in "”’\"'）)]】》":
+                end += 1
+            piece = text[start:end].strip()
+            if piece:
+                clauses.append(piece)
+            start = end
+            i = end
+            continue
+
+        i += 1
+
+    if start < n:
+        tail = text[start:].strip()
+        if tail:
+            clauses.append(tail)
+
+    return clauses
+
+
+def _split_overlong_span(
+    span: str,
+    max_clause_chars: int = 28,
+    min_clause_chars: int = 10,
+) -> List[str]:
+    """
+    Splits a single comma-less or still-overlong clause span exceeding `max_clause_chars`
+    into natural sub-clauses of `[min_clause_chars, max_clause_chars]` characters:
+      - Avoids splitting inside short parentheticals (`<= 14` chars, e.g. `（视力障碍S11级）`, `（也可译为“申诉”）`, `(user_id,30)`).
+      - Prioritizes natural sub-clause boundaries within `[lower, upper]`:
+        1. Immediately after closing brackets/quotes (`）`, `)`, `】`, `]`, `》`, `”`)
+        2. At enumeration commas `、`, semicolons `;`, or whitespace `' '` between words/tokens
+        3. Immediately before opening brackets (`（`, `(`, `【`, `[`) if prefix is >= 16 chars
+        4. At Chinese discourse/syntactic transition markers (`提出`, `说`, `表示`, `在`, `被`, `并`, `与`, `和`)
+        5. Clean fallback outside short parentheticals and ASCII tokens.
     """
     span = span.strip()
     if not span:
@@ -349,45 +463,116 @@ def _split_overlong_span(span: str, max_clause_chars: int) -> List[str]:
     if len(span) <= max_clause_chars:
         return [span]
 
-    comma_parts = [p.strip() for p in re.findall(r"[^，,]+[，,]*", span) if p.strip()]
     pieces: List[str] = []
-    acc = ""
-    for part in comma_parts:
-        if len(part) > max_clause_chars:
-            if acc:
-                pieces.append(acc)
-                acc = ""
-            for i in range(0, len(part), max_clause_chars):
-                chunk = part[i : i + max_clause_chars].strip()
-                if chunk:
-                    pieces.append(chunk)
-            continue
+    curr = span
 
-        candidate = f"{acc}{part}" if acc else part
-        if len(candidate) <= max_clause_chars:
-            acc = candidate
-        else:
-            if acc:
-                pieces.append(acc)
-            acc = part
+    while len(curr) > max_clause_chars:
+        L = len(curr)
+        short_mask = _compute_short_paren_mask(curr, max_short_paren_len=14)
 
-    if acc:
-        pieces.append(acc)
+        upper = min(max_clause_chars, L - min_clause_chars) if L >= 2 * min_clause_chars else max_clause_chars
+        lower = min(min_clause_chars, upper)
+
+        # Target balanced cut if remaining length is < 2 * max_clause_chars
+        num_chunks_est = max(2, int(math.ceil(L / float(max_clause_chars))))
+        ideal_cut = min(upper, max(lower, int(round(L / float(num_chunks_est)))))
+
+        best_cut: Optional[int] = None
+
+        # Priority 1: Immediately after closing brackets/quotes (`）`, `)`, `】`, `]`, `》`, `”`)
+        p1_cands = [
+            idx
+            for idx in range(upper, lower - 1, -1)
+            if not short_mask[idx] and curr[idx - 1] in "）)】]》”\""
+        ]
+        if p1_cands:
+            best_cut = min(p1_cands, key=lambda c: abs(c - ideal_cut) if c >= min_clause_chars else 999)
+
+        # Priority 2: Enumeration comma `、` or whitespace `' '` between words/segments
+        if best_cut is None:
+            p2_cands = []
+            for idx in range(upper, lower - 1, -1):
+                if short_mask[idx]:
+                    continue
+                if curr[idx - 1] in "、;；":
+                    p2_cands.append(idx)
+                elif curr[idx - 1] == " " or curr[idx] == " ":
+                    p2_cands.append(idx)
+            if p2_cands:
+                best_cut = min(p2_cands, key=lambda c: abs(c - ideal_cut))
+
+        # Priority 3: Immediately before opening bracket (`（`, `(`, `【`, `[`) if prefix is substantial
+        if best_cut is None:
+            p3_cands = [
+                idx
+                for idx in range(upper, max(lower, 15) - 1, -1)
+                if not short_mask[idx] and curr[idx] in "（(【[《“\""
+            ]
+            if p3_cands:
+                best_cut = min(p3_cands, key=lambda c: abs(c - ideal_cut))
+
+        # Priority 4: Syntactic / discourse boundary markers in Chinese or code
+        if best_cut is None:
+            p4_cands = []
+            for idx in range(upper, lower - 1, -1):
+                if short_mask[idx]:
+                    continue
+                # Avoid splitting inside an ASCII identifier/word
+                if curr[idx - 1].isascii() and curr[idx - 1].isalnum() and curr[idx].isascii() and curr[idx].isalnum():
+                    continue
+                if curr[idx : idx + 2] in ("提出", "表示", "认为", "发现", "包含", "返回", "如果", "因为", "所以", "但是", "并且", "同时"):
+                    p4_cands.append(idx)
+                elif curr[idx] in "说称被在并和与向对从由把让将给":
+                    p4_cands.append(idx)
+                elif curr[idx - 1] in "的了后中时上内":
+                    p4_cands.append(idx)
+            if p4_cands:
+                best_cut = min(p4_cands, key=lambda c: abs(c - ideal_cut))
+
+        # Priority 5: Clean fallback outside short parentheticals and ASCII words
+        if best_cut is None:
+            for idx in range(ideal_cut, upper + 1):
+                if not short_mask[idx] and not (
+                    curr[idx - 1].isascii() and curr[idx - 1].isalnum() and curr[idx].isascii() and curr[idx].isalnum()
+                ):
+                    best_cut = idx
+                    break
+        if best_cut is None:
+            for idx in range(ideal_cut - 1, lower - 1, -1):
+                if not short_mask[idx] and not (
+                    curr[idx - 1].isascii() and curr[idx - 1].isalnum() and curr[idx].isascii() and curr[idx].isalnum()
+                ):
+                    best_cut = idx
+                    break
+        if best_cut is None:
+            best_cut = ideal_cut
+
+        chunk = curr[:best_cut].strip()
+        if chunk:
+            pieces.append(chunk)
+        curr = curr[best_cut:].strip()
+
+    if curr:
+        pieces.append(curr)
+
     return pieces
 
 
 def _split_target_by_punctuation(
     base_context: str,
     target_text: str,
-    max_clause_chars: int = 120,
-    min_clause_chars: int = 8,
+    max_clause_chars: int = 28,
+    min_clause_chars: int = 10,
     max_context_chars: int = 248,
 ) -> List[Tuple[str, str]]:
     """
-    Splits `target_text` by sentence/line boundaries (`r"[^。！？；\\n]+[。！？；\\n]*"`),
-    further splits over-long sentences (`> max_clause_chars`) by comma `，,`,
-    merges adjacent short fragments (`< min_clause_chars`) into `[min_clause_chars, max_clause_chars]`,
-    and builds a progressive sentence chain `(curr_context, clause_i)`:
+    Splits `target_text` by clause-level punctuation (`。！？；\\n` as well as commas `，,` and colons `：`,
+    avoiding splits inside `12:30` numeric times or short parentheses `（...）` / `(...)`),
+    splits any comma-less span `> max_clause_chars` cleanly,
+    and uses breathing-window merging to merge adjacent short fragments (`< min_clause_chars = 10`,
+    such as `"8月27日，"` or `"她说，"`) forward into the following clause (or backward at the end)
+    within a soft ceiling of `max(max_clause_chars, 30)` chars (`<= 30` chars + `<BOS>/<EOS>` <= `seq_len=32`).
+    Builds a progressive clause chain `(curr_context, clause_i)`:
       - Clause 0: `(base_context, clause_0)`
       - Clause i >= 1: appends `clause_0 .. clause_{i-1}` to `base_context` within `max_context_chars`.
     """
@@ -397,32 +582,40 @@ def _split_target_by_punctuation(
     if not text:
         return []
 
-    raw_sentences = [
-        s.strip()
-        for s in re.findall(r"[^。！？；\n]+[。！？；\n]*", text)
-        if s.strip()
-    ]
-    if not raw_sentences:
-        raw_sentences = [text]
+    raw_clauses = _split_into_raw_clauses(text, short_paren_limit=16)
+    if not raw_clauses:
+        raw_clauses = [text]
 
     bounded_spans: List[str] = []
-    for sent in raw_sentences:
-        bounded_spans.extend(_split_overlong_span(sent, max_clause_chars))
+    for raw_c in raw_clauses:
+        bounded_spans.extend(
+            _split_overlong_span(raw_c, max_clause_chars=max_clause_chars, min_clause_chars=min_clause_chars)
+        )
 
-    # Merge adjacent short fragments (< min_clause_chars)
+    # Soft ceiling for breathing-window merge of short lead/tail fragments (30 chars + <BOS>/<EOS> == 32 tokens)
+    soft_merge_ceiling = max(max_clause_chars, min(max_clause_chars + 2, 30))
+
+    # Merge adjacent short fragments (< min_clause_chars) forward into the following clause (or backward at the end)
     clauses: List[str] = []
     buf = ""
     for span in bounded_spans:
         if not buf:
             buf = span
         elif len(buf) < min_clause_chars:
-            sep = "" if re.search(r"[。！？；，,：:\n]$", buf) else " "
+            sep = "" if re.search(r"[。！？；，,：:、\n）\)]$", buf) else " "
             candidate = f"{buf}{sep}{span}"
-            if len(candidate) <= max_clause_chars:
+            if len(candidate) <= soft_merge_ceiling:
                 buf = candidate
-            else:
-                clauses.append(buf)
+            elif clauses and len(clauses[-1]) + len(buf) <= soft_merge_ceiling:
+                prev_sep = "" if re.search(r"[。！？；，,：:、\n）\)]$", clauses[-1]) else " "
+                clauses[-1] = f"{clauses[-1]}{prev_sep}{buf}"
                 buf = span
+            else:
+                re_split = _split_overlong_span(
+                    candidate, max_clause_chars=max_clause_chars, min_clause_chars=min_clause_chars
+                )
+                clauses.extend(re_split[:-1])
+                buf = re_split[-1] if re_split else ""
         else:
             clauses.append(buf)
             buf = span
@@ -433,12 +626,16 @@ def _split_target_by_punctuation(
 
     if buf:
         if clauses and len(buf) < min_clause_chars:
-            sep = "" if re.search(r"[。！？；，,：:\n]$", clauses[-1]) else " "
+            sep = "" if re.search(r"[。！？；，,：:、\n）\)]$", clauses[-1]) else " "
             merged_tail = f"{clauses[-1]}{sep}{buf}"
-            if len(merged_tail) <= max_clause_chars:
+            if len(merged_tail) <= soft_merge_ceiling:
                 clauses[-1] = merged_tail
             else:
-                clauses.append(buf)
+                re_split = _split_overlong_span(
+                    merged_tail, max_clause_chars=max_clause_chars, min_clause_chars=min_clause_chars
+                )
+                clauses[-1] = re_split[0]
+                clauses.extend(re_split[1:])
         else:
             clauses.append(buf)
 
@@ -486,8 +683,8 @@ class GenericPairDataset(Dataset):
       - Multiple formats: JSONL, JSON, Parquet
       - Automatic negative distractor (K-) removal on `"knowledge"` lists via `_filter_genuine_knowledge`
       - Automatic forum boilerplate cleaning & question-preserving context trimming
-      - Punctuation-split progressive single-clause target chains via `_split_target_by_punctuation`
-      - Default `seq_len = 128` (`target_seq_len = 128`, `prompt_seq_len = max(seq_len, 256)`)
+      - Punctuation-split progressive short-clause target chains (10-28 chars) via `_split_target_by_punctuation`
+      - Default `seq_len = 32` (`target_seq_len = 32`, `prompt_seq_len = max(seq_len, 256)`)
     """
 
     PROMPT_CANDIDATE_KEYS = [
@@ -503,16 +700,16 @@ class GenericPairDataset(Dataset):
         self,
         data_path: Union[str, List[str]],
         tokenizer,
-        seq_len: int = 128,
+        seq_len: int = 32,
         prompt_seq_len: Optional[int] = None,
         target_seq_len: Optional[int] = None,
         prompt_key: Optional[str] = None,
         target_key: Optional[str] = None,
         max_samples: Optional[int] = None,
-        min_target_len: int = 0,
+        min_target_len: int = 10,
         split_by_punctuation: bool = True,
-        max_clause_chars: int = 120,
-        min_clause_chars: int = 8,
+        max_clause_chars: int = 28,
+        min_clause_chars: int = 10,
         verbose: bool = True,
     ):
         self.tokenizer = tokenizer
@@ -533,8 +730,9 @@ class GenericPairDataset(Dataset):
 
         if self.verbose:
             print(
-                f"✅ Loaded {len(self.samples)} single-clause pairs successfully "
+                f"✅ Loaded {len(self.samples)} punctuation-clause pairs successfully "
                 f"(prompt_seq_len={self.prompt_seq_len}, target_seq_len={self.target_seq_len}, "
+                f"clause_chars=[{self.min_clause_chars}, {self.max_clause_chars}], "
                 f"split_by_punctuation={self.split_by_punctuation})."
             )
 

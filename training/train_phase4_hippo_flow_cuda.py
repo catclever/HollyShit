@@ -19,13 +19,9 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 from training.core.char_tokenizer import CharTokenizer
 
 from model.hippo_oracle import HiPPOOracleCUDA
-from model.flow_unet_cuda import FlowMatching1DUnet
+from model.flow_unet_cuda import FlowMatching1DUnet, LeftBrainCrystallizer
 from model.loss_hippo_cfm import hippo_cfm_loss
-
-try:
-    from training.data.dialogue_dataset import GenericPairDataset
-except ImportError:
-    from training.data.knowledge_dataset import GenericPairDataset
+from training.data.dialogue_dataset import GenericPairDataset
 
 from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
@@ -137,7 +133,7 @@ def find_latest_translator_ckpt(base_dirs=["checkpoints/run", "checkpoints"]):
     return None
 
 
-def find_compatible_unet_ckpt(unet, out_dir, prefix="phase4_hippo_flow", device="cpu"):
+def find_compatible_unet_ckpt(unet, out_dir, prefix="phase4_sentvec_flow", device="cpu"):
     """
     Finds the latest checkpoint with matching architecture by testing strict `load_state_dict`
     compatibility in descending order of global_step. Skips incompatible legacy checkpoints cleanly.
@@ -208,9 +204,9 @@ def encode_tokens(encoder, token_ids: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=128, prompt_mask=None, device="cpu"):
+def sample_euler_ode(unet, x_prompt, h_potential, steps=10, seq_len=32, prompt_mask=None, device="cpu"):
     """
-    Standard Stable Euler ODE Integrator conditioned on 2D Sentence Vector `h_potential: (B, 1024)` + `k_attractors`:
+    Standard Stable Euler ODE Integrator conditioned on 2D Clause Vector `h_potential: (B, 1024)` + `k_attractors`:
     dX_t = v(X_t, t, h_potential=z_sent, k_attractors=x_prompt_norm, k_mask=prompt_mask) * dt
     Integrates from white noise X_0 ~ N(0, I) -> X_1_norm, then auto-denormalizes back to encoder manifold.
     """
@@ -234,7 +230,7 @@ def train():
         else "data/Basic_ZH/moss_dialogues.jsonl"
     )
 
-    parser = get_training_parser("Phase 4 HiPPO 2D Sentence Vector + Flow Match Engine (CUDA 021)")
+    parser = get_training_parser("Phase 4 Punctuation-Clause LeftBrainCrystallizer + HiPPO Flow Engine (CUDA)")
     parser.add_argument("--data_path", type=str, default=default_data_path, help="Path to dialogue/knowledge dataset (file, dir, or glob)")
     parser.add_argument("--prompt_seq_len", type=int, default=256, help="Max token length for Prompt + Knowledge k_attractors")
     parser.add_argument("--prompt_key", type=str, default=None, help="Explicit prompt key in dataset items")
@@ -246,14 +242,14 @@ def train():
     parser.add_argument("--euler_steps", type=int, default=10, help="Euler ODE integration steps for qualitative evaluation")
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["bf16", "fp16", "no"], help="Mixed precision mode (bf16, fp16, no)")
     parser.add_argument("--accum_steps", type=int, default=1, help="Number of gradient accumulation steps")
-    parser.add_argument("--min_target_len", type=int, default=8, help="Minimum clause character length after punctuation split")
-    parser.add_argument("--max_clause_chars", type=int, default=120, help="Maximum clause character length after punctuation split")
-    parser.add_argument("--split_by_punctuation", action="store_true", default=True, help="Split multi-sentence targets into progressive single clauses")
+    parser.add_argument("--min_target_len", type=int, default=10, help="Minimum clause character length after punctuation split (default 10)")
+    parser.add_argument("--max_clause_chars", type=int, default=28, help="Maximum clause character length after punctuation split (default 28)")
+    parser.add_argument("--split_by_punctuation", action="store_true", default=True, help="Split multi-sentence targets into progressive 10-28 char punctuation clauses")
     parser.add_argument("--no_split_by_punctuation", dest="split_by_punctuation", action="store_false", help="Disable punctuation splitting")
     parser.add_argument("--attractor_prob", type=float, default=0.90, help="Probability of enabling k_attractors during Phase 4 training (default 0.90)")
     parser.add_argument("--pad_loss_weight", type=float, default=0.05, help="Relative weight for <PAD> tokens in flow matching MSE loss")
     parser.set_defaults(
-        seq_len=128,
+        seq_len=32,
         warmup_steps=500,
         ckpt_prefix="phase4_sentvec_flow",
         batch_size=64,
@@ -291,7 +287,7 @@ def train():
 
     tokenizer = CharTokenizer()
 
-    # 1. Punctuation-Split Single-Clause Dataset with Negative Distractor Removal
+    # 1. Punctuation-Split Short-Clause Dataset (10-28 chars, seq_len=32) with Negative Distractor Removal
     dataset = GenericPairDataset(
         data_path=args.data_path,
         tokenizer=tokenizer,
@@ -346,12 +342,12 @@ def train():
     else:
         print(f"⚠️ No translator checkpoint found at '{translator_path}'. Text preview will be disabled.")
 
-    # 4. Phase 4 HiPPO Oracle (Frozen 2D Sentence Vector Bottleneck)
+    # 4. Phase 4 HiPPO Oracle (Frozen 2D Punctuation-Clause Vector Bottleneck)
     hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=16).to(device)
     hippo_oracle.eval()
 
-    # 5. Flow Match Unet (Trainable Right Brain 021)
-    unet = FlowMatching1DUnet(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=16).to(device)
+    # 5. Stateless Universal Left Brain Crystallizer (`LeftBrainCrystallizer` / `FlowMatching1DUnet` 025)
+    unet = LeftBrainCrystallizer(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=16).to(device)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
 
     max_steps = max(1, args.epochs * len(dataloader))
@@ -401,9 +397,9 @@ def train():
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
 
     print(
-        f"🚀 Starting Phase 4 2D Sentence Vector + Sign-Aligned Flow Match Training (021) "
-        f"(seq_len={args.seq_len}, prompt_seq_len={args.prompt_seq_len}, "
-        f"attractor_prob={args.attractor_prob:.2f}, warmup={args.warmup_steps})..."
+        f"🚀 Starting Phase 4 Punctuation-Clause LeftBrainCrystallizer Training (025) "
+        f"(seq_len={args.seq_len}, clause_chars=[{args.min_target_len}, {args.max_clause_chars}], "
+        f"prompt_seq_len={args.prompt_seq_len}, attractor_prob={args.attractor_prob:.2f}, warmup={args.warmup_steps})..."
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -458,7 +454,7 @@ def train():
                     )
                     print(
                         f"⚖️ Adaptive Manifold Scaler -> Auto Scale: {scale_factor:.2f}x | "
-                        f"Normalized Valid Std: {norm_std:.4f} | 2D Z_sent Shape: {tuple(z_check.shape)} "
+                        f"Normalized Valid Std: {norm_std:.4f} | 2D Z_clause Shape: {tuple(z_check.shape)} "
                         f"(Std: {z_check.std().item():.4f}, Unpacked Wave Cos: {wave_cos:.4f})"
                     )
 
@@ -504,7 +500,7 @@ def train():
                 print(
                     f"Epoch {epoch+1} | Step {global_step} | "
                     f"Loss: {loss.item():.4f} (Vel: {metrics['loss_vel'].item():.4f}, Cos: {metrics['loss_cos'].item():.4f}) | "
-                    f"Z_sent Std: {metrics['z_sent_std'].item():.3f} | "
+                    f"Z_clause Std: {metrics['z_sent_std'].item():.3f} | "
                     f"Attractor Prob: {p_attractor:.2f} | Scale: {scale_factor:.2f}x"
                 )
 
@@ -514,7 +510,7 @@ def train():
                 with torch.no_grad():
                     print("\n" + "=" * 70)
                     print(
-                        f"🔮 [Step {global_step}] 2D Sentence Vector Cross-Domain Euler ODE Evaluation "
+                        f"🔮 [Step {global_step}] 2D Punctuation-Clause Cross-Domain Euler ODE Evaluation "
                         f"({len(eval_benchmark_samples)} domains, {args.euler_steps} steps)"
                     )
                     for s_idx, (dom_name, ds_idx) in enumerate(eval_benchmark_samples):
@@ -562,8 +558,8 @@ def train():
 
                         print(f"--- [{dom_name}] Sample #{s_idx + 1} (idx={ds_idx}) ---")
                         print(f"Prompt + Knowledge (k_attractors): {prompt_text}")
-                        print(f"Target Sentence (len={valid_len}, Z_sent shape: {tuple(z_sent.shape)}): {ref_text}")
-                        print(f"Right-Brain Generated (from 1x1024 Z_sent + k_attractors): {gen_text}")
+                        print(f"Target Clause (len={valid_len}, Z_clause shape: {tuple(z_sent.shape)}): {ref_text}")
+                        print(f"Left-Brain Crystallized (from 1x1024 Z_clause + k_attractors): {gen_text}")
                     print("=" * 70 + "\n")
 
                 unet.train()
