@@ -871,7 +871,13 @@ class GenericPairDataset(Dataset):
                 self._load_json(file_path)
 
     def _load_jsonl(self, file_path: str):
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        if file_size == 0:
+            print(f"⚠️ Warning: Dataset file '{file_path}' is completely EMPTY (size = 0 bytes)!")
+            return
+
         with open(file_path, "r", encoding="utf-8") as f:
+            valid_lines = 0
             for line_idx, line in enumerate(f, start=1):
                 if self.max_samples and len(self.samples) >= self.max_samples:
                     break
@@ -881,6 +887,8 @@ class GenericPairDataset(Dataset):
                 try:
                     obj = json.loads(line)
                     pairs = self._extract_pairs_from_dict(obj)
+                    if pairs:
+                        valid_lines += 1
                     for pair in pairs:
                         if self.max_samples and len(self.samples) >= self.max_samples:
                             break
@@ -892,6 +900,8 @@ class GenericPairDataset(Dataset):
                         f"   ... parsed {line_idx:,} JSONL lines -> {len(self.samples):,} single-clause pairs",
                         flush=True,
                     )
+            if self.verbose and valid_lines == 0 and line_idx > 0:
+                print(f"⚠️ Warning: Scanned {line_idx} lines from '{file_path}', but extracted 0 pairs! Check prompt/target keys.")
 
     def _load_json(self, file_path: str):
         with open(file_path, "r", encoding="utf-8") as f:
