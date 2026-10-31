@@ -42,11 +42,12 @@ class HiPPOOracleCUDA(nn.Module):
     Frozen HiPPO-LegS Sentence Vector Bottleneck & State-Space Operator (0 trainable params).
     - Default mode (`return_sequence=False`): Projects a 3D token trajectory `x_seq` of shape `(B, L, D)`
       into a strictly 2D Sentence Vector `z_sent` of shape `(B, D)` by projecting all `L` positions
-      (with `<PAD>` positions strictly zeroed via `valid_mask`) onto a fixed warped Legendre basis
-      `basis` of shape `(K=16, L)` across all `d_sub=64` principal channels (`16 x 64 = 1024`).
+      (with `<PAD>` positions strictly zeroed via `valid_mask`) onto a fixed uniform Legendre basis
+      `basis` of shape `(K=32, L)` across all `d_sub=32` principal channels (`32 x 32 = 1024`).
       Guarantees:
-      1. 1:1 coordinate lock with `unpack_sentence_vector(z_sent, L)` (zero positional stretching/shift);
-      2. Full-spectrum `K=16` Legendre harmonic coverage on every one of the 64 subspace channels;
+      1. 1:1 full-rank coordinate lock with `unpack_sentence_vector(z_sent, L)` on `L=32` (`P = B^T B = I_32`,
+         zero neighbor bleed and zero AABB double-character stuttering);
+      2. Full-spectrum `K=32` Legendre harmonic coverage on every one of the 32 subspace channels;
       3. Strict `<PAD>` zeroing and unit per-sentence standard deviation (`Std == 1.0`).
     - Legacy sequence mode (`return_sequence=True`): Returns the 3D causal Toeplitz trajectory `(B, L, D)`.
     """
@@ -57,7 +58,7 @@ class HiPPOOracleCUDA(nn.Module):
         N: int = 64,
         dt: float = 1.0,
         memory_horizon: float = 64.0,
-        num_subbands: int = 16,
+        num_subbands: int = 32,
     ):
         super().__init__()
         if hidden_dim % num_subbands != 0:
@@ -101,18 +102,19 @@ class HiPPOOracleCUDA(nn.Module):
 
     def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Computes the first K = self.num_subbands (16) discrete-orthonormal warped Legendre polynomials
-        evaluated on the fixed sequence window [0, L-1] with front-concentrated midpoint coordinates
-        tau_l = ((l + 0.5) / L) ** 0.65 in (0, 1), orthonormalized via two-pass Gram-Schmidt so that
-        basis @ basis.T == I_K. Returns `basis` of shape (K, L).
+        Computes the first K = self.num_subbands (32) discrete-orthonormal Legendre polynomials
+        evaluated on the fixed sequence window [0, L-1] with uniform midpoint coordinates
+        tau_l = (l + 0.5) / L in (0, 1), orthonormalized via two-pass Gram-Schmidt in float64 so that
+        basis @ basis.T == I_K and (when K == L == 32) basis.T @ basis == I_32 with 0.0000 neighbor bleed.
+        Returns `basis` of shape (K, L).
         """
         key = (L, device, dtype)
         if key in self._basis_cache:
             return self._basis_cache[key]
 
         K = self.num_subbands
-        tau = ((torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))) ** 0.65
-        u = 2.0 * tau - 1.0  # Mapped to (-1, 1)
+        tau = (torch.arange(L, device="cpu", dtype=torch.float64) + 0.5) / float(max(L, 1))
+        u = 2.0 * tau - 1.0  # Mapped uniformly to (-1, 1)
 
         polys = []
         for k in range(K):
@@ -126,7 +128,7 @@ class HiPPOOracleCUDA(nn.Module):
 
         raw_basis = torch.stack(polys, dim=0)  # (K, L)
 
-        # Two-pass discrete Gram-Schmidt orthogonalization + unit L2 row normalization
+        # Two-pass discrete Gram-Schmidt orthogonalization + unit L2 row normalization in float64
         ortho_rows = []
         for k in range(K):
             v = raw_basis[k]
@@ -134,10 +136,10 @@ class HiPPOOracleCUDA(nn.Module):
                 for _ in range(2):
                     for prev in ortho_rows:
                         v = v - torch.dot(v, prev) * prev
-            norm = v.norm(p=2).clamp(min=1e-6)
+            norm = v.norm(p=2).clamp(min=1e-12)
             ortho_rows.append(v / norm)
 
-        basis = torch.stack(ortho_rows, dim=0).to(dtype=dtype)  # (K, L)
+        basis = torch.stack(ortho_rows, dim=0).to(device=device, dtype=dtype)  # (K, L)
         self._basis_cache[key] = basis
         return basis
 

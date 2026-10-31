@@ -248,6 +248,7 @@ def train():
     parser.add_argument("--no_split_by_punctuation", dest="split_by_punctuation", action="store_false", help="Disable punctuation splitting")
     parser.add_argument("--attractor_prob", type=float, default=0.90, help="Probability of enabling k_attractors during Phase 4 training (default 0.90)")
     parser.add_argument("--pad_loss_weight", type=float, default=0.05, help="Relative weight for <PAD> tokens in flow matching MSE loss")
+    parser.add_argument("--num_subbands", type=int, default=32, help="Number of Legendre harmonic modes K in Z_clause (default 32 for full-rank L=32)")
     parser.set_defaults(
         seq_len=32,
         warmup_steps=500,
@@ -343,11 +344,11 @@ def train():
         print(f"⚠️ No translator checkpoint found at '{translator_path}'. Text preview will be disabled.")
 
     # 4. Phase 4 HiPPO Oracle (Frozen 2D Punctuation-Clause Vector Bottleneck)
-    hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=16).to(device)
+    hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=args.num_subbands).to(device)
     hippo_oracle.eval()
 
     # 5. Stateless Universal Left Brain Crystallizer (`LeftBrainCrystallizer` / `FlowMatching1DUnet` 025)
-    unet = LeftBrainCrystallizer(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=16).to(device)
+    unet = LeftBrainCrystallizer(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=args.num_subbands).to(device)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
 
     max_steps = max(1, args.epochs * len(dataloader))

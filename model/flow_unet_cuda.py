@@ -91,7 +91,7 @@ class OrthogonalAttractor(nn.Module):
         )
         nn.init.normal_(self.span_conv.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.span_conv.bias)
-        self.span_mix = nn.Parameter(torch.tensor(0.25))
+        self.span_mix = nn.Parameter(torch.tensor(0.10))
 
     def forward(
         self,
@@ -123,6 +123,26 @@ class OrthogonalAttractor(nn.Module):
 
         # Cosine Similarity Matrix: (B, L_x, L_k) in [-1, 1]
         sim = torch.bmm(q_unit, k_unit.transpose(1, 2))
+
+        # Diagonal Span Relay + Adjacent Same-Key Exclusion (Pauli anti-collapse against AABB stuttering):
+        # 1. `diag_relay`: rewards contiguous span progression (l-1, m-1) -> (l, m) -> (l+1, m+1);
+        # 2. `same_key_competitor`: suppresses two adjacent target positions (l, l+1) from locking
+        #    onto the exact same single source key index m ("随机" -> "随随", "方法" -> "法法").
+        if sim.shape[1] > 1 and sim.shape[2] > 1:
+            s_pos = F.relu(sim.masked_fill(~k_mask.unsqueeze(1), 0.0) if k_mask is not None else sim)
+            diag_prev = torch.zeros_like(s_pos)
+            diag_next = torch.zeros_like(s_pos)
+            diag_prev[:, 1:, 1:] = s_pos[:, :-1, :-1]
+            diag_next[:, :-1, :-1] = s_pos[:, 1:, 1:]
+            diag_relay = 0.5 * (diag_prev + diag_next)
+
+            same_prev = torch.zeros_like(s_pos)
+            same_next = torch.zeros_like(s_pos)
+            same_prev[:, 1:, :] = s_pos[:, :-1, :]
+            same_next[:, :-1, :] = s_pos[:, 1:, :]
+            same_key_competitor = torch.maximum(same_prev, same_next)
+
+            sim = sim + 0.25 * diag_relay - 0.30 * same_key_competitor
 
         # Mask out <PAD> keys so padding receives strictly 0 attention
         if k_mask is not None:
@@ -213,13 +233,13 @@ class FlowMatching1DUnet(nn.Module):
     """
     Stateless Universal Left-Brain Crystallizer (`LeftBrainCrystallizer` / `FlowMatching1DUnet` 025):
     - Unpacks a 2D Punctuation-Clause Vector `h_potential: (B, 1024)` into a full-spectrum
-      16-mode Legendre trajectory `h_wave: (B, L, 1024)` over the 64-D principal manifold subspace.
-      With `seq_len = 32` (10-28 char punctuation clauses), K=16 modes provide ~1:1 full-rank
-      character resolution across the clause.
+      32-mode Legendre trajectory `h_wave: (B, L, 1024)` over the 32-D principal manifold subspace.
+      With `seq_len = 32` (10-28 char punctuation clauses), K=32 uniform modes provide exact 1:1
+      full-rank character resolution (`P = B^T B = I_32`, 0.0000 neighbor bleed) across the clause.
     - Combines:
       1. `unpack_sentence_vector`: Full-rank Legendre wave unpacker;
       2. `struct_attn` in `Gated1DResBlock`: 32x32 global clause syntax & bracket coordinator;
-      3. Span-aware `OrthogonalAttractor`: 3-gram context matching + exact single-character value copy.
+      3. Span-aware `OrthogonalAttractor`: 3-gram context matching + diagonal span relay + Pauli exclusion.
     - Includes built-in Adaptive Manifold Auto-Calibration (`manifold_mean`, `manifold_std`, `subspace_proj`).
     """
     def __init__(
@@ -227,7 +247,7 @@ class FlowMatching1DUnet(nn.Module):
         hidden_dim: int = 1024,
         cond_dim: int = 1024,
         num_layers: int = 6,
-        num_subbands: int = 16,
+        num_subbands: int = 32,
     ):
         super().__init__()
         if hidden_dim % num_subbands != 0:
@@ -279,17 +299,18 @@ class FlowMatching1DUnet(nn.Module):
 
     def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Computes the first K = self.num_subbands (16) discrete-orthonormal warped Legendre polynomials
-        evaluated on the fixed sequence window [0, L-1] with front-concentrated midpoint coordinates
-        tau_l = ((l + 0.5) / L) ** 0.65 in (0, 1), orthonormalized via two-pass Gram-Schmidt so that
-        basis @ basis.T == I_K. Bit-for-bit identical to HiPPOOracleCUDA._get_legendre_basis.
+        Computes the first K = self.num_subbands (32) discrete-orthonormal Legendre polynomials
+        evaluated on the fixed sequence window [0, L-1] with uniform midpoint coordinates
+        tau_l = (l + 0.5) / L in (0, 1), orthonormalized via two-pass Gram-Schmidt in float64 so that
+        basis @ basis.T == I_K and (when K == L == 32) basis.T @ basis == I_32 with 0.0000 neighbor bleed.
+        Bit-for-bit identical to HiPPOOracleCUDA._get_legendre_basis.
         """
         key = (L, device, dtype)
         if key in self._basis_cache:
             return self._basis_cache[key]
 
         K = self.num_subbands
-        tau = ((torch.arange(L, device=device, dtype=torch.float32) + 0.5) / float(max(L, 1))) ** 0.65
+        tau = (torch.arange(L, device="cpu", dtype=torch.float64) + 0.5) / float(max(L, 1))
         u = 2.0 * tau - 1.0
 
         polys = []
@@ -311,10 +332,10 @@ class FlowMatching1DUnet(nn.Module):
                 for _ in range(2):
                     for prev in ortho_rows:
                         v = v - torch.dot(v, prev) * prev
-            norm = v.norm(p=2).clamp(min=1e-6)
+            norm = v.norm(p=2).clamp(min=1e-12)
             ortho_rows.append(v / norm)
 
-        basis = torch.stack(ortho_rows, dim=0).to(dtype=dtype)
+        basis = torch.stack(ortho_rows, dim=0).to(device=device, dtype=dtype)
         self._basis_cache[key] = basis
         return basis
 
