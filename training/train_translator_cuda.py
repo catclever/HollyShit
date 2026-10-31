@@ -70,7 +70,7 @@ def train_translator():
     parser.add_argument("--no_split_by_punctuation", dest="split_by_punctuation", action="store_false", help="Disable punctuation splitting")
     parser.add_argument("--deblur_weight", type=float, default=0.5, help="Weight of de-blurring/denoising branch loss in [0, 1]")
     parser.set_defaults(
-        ckpt_prefix="translator_conv1d",
+        ckpt_prefix="translator_moss_s32_deblur",
         seq_len=32,
         batch_size=192,
         epochs=1,
@@ -78,7 +78,7 @@ def train_translator():
     )
     args = parser.parse_args()
     if not args.ckpt_prefix:
-        args.ckpt_prefix = "translator_conv1d"
+        args.ckpt_prefix = "translator_moss_s32_deblur"
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
