@@ -68,9 +68,9 @@ def train_translator():
     parser.add_argument("--max_clause_chars", type=int, default=28, help="Maximum clause character length after punctuation split")
     parser.add_argument("--split_by_punctuation", action="store_true", default=True, help="Split targets into 10-28 char punctuation clauses")
     parser.add_argument("--no_split_by_punctuation", dest="split_by_punctuation", action="store_false", help="Disable punctuation splitting")
-    parser.add_argument("--deblur_weight", type=float, default=0.5, help="Weight of de-blurring/denoising branch loss in [0, 1]")
+    parser.add_argument("--deblur_weight", type=float, default=0.0, help="Weight of de-blurring/denoising branch loss in [0, 1] (default 0.0 for pure clean fidelity)")
     parser.set_defaults(
-        ckpt_prefix="translator_moss_s32_deblur",
+        ckpt_prefix="translator_moss_s32_clean",
         seq_len=32,
         batch_size=192,
         epochs=1,
@@ -78,7 +78,7 @@ def train_translator():
     )
     args = parser.parse_args()
     if not args.ckpt_prefix:
-        args.ckpt_prefix = "translator_moss_s32_deblur"
+        args.ckpt_prefix = "translator_moss_s32_clean"
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -141,21 +141,22 @@ def train_translator():
             w_tgt = batch_data[-1].to(device)  # (B, L) - ground truth discrete tokens
             valid_mask = (w_tgt != tokenizer.pad_token_id)
             
+            w_deb = float(args.deblur_weight)
+
             # Step 1: Forward through frozen encoder to get Ground Truth Continuous Curve
             with torch.no_grad():
                 h_tgt = encoder.get_normalized_embeddings(w_tgt)
                 for layer in encoder.layers: 
                     h_tgt = layer(h_tgt, None)
                 x_target = encoder.final_ln(h_tgt)  # (B, L, 1024)
-                x_degraded = synthesize_degraded_manifold_curve(x_target, valid_mask)
+                x_degraded = synthesize_degraded_manifold_curve(x_target, valid_mask) if w_deb > 0.0 else None
             
-            # Step 2: Dual Clean + De-blurring/Denoising prediction
+            # Step 2: Predict logits from the continuous curve
             optimizer.zero_grad()
             logits_clean = translator(x_target)
             loss_clean = criterion(logits_clean.view(-1, tokenizer.vocab_size), w_tgt.view(-1))
 
-            w_deb = float(args.deblur_weight)
-            if w_deb > 0.0:
+            if w_deb > 0.0 and x_degraded is not None:
                 logits_deg = translator(x_degraded)
                 loss_deg = criterion(logits_deg.view(-1, tokenizer.vocab_size), w_tgt.view(-1))
                 loss = (1.0 - w_deb) * loss_clean + w_deb * loss_deg
@@ -168,21 +169,24 @@ def train_translator():
             
             global_step += 1
             if global_step % 50 == 0:
-                print(
-                    f"Epoch {epoch+1} | Step {global_step} | "
-                    f"Loss: {loss.item():.4f} (Clean: {loss_clean.item():.4f}, Deblur: {loss_deg.item():.4f})"
-                )
+                if w_deb > 0.0:
+                    print(
+                        f"Epoch {epoch+1} | Step {global_step} | "
+                        f"Loss: {loss.item():.4f} (Clean: {loss_clean.item():.4f}, Deblur: {loss_deg.item():.4f})"
+                    )
+                else:
+                    print(f"Epoch {epoch+1} | Step {global_step} | Translator Clean Loss: {loss_clean.item():.4f}")
                 
             if global_step == 50 or global_step % 200 == 0:
-                # Quick qualitative test on both Clean and Degraded curves
                 translator.eval()
                 with torch.no_grad():
                     pred_clean = translator.decode_greedy(x_target[:1])[0].tolist()
-                    pred_deg = translator.decode_greedy(x_degraded[:1])[0].tolist()
                     print("\n--- Quick Translation Test (seq_len=32) ---")
                     print(f"Target       : {decode_with_eos_marker(tokenizer, w_tgt[0].tolist())}")
                     print(f"Decode Clean : {decode_with_eos_marker(tokenizer, pred_clean)}")
-                    print(f"Decode Deblur: {decode_with_eos_marker(tokenizer, pred_deg)}")
+                    if w_deb > 0.0 and x_degraded is not None:
+                        pred_deg = translator.decode_greedy(x_degraded[:1])[0].tolist()
+                        print(f"Decode Deblur: {decode_with_eos_marker(tokenizer, pred_deg)}")
                     print("-------------------------------------------\n")
                 translator.train()
 
