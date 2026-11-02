@@ -252,26 +252,82 @@ class AdaLN2DResMLPBlock(nn.Module):
         return z + (1.0 + torch.tanh(gate)) * self.mlp(z_mod)
 
 
-# [Bug Fix & Manifold Calibration Documentation - Task #027]
-# 1. Problem Fixed:
-#    `HiPPOOracleCUDA` clause vectors `z_clause` can have a coordinate scale (`Std ~ 0.289` or `1.0`)
-#    that differs from the standard unit Gaussian prior `z_0 ~ N(0, I)` (`Std = 1.0`) used by `ThoughtFlowMatcher`,
-#    and padded empty clause transition steps (`t -> t+1`) previously polluted flow matching loss.
-# 2. Resolution Logic:
-#    Added persistent buffers (`z_mean`, `z_std`, `calib_steps`) and online EMA calibration `calibrate_z`
-#    (first 50 training steps) + `normalize` / `denormalize` to `ThoughtFlowMatcher`.
-#    In `compute_loss`, invalid/padded transition steps are filtered via `valid_mask`, targets `z_1` are
-#    auto-calibrated and normalized before OT-CFM velocity matching, and in `sample`, the integrated
-#    vector is denormalized back to the exact `z_clause` coordinate space expected by `LeftBrainCrystallizer`.
-# 3. Caveats for Subsequent Development:
-#    `z_mean`, `z_std`, and `calib_steps` are registered buffers saved in `right_brain.pt`. Do not
-#    manually re-scale `z_thought` outside `ThoughtFlowMatcher.sample`.
+# =====================================================================================
+# Clause-vector frequency-band layout helpers (Task #029, Right-Brain v2)
+# -------------------------------------------------------------------------------------
+# `HiPPOOracleCUDA` packs a clause as `z_sub: (K=32 Legendre orders, d_sub=32 PCA channels)`
+# and flattens it row-major, so a clause vector `z: (..., 1024)` is BAND-MAJOR:
+#   band b (Legendre order b) == dims [b * d_sub : (b + 1) * d_sub].
+# `ThoughtFlowMatcher.normalize` is a scalar mean/std affine map, so the layout survives
+# normalization. Low orders (b < sem_bands, default 6) are *hypothesised* to carry content /
+# semantics and high orders word-order / syntax; this split is NOT verified -> keep
+# `sem_bands` configurable and monitor the per-band sigma curve.
+# =====================================================================================
+DEFAULT_NUM_BANDS = 32
+DEFAULT_SEM_BANDS = 6
+
+
+def to_bands(z: torch.Tensor, num_bands: int = DEFAULT_NUM_BANDS) -> torch.Tensor:
+    """Reshapes a band-major clause vector `z: (..., D)` into `(..., num_bands, D // num_bands)`."""
+    D = z.shape[-1]
+    if D % num_bands != 0:
+        raise ValueError(f"Clause dim {D} is not divisible by num_bands={num_bands}.")
+    return z.reshape(*z.shape[:-1], num_bands, D // num_bands)
+
+
+def from_bands(z_bands: torch.Tensor) -> torch.Tensor:
+    """Inverse of `to_bands`: `(..., num_bands, d_sub) -> (..., num_bands * d_sub)`."""
+    return z_bands.reshape(*z_bands.shape[:-2], z_bands.shape[-2] * z_bands.shape[-1])
+
+
+def band_gaussian_nll(
+    z1: torch.Tensor,
+    mu: torch.Tensor,
+    sigma_band: torch.Tensor,
+    num_bands: int = DEFAULT_NUM_BANDS,
+) -> torch.Tensor:
+    """
+    Band-wise heteroscedastic Gaussian NLL (float32, constant terms dropped), per row:
+      nll = mean_b [ ||z1_b - mu_b||^2 / (2 * d_sub * sigma_b^2) + log sigma_b ]
+    Optimum: sigma_b^2 = E[ ||z1_b - mu_b||^2 / d_sub | condition ].
+    Shapes: z1, mu: (..., D); sigma_band: (..., num_bands). Returns (...,).
+    """
+    diff_b = to_bands(z1.float() - mu.float(), num_bands)  # (..., nb, d_sub)
+    d_sub = diff_b.shape[-1]
+    sq_b = diff_b.pow(2).sum(dim=-1)  # (..., nb)
+    s = sigma_band.float()
+    nll_b = sq_b / (2.0 * d_sub * s.pow(2)) + torch.log(s)
+    return nll_b.mean(dim=-1)
+
+
+# [Design Change Documentation - Task #029: ThoughtFlowMatcher v2]
+# 1. What changed vs #027:
+#    - REMOVED the hard residual `v_pred = (h_t - z_tau) + final_proj(...)`. That residual made every
+#      ODE trajectory collapse onto the single point `h_t` (a conditional *mean*), so the Right Brain
+#      could only express one interpretation per step. `v_pred = final_proj(final_norm(...))` now.
+#    - The ODE start point is no longer N(0, I) but the input-dependent adaptive prior cone
+#      `z0 = mu + sigma_band (x) eps` produced by `PriorHead` (32 Legendre bands, 1 sigma per band).
+#    - Training uses K-branch soft competition (`compute_branch_loss`): K blind Euler roll-outs
+#      (with grad, no ground-truth leakage); the closest branch (winner) gets CFM velocity MSE +
+#      endpoint MSE + 0.25 (1 - cos); the losers are only constrained to remain *legal* clause
+#      vectors: low-band Mahalanobis (scaled by detached sigma) + low-band cosine, and per-band
+#      L2 *energy* matching on high bands (no direction constraint -> syntax freedom).
+# 2. Why: the design intent (design/tentative/2026-11-02_phase5_right_brain_v2_adaptive_prior.md)
+#    is "Mamba state = a region of plausible clauses; Flow Matching samples inside that region".
+#    A single-target CFM + residual regresses to the blurry mean.
+# 3. Caveats:
+#    - Calibration buffers (`z_mean`, `z_std`, `calib_steps`) and `normalize` / `denormalize` are
+#      unchanged; mu / sigma / all losses live in the NORMALIZED space.
+#    - `mu` / `sigma_band` are always `.detach()`-ed inside the flow losses: the prior head is
+#      trained only by the band NLL (`band_gaussian_nll`).
+#    - The flow cost is ~ K * (train_ode_steps + 1) forward passes of this MLP per valid row.
+#    - Checkpoints of #027 are NOT compatible (residual semantics + new modules) -> use a new
+#      checkpoint prefix (e.g. `bicameral_right_brain_v2`).
 class ThoughtFlowMatcher(nn.Module):
     """
-    2D Conditional OT-CFM Velocity Predictor in Clause-Vector Space `(B, D)`.
-    Given the Right Brain's Mamba discourse state `cond` (`h_t: (B, D)`), transports Gaussian prior
-    `z_0 ~ N(0, I_D)` at tau=0 to the normalized target clause vector `z_1_norm: (B, D)` at tau=1,
-    and denormalizes sampled `z_thought` back to the target clause manifold.
+    2D Conditional Flow Matcher in Clause-Vector Space `(B, D)` (Right-Brain v2, #029).
+    Transports the adaptive prior `z_0 = mu + sigma (x) eps` (normalized space) at tau=0 to the
+    normalized target clause `z_1_norm` at tau=1, conditioned (AdaLN) on the fused Mamba state `h_t`.
     """
 
     def __init__(
@@ -279,12 +335,26 @@ class ThoughtFlowMatcher(nn.Module):
         hidden_dim: int = 1024,
         num_layers: int = 4,
         d_clause: Optional[int] = None,
+        *,
+        num_bands: int = DEFAULT_NUM_BANDS,
+        sem_bands: int = DEFAULT_SEM_BANDS,
+        num_branches: int = 4,
+        train_ode_steps: int = 3,
+        win_weight: float = 0.65,
+        other_temp: float = 1.0,
     ):
         super().__init__()
         if d_clause is not None:
             hidden_dim = int(d_clause)
         self.hidden_dim = hidden_dim
         self.d_clause = hidden_dim
+        self.num_bands = int(num_bands)
+        self.d_sub = hidden_dim // self.num_bands
+        self.sem_bands = int(sem_bands)
+        self.num_branches = int(num_branches)
+        self.train_ode_steps = int(train_ode_steps)
+        self.win_weight = float(win_weight)
+        self.other_temp = float(other_temp)
 
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.cond_proj = nn.Sequential(
@@ -302,7 +372,7 @@ class ThoughtFlowMatcher(nn.Module):
         nn.init.normal_(self.final_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.final_proj.bias)
 
-        # In-Model Manifold Auto-Calibration Buffers (#027)
+        # In-Model Manifold Auto-Calibration Buffers (#027, unchanged)
         self.register_buffer("z_mean", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("z_std", torch.tensor(1.0, dtype=torch.float32))
         self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
@@ -356,7 +426,8 @@ class ThoughtFlowMatcher(nn.Module):
 
     def forward(self, z_tau: torch.Tensor, tau: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
         """
-        Predicts 2D velocity field `v_pred: (B, D)` at flow time `tau: (B,)` conditioned on `h_t: (B, D)`.
+        Predicts velocity `v_pred: (B, D)` (or `(B, T, D)`) at flow time `tau` conditioned on `h_t`.
+        v2: NO `(h_t - z_tau)` residual.
         """
         orig_shape = z_tau.shape
         if z_tau.dim() == 3:
@@ -368,21 +439,144 @@ class ThoughtFlowMatcher(nn.Module):
             elif tau.numel() == B * T:
                 tau = tau.reshape(B * T)
 
-        t_emb = self.t_embedder(tau).to(dtype=z_tau.dtype)
+        t_emb = self.t_embedder(tau).to(dtype=h_t.dtype)
         cond = self.cond_proj(torch.cat([h_t, t_emb], dim=-1))
-        h = self.in_proj(torch.cat([z_tau, h_t], dim=-1))
+        h = self.in_proj(torch.cat([z_tau.to(dtype=h_t.dtype), h_t], dim=-1))
         for block in self.blocks:
             h = block(h, cond)
-        v_pred = (h_t - z_tau) + self.final_proj(self.final_norm(h))
+        v_pred = self.final_proj(self.final_norm(h))
 
         if len(orig_shape) == 3:
             v_pred = v_pred.reshape(orig_shape)
         return v_pred
 
+    def expand_sigma(self, sigma_band: torch.Tensor) -> torch.Tensor:
+        """Broadcasts per-band sigma `(..., num_bands)` to per-dim `(..., D)` (band-major layout)."""
+        return sigma_band.repeat_interleave(self.d_sub, dim=-1)
+
+    def _euler_integrate(
+        self,
+        z0: torch.Tensor,
+        cond: torch.Tensor,
+        steps: int,
+    ) -> torch.Tensor:
+        """Euler-integrates the ODE from tau=0 to tau=1 in float32 state precision (keeps grad)."""
+        x = z0.float()
+        n_steps = max(int(steps), 1)
+        dt = 1.0 / float(n_steps)
+        for i in range(n_steps):
+            tau = torch.full((x.shape[0],), i * dt, device=x.device, dtype=torch.float32)
+            v = self.forward(x, tau, cond)
+            x = x + v.float() * dt
+        return x
+
+    def compute_branch_loss(
+        self,
+        z1_norm: torch.Tensor,
+        cond: torch.Tensor,
+        mu: torch.Tensor,
+        sigma_band: torch.Tensor,
+        num_branches: Optional[int] = None,
+        train_ode_steps: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        K-branch soft-competition flow loss on ALREADY-FILTERED, NORMALIZED rows.
+          z1_norm: (N, D) normalized targets, cond: (N, D) fused Mamba state,
+          mu: (N, D) prior mean (normalized space), sigma_band: (N, num_bands).
+        Returns `(L_flow, stats)` where `stats` holds detached tensors for metrics.
+        """
+        K = int(num_branches) if num_branches is not None else self.num_branches
+        K = max(K, 1)
+        S = int(train_ode_steps) if train_ode_steps is not None else self.train_ode_steps
+        N, D = z1_norm.shape
+        nb, ds, L = self.num_bands, self.d_sub, self.sem_bands
+        device = z1_norm.device
+
+        z1f = z1_norm.float()
+        mu_d = mu.detach().float()
+        sig_d = sigma_band.detach().float()  # (N, nb)
+        sig_full = self.expand_sigma(sig_d)  # (N, D)
+
+        # ---- 1. K blind roll-outs from the adaptive prior cone (with grad, no target leakage)
+        eps = torch.randn((K, N, D), device=device, dtype=torch.float32)
+        z0 = mu_d.unsqueeze(0) + sig_full.unsqueeze(0) * eps  # (K, N, D)
+        cond_k = cond.unsqueeze(0).expand(K, N, D).reshape(K * N, D)
+        x1 = self._euler_integrate(z0.reshape(K * N, D), cond_k, S).reshape(K, N, D)
+
+        # ---- 2. Winner selection (no grad)
+        with torch.no_grad():
+            err = (x1.detach() - z1f.unsqueeze(0)).pow(2).mean(dim=-1)  # (K, N)
+            k_star = err.argmin(dim=0)  # (N,)
+        rows = torch.arange(N, device=device)
+        x1_win = x1[k_star, rows]  # (N, D)
+        z0_win = z0[k_star, rows]  # (N, D), detached (built from detached mu/sigma)
+
+        # ---- 3. Winner loss: CFM velocity MSE on the winner's own z0 + endpoint MSE + 0.25 (1 - cos)
+        tau = torch.rand((N,), device=device, dtype=torch.float32).clamp(min=1e-4, max=1.0 - 1e-4)
+        tau_col = tau.unsqueeze(-1)
+        z_tau = (1.0 - tau_col) * z0_win + tau_col * z1f
+        v_target = z1f - z0_win
+        v_pred = self.forward(z_tau, tau, cond)
+        vel_loss = F.mse_loss(v_pred.float(), v_target)
+        end_mse = F.mse_loss(x1_win, z1f)
+        win_cos = F.cosine_similarity(x1_win, z1f, dim=-1, eps=1e-6)  # (N,)
+        cos_loss = 1.0 - win_cos.mean()
+        win_loss = vel_loss + end_mse + 0.25 * cos_loss
+
+        # ---- 4. Loser ("other") loss: stay a legal clause vector
+        x1_b = to_bands(x1, nb)  # (K, N, nb, ds)
+        z1_b = to_bands(z1f, nb)  # (N, nb, ds)
+        low_sq = (x1_b[:, :, :L] - z1_b.unsqueeze(0)[:, :, :L]).pow(2).sum(dim=-1)  # (K, N, L)
+        maha = (low_sq / (ds * sig_d[:, :L].pow(2)).unsqueeze(0)).mean(dim=-1)  # (K, N)
+        low_cos = F.cosine_similarity(
+            x1[..., : L * ds], z1f[..., : L * ds].unsqueeze(0), dim=-1, eps=1e-6
+        )  # (K, N)
+        x_hi_norm = (x1_b[:, :, L:].pow(2).sum(dim=-1) + 1e-8).sqrt()  # (K, N, nb - L)
+        z_hi_norm = (z1_b[:, L:].pow(2).sum(dim=-1) + 1e-8).sqrt()  # (N, nb - L)
+        energy = (x_hi_norm - z_hi_norm.unsqueeze(0)).pow(2).mean(dim=-1)  # (K, N)
+        other_per = maha + (1.0 - low_cos) + energy  # (K, N)
+
+        win_onehot = F.one_hot(k_star, num_classes=K).transpose(0, 1).bool()  # (K, N)
+        if K > 1:
+            with torch.no_grad():
+                logits = -(maha.detach() + energy.detach()) / max(self.other_temp, 1e-6)
+                logits = logits.masked_fill(win_onehot, float("-inf"))
+                w_other = torch.softmax(logits, dim=0)  # (K, N), winner weight == 0
+            other_loss = (w_other * other_per).sum(dim=0).mean()
+        else:
+            other_loss = other_per.sum() * 0.0
+
+        ww = self.win_weight
+        loss = ww * win_loss + (1.0 - ww) * other_loss
+
+        with torch.no_grad():
+            if K > 1:
+                x_low = x1.detach()[..., : L * ds].transpose(0, 1)  # (N, K, L*ds)
+                pd = torch.cdist(x_low, x_low)  # (N, K, K)
+                diversity = pd.sum(dim=(-1, -2)) / float(K * (K - 1))
+                diversity = diversity.mean()
+            else:
+                diversity = torch.zeros((), device=device)
+            hist = torch.bincount(k_star, minlength=K)
+
+        stats = {
+            "vel_loss": vel_loss.detach(),
+            "end_mse": end_mse.detach(),
+            "cos_loss": cos_loss.detach(),
+            "thought_cos": win_cos.mean().detach(),
+            "win_loss": win_loss.detach(),
+            "other_loss": other_loss.detach(),
+            "branch_diversity": diversity,
+            "winner_hist": hist,
+        }
+        return loss, stats
+
     def compute_loss(
         self,
         z_1: Optional[torch.Tensor] = None,
         cond: Optional[torch.Tensor] = None,
+        mu: Optional[torch.Tensor] = None,
+        sigma_band: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
         return_metrics: bool = False,
         *,
@@ -390,9 +584,9 @@ class ThoughtFlowMatcher(nn.Module):
         z_target: Optional[torch.Tensor] = None,
     ):
         """
-        Computes Conditional Optimal Transport Flow Matching (OT-CFM) loss between target clause
-        vector(s) `z_1` and Right-Brain Mamba condition `cond` (`h_t`), with optional `valid_mask`
-        filtering and automatic manifold calibration.
+        Stand-alone flow loss (filters `valid_mask`, auto-calibrates, normalizes, then runs
+        `compute_branch_loss`). If `mu` / `sigma_band` are None the prior falls back to N(0, I).
+        `MultiStreamRightBrain.compute_loss` is the primary entry point (it also adds prior NLL + stop BCE).
         """
         if z_1 is None and z_target is not None:
             z_1 = z_target
@@ -402,71 +596,52 @@ class ThoughtFlowMatcher(nn.Module):
             raise ValueError("ThoughtFlowMatcher.compute_loss requires `z_1` and `cond` (or `h_t` and `z_target`).")
 
         D = z_1.shape[-1]
+        nb = self.num_bands
+        z_1 = z_1.reshape(-1, D)
+        cond = cond.reshape(-1, D)
+        mu = torch.zeros_like(z_1, dtype=torch.float32) if mu is None else mu.reshape(-1, D)
+        sigma_band = (
+            torch.ones((z_1.shape[0], nb), device=z_1.device, dtype=torch.float32)
+            if sigma_band is None else sigma_band.reshape(-1, nb)
+        )
         empty_valid = False
         if valid_mask is not None:
             mask_bool = valid_mask.reshape(-1).bool()
             if mask_bool.any():
-                z_1 = z_1.reshape(-1, D)[mask_bool]
-                cond = cond.reshape(-1, D)[mask_bool]
+                z_1, cond, mu, sigma_band = z_1[mask_bool], cond[mask_bool], mu[mask_bool], sigma_band[mask_bool]
             else:
                 empty_valid = True
-                z_1 = z_1.reshape(-1, D)[:1]
-                cond = cond.reshape(-1, D)[:1]
-        elif z_1.dim() > 2:
-            z_1 = z_1.reshape(-1, D)
-            cond = cond.reshape(-1, D)
+                z_1, cond, mu, sigma_band = z_1[:1], cond[:1], mu[:1], sigma_band[:1]
 
         if self.training and not empty_valid and int(self.calib_steps.item()) < 50:
             self.calibrate_z(z_1)
+        z_1_norm = self.normalize(z_1.float())
 
-        z_1_norm = self.normalize(z_1)
-        N_valid = z_1_norm.shape[0]
-        device = z_1_norm.device
-        dtype = z_1_norm.dtype
-
-        z_0 = torch.randn_like(z_1_norm)
-        t = torch.rand((N_valid,), device=device, dtype=torch.float32).clamp(min=1e-4, max=1.0 - 1e-4)
-        t_col = t.unsqueeze(-1).to(dtype=dtype)
-
-        z_t = (1.0 - t_col) * z_0 + t_col * z_1_norm
-        v_target = z_1_norm - z_0
-
-        v_pred = self.forward(z_t, t, cond)
-        loss_mse = F.mse_loss(v_pred.float(), v_target.float())
-
-        z_1_hat = z_t.float() + (1.0 - t.unsqueeze(-1)) * v_pred.float()
-        cos_sim = F.cosine_similarity(z_1_hat, z_1_norm.float(), dim=-1)
-        cos_sim_mean = cos_sim.mean()
-        loss_cos = 1.0 - cos_sim_mean
-
-        loss = loss_mse + 0.25 * loss_cos
+        loss, stats = self.compute_branch_loss(z_1_norm, cond, mu, sigma_band)
         if empty_valid:
             loss = loss * 0.0
-
         if return_metrics:
-            return loss, {
-                "vel_loss": float(loss_mse.detach().item()),
-                "cos_loss": float(loss_cos.detach().item()),
-                "thought_cos": float(cos_sim_mean.detach().item()),
-                "loss_vel": loss_mse.detach(),
-                "loss_cos": loss_cos.detach(),
-                "cos_sim": cos_sim_mean.detach(),
-            }
+            metrics = {k: (v.tolist() if v.dim() > 0 else float(v.item())) for k, v in stats.items()}
+            return loss, metrics
         return loss
 
     @torch.no_grad()
     def sample(
         self,
         cond: Optional[torch.Tensor] = None,
+        mu: Optional[torch.Tensor] = None,
+        sigma_band: Optional[torch.Tensor] = None,
         steps: int = 10,
         temperature: float = 1.0,
+        renorm: bool = True,
         *,
         h_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Integrates the 2D ODE from `tau = 0` to `tau = 1` in `steps` Euler steps in normalized space
-        and returns `self.denormalize(z)` so the sampled `z_thought: (B, D)` is in the calibrated
-        target clause coordinate space expected by `LeftBrainCrystallizer` and `ClauseMambaStream`.
+        Samples ONE eps per row: `z0 = mu + temperature * sigma (x) eps` (normalized space), Euler-integrates
+        `steps` steps conditioned on `cond`, applies the #027 per-sample std renorm (if `renorm`) and
+        returns `self.denormalize(z)` in `z_clause` coordinates. `cond` / `mu`: (B, D) or (B, T, D);
+        `sigma_band`: (B, nb) or (B, T, nb). Missing mu / sigma -> N(0, I) prior (legacy behaviour).
         """
         if cond is None and h_t is not None:
             cond = h_t
@@ -474,42 +649,133 @@ class ThoughtFlowMatcher(nn.Module):
             raise ValueError("ThoughtFlowMatcher.sample requires `cond` (or `h_t`).")
 
         orig_shape = cond.shape
-        if cond.dim() == 3:
-            cond_2d = cond.reshape(-1, self.d_clause)
-        else:
-            cond_2d = cond
-
+        D = self.d_clause
+        cond_2d = cond.reshape(-1, D)
         B = cond_2d.shape[0]
-        z = torch.randn((B, self.d_clause), device=cond_2d.device, dtype=cond_2d.dtype) * float(temperature)
-        dt = 1.0 / float(max(steps, 1))
-        for i in range(steps):
-            tau_val = i / float(max(steps, 1))
-            tau = torch.full((B,), tau_val, device=cond_2d.device, dtype=torch.float32)
-            v_pred = self.forward(z, tau, cond_2d)
-            z = z + v_pred * dt
+        mu_2d = (
+            torch.zeros((B, D), device=cond.device, dtype=torch.float32)
+            if mu is None else mu.reshape(-1, D).float()
+        )
+        sig_2d = (
+            torch.ones((B, self.num_bands), device=cond.device, dtype=torch.float32)
+            if sigma_band is None else sigma_band.reshape(-1, self.num_bands).float()
+        )
+        eps = torch.randn((B, D), device=cond.device, dtype=torch.float32)
+        z0 = mu_2d + float(temperature) * self.expand_sigma(sig_2d) * eps
+        z = self._euler_integrate(z0, cond_2d, steps)
 
-        z_unit = z / z.float().std(dim=-1, keepdim=True).clamp(min=1e-5).to(dtype=z.dtype)
-        z_out = self.denormalize(z_unit)
+        if renorm:
+            z = z / z.std(dim=-1, keepdim=True).clamp(min=1e-5)
+        z_out = self.denormalize(z).to(dtype=cond.dtype)
         if len(orig_shape) == 3:
             z_out = z_out.reshape(orig_shape)
         return z_out
 
 
+class PriorHead(nn.Module):
+    """
+    32-Band Adaptive Prior Head (#029).
+    Input: concat[h0_t, F_aux_t, max_i g_ti, sum_i g_ti] -> mu (D, normalized z space) and
+    sigma_band (num_bands,) = sigma_min + (sigma_max - sigma_min) * sigmoid(.).
+    Trained ONLY by `band_gaussian_nll` (callers must detach mu / sigma for any other loss).
+    Gradients of the NLL DO flow back into the Mamba streams through h0 / F_aux / gates.
+    """
+
+    def __init__(
+        self,
+        d_clause: int = 1024,
+        num_bands: int = DEFAULT_NUM_BANDS,
+        hidden_dim: int = 1024,
+        sigma_min: float = 0.05,
+        sigma_max: float = 1.0,
+        sigma_init: float = 0.5,
+        zero_init_aux: bool = True,
+    ):
+        super().__init__()
+        self.d_clause = int(d_clause)
+        self.num_bands = int(num_bands)
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        in_dim = 2 * self.d_clause + 2
+        self.trunk = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        # [Design Change - Task #033: zero-init companion inputs of the prior head]
+        # 1. What: the input columns of `trunk[0]` that consume [F_aux (D), gate_max (1), gate_sum (1)]
+        #    (= columns d_clause .. 2*d_clause+1) are zero-initialised.
+        # 2. Why: Stage 1 (design/tentative/2026-11-02_phase5_staged_training_plan.md §2) trains a single
+        #    main stream; the companion stream (Stage 3) is attached later as an EXACT identity branch, so
+        #    a freshly attached aux stream must not perturb mu / sigma of the trained Stage-1 prior.
+        # 3. Caveats: shapes are unchanged (old #029 checkpoints still load strictly). The columns DO
+        #    receive gradients as soon as non-zero F_aux / gates are fed, so they only stay zero while
+        #    N == 0 (Stage 1). With aux=None the inputs in those columns are zeros anyway.
+        if zero_init_aux:
+            with torch.no_grad():
+                self.trunk[0].weight[:, self.d_clause:].zero_()
+        self.mu_out = nn.Linear(hidden_dim, self.d_clause)
+        self.sigma_out = nn.Linear(hidden_dim, self.num_bands)
+        nn.init.normal_(self.mu_out.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.mu_out.bias)
+        nn.init.normal_(self.sigma_out.weight, mean=0.0, std=0.02)
+        frac = (float(sigma_init) - self.sigma_min) / max(self.sigma_max - self.sigma_min, 1e-6)
+        frac = min(max(frac, 1e-4), 1.0 - 1e-4)
+        nn.init.constant_(self.sigma_out.bias, math.log(frac / (1.0 - frac)))
+
+    def forward(
+        self,
+        h0: torch.Tensor,
+        F_aux: torch.Tensor,
+        gate_max: torch.Tensor,
+        gate_sum: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        h0, F_aux: (..., D); gate_max, gate_sum: (...,).
+        Returns mu: (..., D) float32, sigma_band: (..., num_bands) float32.
+        """
+        x = torch.cat(
+            [h0, F_aux.to(dtype=h0.dtype), gate_max.unsqueeze(-1).to(dtype=h0.dtype), gate_sum.unsqueeze(-1).to(dtype=h0.dtype)],
+            dim=-1,
+        )
+        feat = self.trunk(x)
+        mu = self.mu_out(feat).float()
+        raw = self.sigma_out(feat).float()
+        sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * torch.sigmoid(raw)
+        return mu, sigma
+
+
+# [Design Change Documentation - Task #029: MultiStreamRightBrain v2 (1 + N dynamic streams)]
+# 1. What changed vs #027:
+#    - The 3 fixed streams (discourse / knowledge / goal) + scalar gates alpha_k / alpha_g are replaced by
+#      `main_stream` (ClauseMambaStream, 4 layers) + ONE shared `aux_stream` (2 layers) that encodes
+#      N >= 0 isomorphic companion streams `aux: (B, N, S, D)` (no stream-type embedding; identity is
+#      not preset). Each companion contributes its LAST VALID state h_aux_i.
+#    - Per-step dynamic gates g[t, i] = sigmoid(<q(h0_t), k(h_aux_i)> / sqrt(d_gate) + b) and an
+#      orthogonal force F_aux_t = sum_i g * OrthProj(v(h_aux_i), h0_t); h_t = h0_t + tanh(alpha_aux) F_aux_t.
+#      Implementation note: OrthProj is linear in its first argument, so we compute
+#      OrthProj(sum_i g_ti v_i, h0_t) — mathematically identical, O(B T D) memory instead of O(B T N D).
+#    - New heads: `prior_head` (adaptive 32-band prior, NLL-trained) and `stop_head` (end-of-answer BCE).
+#    - Flow loss = K-branch soft competition (see ThoughtFlowMatcher v2).
+# 2. Why: information may come from any stream; when the condition is decisive the low-band sigma
+#    must shrink (only syntax variation left), when ambiguous it must widen. See the design doc §2.
+# 3. Caveats:
+#    - #027 checkpoints are INCOMPATIBLE (different module names) -> new ckpt prefix
+#      `bicameral_right_brain_v2`; resume checks must skip old checkpoints.
+#    - Legacy kwargs `z_knowledge_seq` / `z_goal_seq` are auto-packed (goal -> 1 stream of G clauses,
+#      each knowledge clause -> its own length-1 stream). Validity of legacy rows is inferred from
+#      non-zero rows (the trainer zeroes padded clauses). Companion streams must be RIGHT-padded.
+#    - `alpha_k` / `alpha_g` are read-only aliases of `alpha_aux` kept only for old log lines.
+#    - `sigma_max` (default 1.0) caps per-band std in normalized space; bands whose residual std
+#      exceeds it will saturate — watch `sigma_band` metrics and raise `sigma_max` if needed.
 class MultiStreamRightBrain(nn.Module):
     """
-    Paired Multi-Stream Mamba + ThoughtFlowMatcher Right Brain (#025 / #027):
-      - Builds all 3 Mamba streams upfront:
-        1. `discourse_stream`: Main clause progression Mamba (Stream 1)
-        2. `knowledge_stream`: Knowledge resonance Mamba (Stream 2)
-        3. `goal_stream`: Global question / AST outline goal Mamba (Stream 3)
-      - Fuses Stream 2 and Stream 3 into Stream 1 via Gram-Schmidt orthogonal projection
-        (`_project_orthogonal`) gated by zero-initialized scalar parameters `alpha_k = 0` and `alpha_g = 0`.
-      - Supports curriculum switching between:
-        - `active_streams=("discourse",)` (Stage 1: Single-Stream First fast training)
-        - `active_streams=("discourse", "knowledge", "goal")` (Stage 2: Full Multi-Stream mode)
-        At initialization (`alpha_k == 0`, `alpha_g == 0`), both modes produce bit-for-bit identical `h_t`.
-      - Paired with `self.flow_matcher = ThoughtFlowMatcher(d_clause)` to sample `z_thought: (B, D)`.
+    Right-Brain v2 (#029): 1 main + N companion Mamba streams, 32-band adaptive prior cone,
+    K-branch soft-competition flow matcher and stop head.
     """
+
+    GROUP_NAMES = {0: "full", 1: "goal_only", 2: "none"}
 
     def __init__(
         self,
@@ -520,10 +786,27 @@ class MultiStreamRightBrain(nn.Module):
         *,
         d_clause: Optional[int] = None,
         d_mamba: Optional[int] = None,
+        n_layers_main: Optional[int] = None,
+        n_layers_aux: Optional[int] = None,
         n_layers_discourse: Optional[int] = None,
         n_layers_knowledge: Optional[int] = None,
         n_layers_goal: Optional[int] = None,
         active_streams: Optional[Sequence[str]] = None,
+        num_bands: int = DEFAULT_NUM_BANDS,
+        sem_bands: int = DEFAULT_SEM_BANDS,
+        d_gate: int = 128,
+        prior_hidden: int = 1024,
+        sigma_min: float = 0.05,
+        sigma_max: float = 1.0,
+        sigma_init: float = 0.5,
+        num_branches: int = 4,
+        train_ode_steps: int = 3,
+        win_weight: float = 0.65,
+        other_temp: float = 1.0,
+        prior_weight: float = 1.0,
+        stop_weight: float = 0.2,
+        alpha_aux_init: float = 0.0,
+        zero_init_aux: bool = True,
     ):
         super().__init__()
         if d_clause is not None:
@@ -531,45 +814,83 @@ class MultiStreamRightBrain(nn.Module):
         self.hidden_dim = hidden_dim
         self.d_clause = hidden_dim
         self.d_mamba = int(d_mamba) if d_mamba is not None else hidden_dim
+        self.num_bands = int(num_bands)
+        self.sem_bands = int(sem_bands)
+        self.d_sub = hidden_dim // self.num_bands
+        self.d_gate = int(d_gate)
+        self.prior_weight = float(prior_weight)
+        self.stop_weight = float(stop_weight)
 
-        l_disc = int(n_layers_discourse) if n_layers_discourse is not None else num_mamba_layers
-        l_know = int(n_layers_knowledge) if n_layers_knowledge is not None else num_mamba_layers
-        l_goal = int(n_layers_goal) if n_layers_goal is not None else num_mamba_layers
+        # Layer counts: explicit v2 args > legacy #027 args > v2 defaults (main=4, aux=2).
+        # `num_mamba_layers` is accepted for signature compatibility only.
+        if n_layers_main is not None:
+            l_main = int(n_layers_main)
+        elif n_layers_discourse is not None:
+            l_main = int(n_layers_discourse)
+        else:
+            l_main = 4
+        if n_layers_aux is not None:
+            l_aux = int(n_layers_aux)
+        elif n_layers_goal is not None:
+            l_aux = int(n_layers_goal)
+        elif n_layers_knowledge is not None:
+            l_aux = int(n_layers_knowledge)
+        else:
+            l_aux = 2
 
         if active_streams is None:
-            self.active_streams: Tuple[str, ...] = ("discourse", "knowledge", "goal")
+            self.active_streams: Tuple[str, ...] = ("discourse", "aux")
         elif isinstance(active_streams, str):
             self.active_streams = tuple(s.strip() for s in active_streams.split(",") if s.strip())
         else:
             self.active_streams = tuple(active_streams)
 
-        # 3 Parallel Clause-Level Mamba Streams
-        self.discourse_stream = ClauseMambaStream(
-            hidden_dim=self.d_mamba,
-            d_state=d_state,
-            num_layers=l_disc,
-            input_dim=self.d_clause,
+        self.main_stream = ClauseMambaStream(
+            hidden_dim=self.d_mamba, d_state=d_state, num_layers=l_main, input_dim=self.d_clause,
         )
-        self.knowledge_stream = ClauseMambaStream(
-            hidden_dim=self.d_mamba,
-            d_state=d_state,
-            num_layers=l_know,
-            input_dim=self.d_clause,
-        )
-        self.goal_stream = ClauseMambaStream(
-            hidden_dim=self.d_mamba,
-            d_state=d_state,
-            num_layers=l_goal,
-            input_dim=self.d_clause,
+        self.aux_stream = ClauseMambaStream(
+            hidden_dim=self.d_mamba, d_state=d_state, num_layers=l_aux, input_dim=self.d_clause,
         )
 
-        # Zero-initialized orthogonal fusion gates (guarantees bit-for-bit identity at Step 0)
-        self.alpha_k = nn.Parameter(torch.zeros(1))
-        self.alpha_g = nn.Parameter(torch.zeros(1))
+        # Dynamic per-step companion gates + orthogonal force value projection
+        self.gate_q = nn.Linear(self.d_clause, self.d_gate)
+        self.gate_k = nn.Linear(self.d_clause, self.d_gate)
+        self.gate_bias = nn.Parameter(torch.zeros(1))
+        self.aux_v = nn.Linear(self.d_clause, self.d_clause)
+        # [Design Change - Task #033] `alpha_aux_init` default 0.1 -> 0.0 (tanh(alpha) == 0): together with
+        # the zero-initialised companion columns of `PriorHead` (`zero_init_aux`), a fresh model given
+        # `aux` produces bit-identical (mu, sigma, h) to `aux=None`. Stage 3 attaches companions as an
+        # exact identity branch (staged plan §2/§4). Caveat: while tanh(alpha_aux) == 0 the gate / aux_v /
+        # aux_stream weights get ZERO gradient; alpha_aux itself does get a gradient (dh/dalpha = F_aux),
+        # so it leaves 0 after the first aux-stage step and the branch then opens smoothly.
+        a0 = min(max(float(alpha_aux_init), -0.999), 0.999)
+        self.alpha_aux = nn.Parameter(torch.full((1,), math.atanh(a0)))
 
-        # Paired 2D Clause-Vector Conditional Flow Matcher
-        self.flow_matcher = ThoughtFlowMatcher(hidden_dim=self.d_clause, num_layers=num_flow_layers)
+        self.prior_head = PriorHead(
+            d_clause=self.d_clause, num_bands=self.num_bands, hidden_dim=prior_hidden,
+            sigma_min=sigma_min, sigma_max=sigma_max, sigma_init=sigma_init,
+            zero_init_aux=zero_init_aux,
+        )
+        self.stop_head = nn.Linear(self.d_clause, 1)
 
+        self.flow_matcher = ThoughtFlowMatcher(
+            hidden_dim=self.d_clause, num_layers=num_flow_layers,
+            num_bands=self.num_bands, sem_bands=self.sem_bands, num_branches=num_branches,
+            train_ode_steps=train_ode_steps, win_weight=win_weight, other_temp=other_temp,
+        )
+
+    # ------------------------------------------------------------------ legacy aliases
+    @property
+    def alpha_k(self) -> torch.Tensor:
+        """Read-only #027 log alias of `alpha_aux`."""
+        return self.alpha_aux
+
+    @property
+    def alpha_g(self) -> torch.Tensor:
+        """Read-only #027 log alias of `alpha_aux`."""
+        return self.alpha_aux
+
+    # ------------------------------------------------------------------ static helpers
     @staticmethod
     def _project_orthogonal(
         stream_vec: torch.Tensor,
@@ -586,275 +907,573 @@ class MultiStreamRightBrain(nn.Module):
         proj = (dot / norm_sq) * main_vec.float()
         return (stream_vec.float() - proj).to(dtype=main_vec.dtype)
 
-    def _fuse_streams(
-        self,
-        h_d: torch.Tensor,
-        h_k: Optional[torch.Tensor] = None,
-        h_g: Optional[torch.Tensor] = None,
-        active_streams: Optional[Sequence[str]] = None,
+    @staticmethod
+    def pack_aux_streams(
+        z_goal: Optional[torch.Tensor] = None,
+        goal_valid: Optional[torch.Tensor] = None,
+        z_cand: Optional[torch.Tensor] = None,
+        cand_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Packs companion streams into `aux: (B, N, S, D)` + `aux_valid: (B, N, S)`:
+          - stream 0 = goal clause sequence `z_goal: (B, G, D)` (or (B, D) -> G = 1),
+          - streams 1..C = each candidate/knowledge clause `z_cand: (B, C, D)` as its own length-1 stream.
+        Missing validity masks are inferred as "row is non-zero". Returns (None, None) if nothing to pack.
+        """
+        parts: List[Tuple[torch.Tensor, torch.Tensor]] = []  # (B, n, S_i, D), (B, n, S_i)
+        if z_goal is not None:
+            if z_goal.dim() == 2:
+                z_goal = z_goal.unsqueeze(1)
+                if goal_valid is not None and goal_valid.dim() == 1:
+                    goal_valid = goal_valid.unsqueeze(1)
+            gv = goal_valid.bool() if goal_valid is not None else (z_goal.abs().sum(dim=-1) > 0)
+            if z_goal.shape[1] > 0:
+                parts.append((z_goal.unsqueeze(1), gv.unsqueeze(1)))
+        if z_cand is not None:
+            if z_cand.dim() == 2:
+                z_cand = z_cand.unsqueeze(1)
+                if cand_valid is not None and cand_valid.dim() == 1:
+                    cand_valid = cand_valid.unsqueeze(1)
+            cv = cand_valid.bool() if cand_valid is not None else (z_cand.abs().sum(dim=-1) > 0)
+            if z_cand.shape[1] > 0:
+                parts.append((z_cand.unsqueeze(2), cv.unsqueeze(2)))
+        if not parts:
+            return None, None
+        S = max(p[0].shape[2] for p in parts)
+        auxs, valids = [], []
+        for a, v in parts:
+            pad = S - a.shape[2]
+            if pad > 0:
+                a = F.pad(a, (0, 0, 0, pad))
+                v = F.pad(v, (0, pad), value=False)
+            auxs.append(a)
+            valids.append(v)
+        dtype = auxs[0].dtype
+        return torch.cat([a.to(dtype=dtype) for a in auxs], dim=1), torch.cat(valids, dim=1)
+
+    @staticmethod
+    @torch.no_grad()
+    def jitter_high_bands(
+        z: torch.Tensor,
+        p: float = 0.3,
+        sem_bands: int = DEFAULT_SEM_BANDS,
+        num_bands: int = DEFAULT_NUM_BANDS,
     ) -> torch.Tensor:
+        """
+        Exposure-bias augmentation (§2.6): for each clause row independently with probability `p`,
+        rotates every HIGH band (b >= sem_bands) by an independent random orthogonal matrix
+        (QR of a Gaussian, sign-fixed -> Haar). Norm-preserving per band; low bands and
+        all-zero (padded) rows are returned bit-identical. Works on any `(..., D)` tensor.
+        """
+        if p <= 0.0 or z.numel() == 0 or sem_bands >= num_bands:
+            return z
+        orig_shape = z.shape
+        D = orig_shape[-1]
+        flat = z.reshape(-1, D)
+        R = flat.shape[0]
+        nonzero = flat.abs().sum(dim=-1) > 0
+        sel = (torch.rand((R,), device=z.device) < float(p)) & nonzero
+        idx = torch.nonzero(sel, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return z
+        d_sub = D // num_bands
+        n_hi = num_bands - int(sem_bands)
+        n_sel = idx.numel()
+        rows_b = to_bands(flat[idx].float(), num_bands)  # (n_sel, nb, d_sub)
+        hi = rows_b[:, sem_bands:, :]  # (n_sel, n_hi, d_sub)
+        G = torch.randn((n_sel, n_hi, d_sub, d_sub), device=z.device, dtype=torch.float32)
+        Q, Rm = torch.linalg.qr(G)
+        sgn = torch.sign(torch.diagonal(Rm, dim1=-2, dim2=-1))
+        sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
+        Q = Q * sgn.unsqueeze(-2)
+        hi_rot = torch.einsum("nbij,nbj->nbi", Q, hi)
+        new_rows = flat[idx].clone()
+        new_rows[:, sem_bands * d_sub:] = from_bands(hi_rot).to(dtype=z.dtype)
+        out = flat.clone()
+        out[idx] = new_rows
+        return out.reshape(orig_shape)
+
+    # ------------------------------------------------------------------ stream encoding
+    def _use_aux(self, active_streams: Optional[Sequence[str]]) -> bool:
         streams = self.active_streams if active_streams is None else active_streams
-        h_fused = h_d
-        if "knowledge" in streams and h_k is not None:
-            h_k_orth = self._project_orthogonal(h_k, h_d)
-            h_fused = h_fused + torch.tanh(self.alpha_k).to(dtype=h_d.dtype) * h_k_orth
-        if "goal" in streams and h_g is not None:
-            h_g_orth = self._project_orthogonal(h_g, h_d)
-            h_fused = h_fused + torch.tanh(self.alpha_g).to(dtype=h_d.dtype) * h_g_orth
-        return h_fused
+        if isinstance(streams, str):
+            streams = tuple(s.strip() for s in streams.split(",") if s.strip())
+        return any(s != "discourse" for s in streams)
+
+    def _resolve_aux(
+        self,
+        aux: Optional[torch.Tensor],
+        aux_valid: Optional[torch.Tensor],
+        active_streams: Optional[Sequence[str]] = None,
+        z_knowledge_seq: Optional[torch.Tensor] = None,
+        z_goal_seq: Optional[torch.Tensor] = None,
+        knowledge_valid: Optional[torch.Tensor] = None,
+        goal_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Merges explicit `aux` with legacy knowledge/goal kwargs; honours `active_streams=('discourse',)`."""
+        if not self._use_aux(active_streams):
+            return None, None
+        legacy_aux, legacy_valid = self.pack_aux_streams(z_goal_seq, goal_valid, z_knowledge_seq, knowledge_valid)
+        if aux is not None and aux.dim() == 3:  # (B, N, D) -> N length-1 streams
+            aux = aux.unsqueeze(2)
+            if aux_valid is not None and aux_valid.dim() == 2:
+                aux_valid = aux_valid.unsqueeze(2)
+        if aux is not None and aux_valid is None:
+            aux_valid = aux.abs().sum(dim=-1) > 0
+        if legacy_aux is None:
+            return aux, aux_valid
+        if aux is None:
+            return legacy_aux, legacy_valid
+        S = max(aux.shape[2], legacy_aux.shape[2])
+        aux = F.pad(aux, (0, 0, 0, S - aux.shape[2]))
+        aux_valid = F.pad(aux_valid.bool(), (0, S - aux_valid.shape[2]), value=False)
+        legacy_aux = F.pad(legacy_aux, (0, 0, 0, S - legacy_aux.shape[2])).to(dtype=aux.dtype)
+        legacy_valid = F.pad(legacy_valid, (0, S - legacy_valid.shape[2]), value=False)
+        return torch.cat([aux, legacy_aux], dim=1), torch.cat([aux_valid, legacy_valid], dim=1)
+
+    def encode_aux(
+        self,
+        aux: Optional[torch.Tensor],
+        aux_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Encodes companion streams `aux: (B, N, S, D)` with the shared `aux_stream` batched as (B*N, S, D)
+        and gathers the state at each stream's LAST VALID position.
+        Returns `h_aux: (B, N, D)` (zeros for invalid streams) and `stream_valid: (B, N)` bool,
+        or `(None, None)` if `aux` is None or N == 0.
+        """
+        if aux is None or aux.shape[1] == 0 or aux.shape[2] == 0:
+            return None, None
+        B, N, S, D = aux.shape
+        if aux_valid is None:
+            aux_valid = aux.abs().sum(dim=-1) > 0
+        valid = aux_valid.reshape(B * N, S).bool()
+        pos = torch.arange(S, device=aux.device).unsqueeze(0).expand(B * N, S)
+        last_idx = torch.where(valid, pos, torch.full_like(pos, -1)).max(dim=-1).values  # (B*N,)
+        stream_valid = last_idx >= 0
+        if not bool(stream_valid.any()):
+            return (
+                torch.zeros((B, N, D), device=aux.device, dtype=aux.dtype),
+                stream_valid.reshape(B, N),
+            )
+        # Trim trailing all-padding positions (no stream needs them) before the sequential scan.
+        S_eff = int(last_idx.max().item()) + 1
+        flat = aux.reshape(B * N, S, D)[:, :S_eff]
+        h_seq = self.aux_stream(flat)  # (B*N, S_eff, D)
+        gidx = last_idx.clamp(min=0).view(B * N, 1, 1).expand(B * N, 1, h_seq.shape[-1])
+        h_last = torch.gather(h_seq, dim=1, index=gidx).squeeze(1)  # (B*N, D)
+        h_last = h_last * stream_valid.unsqueeze(-1).to(dtype=h_last.dtype)
+        return h_last.reshape(B, N, -1), stream_valid.reshape(B, N)
+
+    def _fuse(
+        self,
+        h0: torch.Tensor,
+        h_aux: Optional[torch.Tensor],
+        stream_valid: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        h0: (B, T, D); h_aux: (B, N, D) or None. Returns dict with
+        h (B,T,D), h0, F_aux (B,T,D), gates (B,T,N) float32, gate_max (B,T), gate_sum (B,T).
+        """
+        B, T, D = h0.shape
+        if h_aux is None or h_aux.shape[1] == 0:
+            zeros_bt = torch.zeros((B, T), device=h0.device, dtype=torch.float32)
+            F_aux = torch.zeros_like(h0)
+            return {
+                "h": h0, "h0": h0, "F_aux": F_aux,
+                "gates": torch.zeros((B, T, 0), device=h0.device, dtype=torch.float32),
+                "gate_max": zeros_bt, "gate_sum": zeros_bt,
+            }
+        N = h_aux.shape[1]
+        if stream_valid is None:
+            stream_valid = torch.ones((B, N), device=h0.device, dtype=torch.bool)
+        q = self.gate_q(h0).float()  # (B, T, dg)
+        k = self.gate_k(h_aux).float()  # (B, N, dg)
+        logits = torch.einsum("btd,bnd->btn", q, k) / math.sqrt(self.d_gate) + self.gate_bias.float()
+        gates = torch.sigmoid(logits) * stream_valid.unsqueeze(1).float()  # (B, T, N)
+        v = self.aux_v(h_aux).float()  # (B, N, D)
+        agg = torch.einsum("btn,bnd->btd", gates, v)  # sum_i g_ti v_i
+        F_aux = self._project_orthogonal(agg, h0.float())  # == sum_i g_ti OrthProj(v_i, h0_t)
+        h = (h0.float() + torch.tanh(self.alpha_aux.float()) * F_aux).to(dtype=h0.dtype)
+        return {
+            "h": h, "h0": h0, "F_aux": F_aux.to(dtype=h0.dtype), "gates": gates,
+            "gate_max": gates.amax(dim=-1), "gate_sum": gates.sum(dim=-1),
+        }
+
+    def forward_context(
+        self,
+        z_main_seq: Optional[torch.Tensor] = None,
+        aux: Optional[torch.Tensor] = None,
+        aux_valid: Optional[torch.Tensor] = None,
+        *,
+        active_streams: Optional[Sequence[str]] = None,
+        h_aux: Optional[torch.Tensor] = None,
+        stream_valid: Optional[torch.Tensor] = None,
+        main_states: Optional[List[torch.Tensor]] = None,
+        return_state: bool = False,
+        discourse_seq: Optional[torch.Tensor] = None,
+        z_knowledge_seq: Optional[torch.Tensor] = None,
+        z_goal_seq: Optional[torch.Tensor] = None,
+        knowledge_seq: Optional[torch.Tensor] = None,
+        goal_seq: Optional[torch.Tensor] = None,
+        knowledge_valid: Optional[torch.Tensor] = None,
+        goal_valid: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """
+        Runs `main_stream` over `z_main_seq: (B, T, D)` and fuses companion streams.
+        Pre-encoded `h_aux` / `stream_valid` may be passed to skip `encode_aux`.
+        Returns dict: h (B,T,D), h0 (B,T,D), F_aux (B,T,D), gates (B,T,N), gate_max (B,T),
+        gate_sum (B,T), h_aux, stream_valid (+ `main_states` if return_state).
+        """
+        if z_main_seq is None:
+            z_main_seq = discourse_seq
+        if z_main_seq is None:
+            raise ValueError("forward_context requires `z_main_seq`.")
+        if z_main_seq.dim() == 2:
+            z_main_seq = z_main_seq.unsqueeze(1)
+        if z_knowledge_seq is None:
+            z_knowledge_seq = knowledge_seq
+        if z_goal_seq is None:
+            z_goal_seq = goal_seq
+
+        if h_aux is None:
+            aux_r, aux_valid_r = self._resolve_aux(
+                aux, aux_valid, active_streams, z_knowledge_seq, z_goal_seq, knowledge_valid, goal_valid
+            )
+            h_aux, stream_valid = self.encode_aux(aux_r, aux_valid_r)
+        elif not self._use_aux(active_streams):
+            h_aux, stream_valid = None, None
+
+        h0, new_main = self.main_stream(z_main_seq, states=main_states, return_state=True)
+        out = self._fuse(h0, h_aux, stream_valid)
+        out["h_aux"] = h_aux
+        out["stream_valid"] = stream_valid
+        if return_state:
+            out["main_states"] = new_main
+        return out
+
+    def predict_prior(self, ctx: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Applies `prior_head` to a `forward_context` dict -> (mu (…,D), sigma_band (…,nb)), float32."""
+        return self.prior_head(ctx["h0"], ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"])
+
+    # ------------------------------------------------------------------ training loss
+    def compute_loss(
+        self,
+        z_discourse_seq: Optional[torch.Tensor] = None,
+        target_valid_mask: Optional[torch.Tensor] = None,
+        aux: Optional[torch.Tensor] = None,
+        aux_valid: Optional[torch.Tensor] = None,
+        stop_labels: Optional[torch.Tensor] = None,
+        z_in_override: Optional[torch.Tensor] = None,
+        sample_group: Optional[torch.Tensor] = None,
+        return_metrics: bool = True,
+        *,
+        active_streams: Optional[Sequence[str]] = None,
+        z_knowledge_seq: Optional[torch.Tensor] = None,
+        z_goal_seq: Optional[torch.Tensor] = None,
+        knowledge_seq: Optional[torch.Tensor] = None,
+        goal_seq: Optional[torch.Tensor] = None,
+        discourse_seq: Optional[torch.Tensor] = None,
+        knowledge_valid: Optional[torch.Tensor] = None,
+        goal_valid: Optional[torch.Tensor] = None,
+        z_target: Optional[torch.Tensor] = None,
+        stop_valid_mask: Optional[torch.Tensor] = None,
+        group_names: Optional[Dict[int, str]] = None,
+        profile_cb: Optional[Any] = None,
+    ):
+        """
+        Right-Brain v2 training loss.
+          z_discourse_seq: (B, T, D) clause trajectory (T >= 2); targets z1 = z[:, 1:].
+          target_valid_mask: (B, T-1) valid transitions.
+          aux / aux_valid: (B, N, S, D) / (B, N, S) companion streams (or legacy kwargs).
+          stop_labels: (B, T-1) 1 where the target clause is the answer's last clause.
+          z_in_override: (B, T-1, D) main-stream input (jittered / self-fed); default z[:, :-1].
+          sample_group: (B,) long group id per sample, used ONLY for per-group sigma metrics
+            (#029: stream-dropout group 0=full, 1=goal_only, 2=none; #033: source 0=qa, 1=cont).
+          stop_valid_mask (#033): (B, T-1) rows that take part in the stop BCE. Defaults to
+            `target_valid_mask` (#029 behaviour). Rows outside `target_valid_mask` never count.
+          group_names (#033): {group_id: name} for the per-group metric keys
+            `sigma_sem_<name>` / `sigma_syn_<name>`; defaults to `GROUP_NAMES` (full/goal_only/none).
+          profile_cb (#033): optional callable(str) invoked after the context/prior pass ("mamba_prior")
+            and after the flow loss ("flow") so a trainer can take CUDA-synchronised timings.
+        total = L_flow + prior_weight * L_prior + stop_weight * L_stop.
+        Legacy #025 single-target mode: `z_target: (B, D)` predicted from the last context state.
+        """
+        if z_discourse_seq is None:
+            z_discourse_seq = discourse_seq
+        if z_discourse_seq is None:
+            raise ValueError("MultiStreamRightBrain.compute_loss requires `z_discourse_seq`.")
+        if z_knowledge_seq is None:
+            z_knowledge_seq = knowledge_seq
+        if z_goal_seq is None:
+            z_goal_seq = goal_seq
+
+        ctx_kwargs = dict(
+            active_streams=active_streams, z_knowledge_seq=z_knowledge_seq, z_goal_seq=z_goal_seq,
+            knowledge_valid=knowledge_valid, goal_valid=goal_valid,
+        )
+        if z_target is not None:
+            ctx = self.forward_context(z_discourse_seq, aux, aux_valid, **ctx_kwargs)
+            ctx = {k: (v[:, -1:] if (torch.is_tensor(v) and k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum")) else v)
+                   for k, v in ctx.items()}
+            z1 = z_target.reshape(z_target.shape[0], 1, -1)
+            valid = target_valid_mask.reshape(-1, 1) if target_valid_mask is not None else None
+        else:
+            if z_discourse_seq.shape[1] < 2:
+                raise ValueError(
+                    f"z_discourse_seq must have at least 2 clauses (lead + >=1 target), got shape {tuple(z_discourse_seq.shape)}"
+                )
+            z_in = z_in_override if z_in_override is not None else z_discourse_seq[:, :-1, :]
+            z1 = z_discourse_seq[:, 1:, :]
+            valid = target_valid_mask
+            ctx = self.forward_context(z_in, aux, aux_valid, **ctx_kwargs)
+
+        B, Tp, D = z1.shape
+        nb = self.num_bands
+        if valid is None:
+            valid = torch.ones((B, Tp), device=z1.device, dtype=torch.bool)
+        valid = valid.reshape(B, Tp).bool()
+
+        mu, sigma = self.predict_prior(ctx)  # (B, Tp, D), (B, Tp, nb) float32
+        h = ctx["h"]
+        stop_logits = self.stop_head(h).squeeze(-1).float()  # (B, Tp)
+        if profile_cb is not None:
+            profile_cb("mamba_prior")
+
+        mask_flat = valid.reshape(-1)
+        empty_valid = not bool(mask_flat.any())
+        sel = mask_flat if not empty_valid else torch.zeros_like(mask_flat).index_fill_(0, torch.zeros(1, dtype=torch.long, device=z1.device), True)
+
+        z1_v = z1.reshape(-1, D)[sel]
+        h_v = h.reshape(-1, D)[sel]
+        mu_v = mu.reshape(-1, D)[sel]
+        sig_v = sigma.reshape(-1, nb)[sel]
+
+        fm = self.flow_matcher
+        if self.training and not empty_valid and int(fm.calib_steps.item()) < 50:
+            fm.calibrate_z(z1_v)
+        z1n = fm.normalize(z1_v.float())
+
+        # Prior NLL (float32) — the ONLY loss that trains `prior_head`.
+        prior_nll = band_gaussian_nll(z1n, mu_v, sig_v, nb).mean()
+        # K-branch soft-competition flow loss (mu / sigma detached inside).
+        flow_loss, fstats = fm.compute_branch_loss(z1n, h_v, mu_v, sig_v)
+        if profile_cb is not None:
+            profile_cb("flow")
+
+        # Stop head BCE with pos_weight balancing.
+        # #033: `stop_valid_mask` (if given) selects the stop-supervised rows (e.g. continuation rows have
+        # no stop label -> stop_valid=False), always intersected with the flow-valid rows.
+        stop_loss = stop_logits.sum() * 0.0
+        stop_acc = None
+        stop_recall = None
+        if stop_labels is not None:
+            lbl = stop_labels.reshape(B, Tp).float()
+            if stop_valid_mask is not None:
+                vf = (stop_valid_mask.reshape(B, Tp).bool() & valid).float()
+            else:
+                vf = valid.float()
+            n_pos = (lbl * vf).sum()
+            n_neg = ((1.0 - lbl) * vf).sum()
+            pos_weight = (n_neg / n_pos.clamp(min=1.0)).clamp(min=1.0, max=10.0).detach()
+            bce = F.binary_cross_entropy_with_logits(stop_logits, lbl, pos_weight=pos_weight, reduction="none")
+            n_valid = vf.sum()
+            stop_loss = (bce * vf).sum() / n_valid.clamp(min=1.0)
+            with torch.no_grad():
+                if n_valid.item() > 0:
+                    correct = ((stop_logits > 0).float() == (lbl > 0.5).float()).float()
+                    stop_acc = float(((correct * vf).sum() / n_valid).item())
+                    # #033: recall on positive (last-answer-clause) rows; accuracy alone is dominated by negatives.
+                    pos_vf = (lbl > 0.5).float() * vf
+                    if pos_vf.sum().item() > 0:
+                        stop_recall = float(((correct * pos_vf).sum() / pos_vf.sum()).item())
+
+        total = flow_loss + self.prior_weight * prior_nll + self.stop_weight * stop_loss
+        if empty_valid:
+            total = total * 0.0
+
+        if not return_metrics:
+            return total
+
+        with torch.no_grad():
+            L = self.sem_bands
+            sig_d = sig_v.detach()
+            sigma_band_mean = sig_d.mean(dim=0)  # (nb,)
+            gates = ctx["gates"].detach()
+            sv = ctx.get("stream_valid")
+            metrics: Dict[str, Any] = {
+                "total_loss": float(total.detach().item()),
+                "flow_loss": float(flow_loss.detach().item()),
+                "vel_loss": float(fstats["vel_loss"].item()),
+                "cos_loss": float(fstats["cos_loss"].item()),
+                "thought_cos": float(fstats["thought_cos"].item()),
+                "end_mse": float(fstats["end_mse"].item()),
+                "win_loss": float(fstats["win_loss"].item()),
+                "other_loss": float(fstats["other_loss"].item()),
+                "prior_nll": float(prior_nll.detach().item()),
+                "stop_loss": float(stop_loss.detach().item()),
+                "stop_acc": stop_acc,
+                "stop_recall": stop_recall,
+                "sigma_sem": float(sig_d[:, :L].mean().item()),
+                "sigma_syn": float(sig_d[:, L:].mean().item()) if L < nb else 0.0,
+                "sigma_band": [float(x) for x in sigma_band_mean.tolist()],
+                "winner_hist": [int(x) for x in fstats["winner_hist"].tolist()],
+                "branch_diversity": float(fstats["branch_diversity"].item()),
+                "alpha_aux": float(torch.tanh(self.alpha_aux.detach()).item()),
+                "n_streams": int(gates.shape[-1]),
+                "gate_mean": float(gates[valid].mean().item()) if (gates.shape[-1] > 0 and not empty_valid) else 0.0,
+                "n_valid_rows": int(mask_flat.sum().item()),
+                "empty_valid": empty_valid,
+            }
+            if sv is not None and gates.shape[-1] > 0 and not empty_valid:
+                gv = gates[valid]  # (n, N)
+                svv = sv.unsqueeze(1).expand(B, Tp, -1)[valid]
+                metrics["gate_valid_mean"] = float((gv.sum() / svv.float().sum().clamp(min=1.0)).item())
+            if sample_group is not None and not empty_valid:
+                grp = sample_group.reshape(B, 1).expand(B, Tp).reshape(-1)[sel]
+                names = self.GROUP_NAMES if group_names is None else group_names
+                for gid, gname in names.items():
+                    m = grp == int(gid)
+                    if bool(m.any()):
+                        metrics[f"sigma_sem_{gname}"] = float(sig_d[m][:, :L].mean().item())
+                        metrics[f"sigma_syn_{gname}"] = float(sig_d[m][:, L:].mean().item()) if L < nb else 0.0
+                        metrics[f"n_rows_{gname}"] = int(m.sum().item())
+            metrics["n_stop_rows"] = int(vf.sum().item()) if stop_labels is not None else 0
+            # Tensor views for callers that prefer device tensors (old #027 keys)
+            metrics["loss_vel"] = fstats["vel_loss"]
+            metrics["loss_cos"] = fstats["cos_loss"]
+            metrics["cos_sim"] = fstats["thought_cos"]
+        return total, metrics
+
+    # ------------------------------------------------------------------ sampling / rollout
+    @torch.no_grad()
+    def sample_next_clauses(
+        self,
+        z_in: torch.Tensor,
+        aux: Optional[torch.Tensor] = None,
+        aux_valid: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        ode_steps: int = 10,
+        *,
+        active_streams: Optional[Sequence[str]] = None,
+        z_knowledge_seq: Optional[torch.Tensor] = None,
+        z_goal_seq: Optional[torch.Tensor] = None,
+        renorm: bool = True,
+    ) -> torch.Tensor:
+        """
+        Teacher-forced one-step-ahead sampling for scheduled self-feeding:
+        `z_in: (B, T', D)` -> `z_hat: (B, T', D)` in z_clause (DENORMALIZED) space, where
+        z_hat[:, t] is a sample of the clause following z_in[:, :t+1].
+        """
+        ctx = self.forward_context(
+            z_in, aux, aux_valid, active_streams=active_streams,
+            z_knowledge_seq=z_knowledge_seq, z_goal_seq=z_goal_seq,
+        )
+        mu, sigma = self.predict_prior(ctx)
+        z_hat = self.flow_matcher.sample(
+            ctx["h"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=temperature, renorm=renorm,
+        )
+        return z_hat.to(dtype=z_in.dtype)
 
     def step(
         self,
-        s_discourse_t: torch.Tensor,
-        s_knowledge_t: Optional[torch.Tensor] = None,
-        s_goal_t: Optional[torch.Tensor] = None,
-        states: Optional[Dict[str, List[torch.Tensor]]] = None,
-        active_streams: Optional[Sequence[str]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, List[torch.Tensor]]]:
+        z_t: torch.Tensor,
+        states: Optional[Dict[str, Any]] = None,
+        h_aux: Optional[torch.Tensor] = None,
+        stream_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
         """
-        Advances the Right Brain by 1 punctuation clause step (`1 step of Mamba = 1 punctuation clause`).
+        Advances the main stream by ONE clause `z_t: (B, D)` and fuses pre-encoded companions.
+        Returns `(ctx, new_states)` where ctx has h/h0/F_aux/gates/gate_max/gate_sum of shape (B, ·).
         """
-        streams = self.active_streams if active_streams is None else active_streams
-        if states is None:
-            states = {}
-        new_states: Dict[str, List[torch.Tensor]] = {}
-
-        h_d, new_states["discourse"] = self.discourse_stream.step(
-            s_discourse_t, states.get("discourse")
-        )
-
-        h_k = None
-        if "knowledge" in streams and s_knowledge_t is not None:
-            h_k, new_states["knowledge"] = self.knowledge_stream.step(
-                s_knowledge_t, states.get("knowledge")
-            )
-
-        h_g = None
-        if "goal" in streams and s_goal_t is not None:
-            h_g, new_states["goal"] = self.goal_stream.step(
-                s_goal_t, states.get("goal")
-            )
-
-        h_t = self._fuse_streams(h_d, h_k=h_k, h_g=h_g, active_streams=streams)
-        return h_t, new_states
+        states = {} if states is None else states
+        new_states: Dict[str, Any] = dict(states)
+        h0_t, new_states["main"] = self.main_stream.step(z_t, states.get("main"))
+        ctx = self._fuse(h0_t.unsqueeze(1), h_aux, stream_valid)
+        ctx = {k: v.squeeze(1) for k, v in ctx.items()}
+        return ctx, new_states
 
     @torch.no_grad()
     def step_clause(
         self,
         z_curr: torch.Tensor,
         states: Optional[Dict[str, Any]] = None,
-        z_knowledge: Optional[torch.Tensor] = None,
-        z_goal: Optional[torch.Tensor] = None,
-        active_streams: Optional[Sequence[str]] = None,
+        aux: Optional[torch.Tensor] = None,
+        aux_valid: Optional[torch.Tensor] = None,
         ode_steps: int = 10,
         temperature: float = 0.8,
         return_all: bool = False,
-    ):
-        """
-        Autoregressive single-clause Right-Brain step for Stage 3 Dual-Brain Rollout:
-          1. Updates `discourse_stream` state with current clause vector `z_curr: (B, D)`.
-          2. Encodes/steps `knowledge_stream` and `goal_stream` (caching 3D sequence states across steps).
-          3. Fuses active streams via orthogonal projection (`_fuse_streams`).
-          4. Samples the next clause's thought vector `z_thought: (B, D)` via `self.flow_matcher.sample(...)`.
-        Returns `(z_thought, new_states)` (or `(z_thought, h_t, new_states)` if `return_all=True`).
-        """
-        streams = self.active_streams if active_streams is None else active_streams
-        if states is None:
-            states = {}
-        new_states: Dict[str, Any] = dict(states)
-
-        if z_curr.dim() == 3:
-            z_curr_2d = z_curr[:, -1, :]
-        else:
-            z_curr_2d = z_curr
-
-        h_d, new_states["discourse"] = self.discourse_stream.step(
-            z_curr_2d, states.get("discourse")
-        )
-
-        h_k = None
-        if "knowledge" in streams:
-            if "knowledge_h" in states and states["knowledge_h"] is not None:
-                h_k = states["knowledge_h"]
-            elif z_knowledge is not None:
-                if z_knowledge.dim() == 3:
-                    h_k_seq, new_states["knowledge"] = self.knowledge_stream(
-                        z_knowledge, states=states.get("knowledge"), return_state=True
-                    )
-                    h_k = h_k_seq[:, -1, :]
-                    new_states["knowledge_h"] = h_k
-                else:
-                    h_k, new_states["knowledge"] = self.knowledge_stream.step(
-                        z_knowledge, states.get("knowledge")
-                    )
-
-        h_g = None
-        if "goal" in streams:
-            if "goal_h" in states and states["goal_h"] is not None:
-                h_g = states["goal_h"]
-            elif z_goal is not None:
-                if z_goal.dim() == 3:
-                    h_g_seq, new_states["goal"] = self.goal_stream(
-                        z_goal, states=states.get("goal"), return_state=True
-                    )
-                    h_g = h_g_seq[:, -1, :]
-                    new_states["goal_h"] = h_g
-                else:
-                    h_g, new_states["goal"] = self.goal_stream.step(
-                        z_goal, states.get("goal")
-                    )
-
-        h_t = self._fuse_streams(h_d, h_k=h_k, h_g=h_g, active_streams=streams)
-        z_thought = self.flow_matcher.sample(h_t, steps=ode_steps, temperature=temperature)
-        if return_all:
-            return z_thought, h_t, new_states
-        return z_thought, new_states
-
-    def forward_context(
-        self,
-        discourse_seq: torch.Tensor,
-        knowledge_seq: Optional[torch.Tensor] = None,
-        goal_seq: Optional[torch.Tensor] = None,
-        active_streams: Optional[Sequence[str]] = None,
-        return_sequence: bool = False,
-    ) -> torch.Tensor:
-        """
-        Processes a sequence of clause vectors `(B, T, D)` across the active Mamba streams
-        and returns either the latest fused context vector `h_T: (B, D)` (`return_sequence=False`)
-        or the full fused sequence `h_seq: (B, T, D)` (`return_sequence=True`).
-        """
-        streams = self.active_streams if active_streams is None else active_streams
-        h_d_seq = self.discourse_stream(discourse_seq)
-
-        h_k_seq = None
-        if "knowledge" in streams and knowledge_seq is not None:
-            if knowledge_seq.dim() == 2:
-                knowledge_seq = knowledge_seq.unsqueeze(1)
-            h_k_raw = self.knowledge_stream(knowledge_seq)
-            if h_k_raw.shape[1] == h_d_seq.shape[1]:
-                h_k_seq = h_k_raw
-            else:
-                h_k_seq = h_k_raw[:, -1:, :].expand(-1, h_d_seq.shape[1], -1)
-
-        h_g_seq = None
-        if "goal" in streams and goal_seq is not None:
-            if goal_seq.dim() == 2:
-                goal_seq = goal_seq.unsqueeze(1)
-            h_g_raw = self.goal_stream(goal_seq)
-            if h_g_raw.shape[1] == h_d_seq.shape[1]:
-                h_g_seq = h_g_raw
-            else:
-                h_g_seq = h_g_raw[:, -1:, :].expand(-1, h_d_seq.shape[1], -1)
-
-        h_fused_seq = self._fuse_streams(
-            h_d_seq, h_k=h_k_seq, h_g=h_g_seq, active_streams=streams
-        )
-        if return_sequence:
-            return h_fused_seq
-        return h_fused_seq[:, -1, :]
-
-    def compute_loss(
-        self,
-        z_discourse_seq: Optional[torch.Tensor] = None,
-        z_knowledge_seq: Optional[torch.Tensor] = None,
-        z_goal_seq: Optional[torch.Tensor] = None,
-        target_valid_mask: Optional[torch.Tensor] = None,
-        return_metrics: bool = False,
         *,
-        discourse_seq: Optional[torch.Tensor] = None,
-        z_target: Optional[torch.Tensor] = None,
-        knowledge_seq: Optional[torch.Tensor] = None,
-        goal_seq: Optional[torch.Tensor] = None,
         active_streams: Optional[Sequence[str]] = None,
+        refresh_aux: bool = False,
+        z_knowledge: Optional[torch.Tensor] = None,
+        z_goal: Optional[torch.Tensor] = None,
+        knowledge_valid: Optional[torch.Tensor] = None,
+        goal_valid: Optional[torch.Tensor] = None,
+        renorm: bool = True,
     ):
         """
-        Computes Right-Brain Mamba + ThoughtFlowMatcher loss:
-          - Multi-clause trajectory mode (#027):
-            Given `z_discourse_seq: (B, T, D)` (`T >= 2`), predicts `z_1 = z_discourse_seq[:, 1:, :]`
-            from Mamba context `cond = forward_context(z_discourse_seq[:, :-1, :], ...)` masked by
-            `target_valid_mask: (B, T - 1)`.
-          - Single-target legacy mode (#025):
-            Given `discourse_seq: (B, T, D)` and 2D `z_target: (B, D)`, predicts `z_target` from `h_T`.
+        Autoregressive single-clause step for rollout:
+          1. Encodes companions ONCE (cached as states['h_aux'] / states['stream_valid']; pass
+             `refresh_aux=True` to re-encode, e.g. when per-clause selection changes the pool).
+          2. Steps `main_stream` with `z_curr: (B, D)` (or last clause of (B, T, D)).
+          3. Prior head -> (mu, sigma_band); samples `z_thought` from the adaptive cone.
+        Returns `(z_thought, new_states)` or, with `return_all`, `(z_thought, h_t, new_states, info)` where
+        info = {stop_prob (B,), sigma_band (B, nb), gates (B, N), mu (B, D) normalized}.
         """
-        if z_discourse_seq is None and discourse_seq is not None:
-            z_discourse_seq = discourse_seq
-        if z_knowledge_seq is None and knowledge_seq is not None:
-            z_knowledge_seq = knowledge_seq
-        if z_goal_seq is None and goal_seq is not None:
-            z_goal_seq = goal_seq
+        states = {} if states is None else states
+        new_states: Dict[str, Any] = dict(states)
+        z_t = z_curr[:, -1, :] if z_curr.dim() == 3 else z_curr
 
-        if z_discourse_seq is None:
-            raise ValueError("MultiStreamRightBrain.compute_loss requires `z_discourse_seq`.")
-
-        streams = self.active_streams if active_streams is None else active_streams
-
-        # Backward compatibility check for #025 positional call `compute_loss(discourse_seq, z_target)`
-        if z_target is None and z_knowledge_seq is not None and z_knowledge_seq.dim() == 2 and z_discourse_seq.dim() == 3:
-            z_target = z_knowledge_seq
-            z_knowledge_seq = None
-
-        if z_target is not None:
-            h_t = self.forward_context(
-                discourse_seq=z_discourse_seq,
-                knowledge_seq=z_knowledge_seq,
-                goal_seq=z_goal_seq,
-                active_streams=streams,
-                return_sequence=False,
+        if refresh_aux or not states.get("aux_encoded", False):
+            aux_r, aux_valid_r = self._resolve_aux(
+                aux, aux_valid, active_streams, z_knowledge, z_goal, knowledge_valid, goal_valid
             )
-            return self.flow_matcher.compute_loss(
-                z_1=z_target,
-                cond=h_t,
-                valid_mask=target_valid_mask,
-                return_metrics=return_metrics,
-            )
+            h_aux, stream_valid = self.encode_aux(aux_r, aux_valid_r)
+            new_states["h_aux"] = h_aux
+            new_states["stream_valid"] = stream_valid
+            new_states["aux_encoded"] = True
+        h_aux = new_states.get("h_aux")
+        stream_valid = new_states.get("stream_valid")
 
-        if z_discourse_seq.shape[1] < 2:
-            raise ValueError(
-                f"z_discourse_seq must have at least 2 clauses (lead + >=1 target), got shape {tuple(z_discourse_seq.shape)}"
-            )
-
-        z_in = z_discourse_seq[:, :-1, :]  # (B, T - 1, D)
-        z_1 = z_discourse_seq[:, 1:, :]    # (B, T - 1, D)
-
-        cond_seq = self.forward_context(
-            discourse_seq=z_in,
-            knowledge_seq=z_knowledge_seq,
-            goal_seq=z_goal_seq,
-            active_streams=streams,
-            return_sequence=True,
-        )
-        return self.flow_matcher.compute_loss(
-            z_1=z_1,
-            cond=cond_seq,
-            valid_mask=target_valid_mask,
-            return_metrics=return_metrics,
-        )
+        ctx, new_states = self.step(z_t, new_states, h_aux, stream_valid)
+        mu, sigma = self.predict_prior(ctx)
+        h_t = ctx["h"]
+        z_thought = self.flow_matcher.sample(
+            h_t, mu=mu, sigma_band=sigma, steps=ode_steps, temperature=temperature, renorm=renorm,
+        ).to(dtype=z_t.dtype)
+        if return_all:
+            info = {
+                "stop_prob": torch.sigmoid(self.stop_head(h_t).float()).squeeze(-1),
+                "sigma_band": sigma,
+                "gates": ctx["gates"],
+                "mu": mu,
+            }
+            return z_thought, h_t, new_states, info
+        return z_thought, new_states
 
     @torch.no_grad()
     def sample_thought(
         self,
         discourse_seq: torch.Tensor,
-        knowledge_seq: Optional[torch.Tensor] = None,
-        goal_seq: Optional[torch.Tensor] = None,
-        active_streams: Optional[Sequence[str]] = None,
+        aux: Optional[torch.Tensor] = None,
+        aux_valid: Optional[torch.Tensor] = None,
         steps: int = 10,
         temperature: float = 1.0,
+        *,
+        active_streams: Optional[Sequence[str]] = None,
+        knowledge_seq: Optional[torch.Tensor] = None,
+        goal_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Runs the active Mamba streams over `discourse_seq` to obtain `h_t: (B, D)` and integrates
-        `ThoughtFlowMatcher` to sample the next clause's thought vector `z_thought: (B, D)`.
-        Returns `(z_thought, h_t)`.
-        """
-        streams = self.active_streams if active_streams is None else active_streams
-        h_t = self.forward_context(
-            discourse_seq=discourse_seq,
-            knowledge_seq=knowledge_seq,
-            goal_seq=goal_seq,
-            active_streams=streams,
-            return_sequence=False,
+        """Samples the clause following `discourse_seq: (B, T, D)`. Returns `(z_thought (B, D), h_T (B, D))`."""
+        ctx = self.forward_context(
+            discourse_seq, aux, aux_valid, active_streams=active_streams,
+            z_knowledge_seq=knowledge_seq, z_goal_seq=goal_seq,
         )
-        z_thought = self.flow_matcher.sample(h_t, steps=steps, temperature=temperature)
-        return z_thought, h_t
+        last = {k: v[:, -1] for k, v in ctx.items() if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum")}
+        mu, sigma = self.predict_prior(last)
+        z_thought = self.flow_matcher.sample(last["h"], mu=mu, sigma_band=sigma, steps=steps, temperature=temperature)
+        return z_thought, last["h"]
 
 
 class KnowledgeSelector(nn.Module):
@@ -910,6 +1529,301 @@ class KnowledgeSelector(nn.Module):
             self.cand_proj.weight.copy_(torch.eye(hidden_dim))
             self.cand_proj.bias.zero_()
             nn.init.normal_(self.goal_proj.weight, mean=0.0, std=0.02)
+
+        # [Feature Addition - Task #033: learnable sink ("do not copy") head]
+        # 1. Purpose: the #031 left-brain diagnosis showed irrelevant attractors HURT (B < C), so the selector
+        #    must be able to say "nothing in the pool is worth copying" -> the left brain then runs with
+        #    `k_attractors=None` (condition C). Labels: `sink_label` = no candidate reaches the IDF rare-span
+        #    overlap threshold (dataset #032).
+        # 2. Method: sink_logit = MLP([probe feature (d_sink), pooled candidate-similarity statistics]).
+        #    The statistics are [max combined sim, mean combined sim, max full-space sim, max low-rank sim,
+        #    log1p(#valid candidates) / log(33)] over the VALID candidates (all 0 when there is none), so the
+        #    head sees both "what am I looking for" (probe) and "how good is the best match" (pool).
+        # 3. Caveats: new parameters `sink_probe.*` / `sink_head.*`. Old #029 `knowledge_selector.pt` files
+        #    lack them; a load_state_dict pre-hook fills the missing sink keys with the current (fresh) values
+        #    so strict loading of #029 checkpoints keeps working (sink is then untrained!).
+        self.d_sink = 128
+        self.num_sink_stats = 5
+        self.sink_probe = nn.Sequential(nn.Linear(hidden_dim, self.d_sink), nn.SiLU())
+        self.sink_head = nn.Sequential(
+            nn.Linear(self.d_sink + self.num_sink_stats, self.d_sink),
+            nn.SiLU(),
+            nn.Linear(self.d_sink, 1),
+        )
+        with torch.no_grad():
+            nn.init.normal_(self.sink_head[-1].weight, mean=0.0, std=0.02)
+            self.sink_head[-1].bias.zero_()
+        self._register_load_state_dict_pre_hook(self._fill_missing_sink_keys)
+
+    _SINK_PREFIXES = ("sink_probe.", "sink_head.")
+
+    def _fill_missing_sink_keys(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """#033 backward compatibility: injects fresh sink parameters into pre-#033 selector state dicts."""
+        own = None
+        filled = 0
+        for name, tensor in self.named_parameters():
+            if not name.startswith(self._SINK_PREFIXES):
+                continue
+            key = prefix + name
+            if key not in state_dict:
+                if own is None:
+                    own = {k: v for k, v in self.state_dict().items()}
+                state_dict[key] = own[name].detach().clone()
+                filled += 1
+        if filled:
+            print(f"ℹ️ KnowledgeSelector: checkpoint has no sink head ({filled} tensors) — using fresh (untrained) sink weights.")
+
+    # ------------------------------------------------------------------ #033 shared projections
+    def _project_probe(self, z_probe: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """z_probe (..., D) -> (q_normed (..., D), q_full unit (..., D), q_sub unit (..., d_proj))."""
+        q_normed = self.probe_norm(z_probe)
+        q_full = F.normalize(self.probe_proj(q_normed), dim=-1, eps=1e-6)
+        q_sub = F.normalize(self.query_sub_proj(q_normed), dim=-1, eps=1e-6)
+        return q_normed, q_full, q_sub
+
+    def _project_cand(self, z_cand: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """z_cand (..., D) -> (k_full unit (..., D), k_sub unit (..., d_proj))."""
+        c_normed = self.cand_norm(z_cand)
+        k_full = F.normalize(self.cand_proj(c_normed), dim=-1, eps=1e-6)
+        k_sub = F.normalize(self.cand_sub_proj(c_normed), dim=-1, eps=1e-6)
+        return k_full, k_sub
+
+    def _scores_from_sims(self, sim_full: torch.Tensor, sim_sub: torch.Tensor) -> torch.Tensor:
+        """Same scoring rule as `score_clause_candidates` (kept bit-compatible with #027/#029)."""
+        scale = self.logit_scale.clamp(min=1.0, max=30.0)
+        return (0.5 * sim_full + 0.5 * sim_sub) * scale + self.bias
+
+    def _sink_from_sims(
+        self,
+        q_normed: torch.Tensor,
+        sim_full: torch.Tensor,
+        sim_sub: torch.Tensor,
+        cand_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        q_normed: (N, D); sim_full / sim_sub: (N, C); cand_valid: (N, C) bool -> sink_logit (N,) float32.
+        Pooled statistics are taken over valid candidates only (0 if a row has none).
+        """
+        v = cand_valid.bool()
+        vf = v.float()
+        n_valid = vf.sum(dim=-1)  # (N,)
+        has = n_valid > 0
+        sf = sim_full.float()
+        ss = sim_sub.float()
+        sc = 0.5 * sf + 0.5 * ss
+        neg = torch.full_like(sc, -2.0)
+        max_c = torch.where(v, sc, neg).amax(dim=-1)
+        max_f = torch.where(v, sf, neg).amax(dim=-1)
+        max_s = torch.where(v, ss, neg).amax(dim=-1)
+        mean_c = (sc * vf).sum(dim=-1) / n_valid.clamp(min=1.0)
+        zero = torch.zeros_like(max_c)
+        stats = torch.stack(
+            [
+                torch.where(has, max_c, zero),
+                torch.where(has, mean_c, zero),
+                torch.where(has, max_f, zero),
+                torch.where(has, max_s, zero),
+                torch.log1p(n_valid) / math.log(33.0),
+            ],
+            dim=-1,
+        )  # (N, 5)
+        feat = self.sink_probe(q_normed)
+        x = torch.cat([feat, stats.to(dtype=feat.dtype)], dim=-1)
+        return self.sink_head(x).squeeze(-1).float()
+
+    def score_with_sink(
+        self,
+        z_probe: torch.Tensor,
+        z_cand: torch.Tensor,
+        cand_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        #033: per-row candidate scores + sink ("copy nothing") logit.
+          z_probe: (N, D); z_cand: (N, C, D); cand_valid: (N, C) bool (default all valid).
+        Returns scores (N, C) float32 raw logits (invalid -> -1e4) and sink_logit (N,) float32.
+        """
+        N, C, _ = z_cand.shape
+        if cand_valid is None:
+            cand_valid = torch.ones((N, C), device=z_cand.device, dtype=torch.bool)
+        cand_valid = cand_valid.bool()
+        q_normed, q_full, q_sub = self._project_probe(z_probe)
+        k_full, k_sub = self._project_cand(z_cand)
+        sim_full = torch.einsum("nd,ncd->nc", q_full, k_full)
+        sim_sub = torch.einsum("nd,ncd->nc", q_sub, k_sub)
+        scores = self._scores_from_sims(sim_full, sim_sub).float().masked_fill(~cand_valid, -1e4)
+        sink_logit = self._sink_from_sims(q_normed, sim_full, sim_sub, cand_valid)
+        return scores, sink_logit
+
+    def compute_context_selection_loss(
+        self,
+        z_main: torch.Tensor,
+        z_probe: torch.Tensor,
+        ctx_rel: torch.Tensor,
+        ctx_rel_valid: torch.Tensor,
+        sink_label: torch.Tensor,
+        main_valid: torch.Tensor,
+        *,
+        top_m: int = 3,
+        pos_threshold: float = 0.5,
+        max_pos_weight: float = 5.0,
+        sink_weight: float = 1.0,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        #033 self-supervised context-clause selection (staged plan §3).
+          z_main: (B, T, D) clause vectors = candidate pool; z_probe: (B, T, D) per-row probes
+          (GT target clause + noise, or right-brain thoughts); ctx_rel: (B, T, T) soft relevance of
+          candidate row j for target row t (only j < t used); ctx_rel_valid / main_valid: (B, T) bool;
+          sink_label: (B, T) 1 = no candidate worth copying.
+        Candidates of row t = valid rows j < t (causal). Rows are supervised iff ctx_rel_valid & main_valid
+        & (>= 1 candidate). Loss = soft-label BCE on candidates (pos_weight = n_neg / n_pos clamped to
+        [1, max_pos_weight]) + sink_weight * BCE(sink) (pos_weight balanced, clamped to [0.2, 5]).
+        Pair projections are computed once per sample (O(B T D^2)) and compared with an einsum
+        (O(B T^2 D)) instead of expanding the pool per probe.
+        Metrics (rows with sink_label == 0 for ranking): precision@1, recall@M (positives = rel >=
+        pos_threshold, or the row-max candidate if none passes), sink accuracy, predicted / true sink rate.
+        """
+        B, T, D = z_main.shape
+        device = z_main.device
+        mv = main_valid.bool()
+        q_normed, q_full, q_sub = self._project_probe(z_probe)
+        k_full, k_sub = self._project_cand(z_main)
+        sim_full = torch.einsum("btd,bjd->btj", q_full, k_full)
+        sim_sub = torch.einsum("btd,bjd->btj", q_sub, k_sub)
+        scores = self._scores_from_sims(sim_full, sim_sub).float()  # (B, T, T)
+
+        causal = torch.ones((T, T), device=device, dtype=torch.bool).tril(diagonal=-1)  # j < t
+        cand_valid = causal.unsqueeze(0) & mv.unsqueeze(1)  # (B, T, T)
+        row_valid = ctx_rel_valid.bool() & mv & cand_valid.any(dim=-1)  # (B, T)
+        pair_valid = row_valid.unsqueeze(-1) & cand_valid
+        pf = pair_valid.float()
+
+        targets = ctx_rel.float().clamp(0.0, 1.0) * pf
+        s_clean = torch.where(pair_valid, scores, torch.zeros_like(scores))
+        n_pos = targets.sum()
+        n_neg = ((1.0 - targets) * pf).sum()
+        pos_weight = (n_neg / n_pos.clamp(min=1e-3)).clamp(min=1.0, max=float(max_pos_weight)).detach()
+        bce = F.binary_cross_entropy_with_logits(s_clean, targets, pos_weight=pos_weight, reduction="none")
+        cand_loss = (bce * pf).sum() / pf.sum().clamp(min=1.0)
+
+        sink_logit = self._sink_from_sims(
+            q_normed.reshape(B * T, -1), sim_full.reshape(B * T, T), sim_sub.reshape(B * T, T),
+            cand_valid.reshape(B * T, T),
+        ).reshape(B, T)
+        sl = sink_label.float().clamp(0.0, 1.0)
+        rf = row_valid.float()
+        s_pos = (sl * rf).sum()
+        s_neg = ((1.0 - sl) * rf).sum()
+        sink_pw = (s_neg / s_pos.clamp(min=1.0)).clamp(min=0.2, max=5.0).detach()
+        sink_bce = F.binary_cross_entropy_with_logits(sink_logit, sl, pos_weight=sink_pw, reduction="none")
+        sink_loss = (sink_bce * rf).sum() / rf.sum().clamp(min=1.0)
+
+        loss = cand_loss + float(sink_weight) * sink_loss
+        n_rows = int(row_valid.sum().item())
+        if n_rows == 0:
+            loss = (scores.sum() + sink_logit.sum()) * 0.0
+
+        with torch.no_grad():
+            metrics: Dict[str, Any] = {
+                "sel_loss": float(loss.detach().item()),
+                "cand_loss": float(cand_loss.detach().item()),
+                "sink_loss": float(sink_loss.detach().item()),
+                "n_rows": n_rows,
+                "n_pairs": int(pair_valid.sum().item()),
+                "pos_weight": float(pos_weight.item()),
+                "precision_at_1": None,
+                "recall_at_m": None,
+                "sink_acc": None,
+                "sink_rate_pred": None,
+                "sink_rate_true": None,
+                "n_rank_rows": 0,
+            }
+            if n_rows > 0:
+                sink_pred = (torch.sigmoid(sink_logit) > 0.5)
+                sink_true = sl > 0.5
+                metrics["sink_acc"] = float(((sink_pred == sink_true) & row_valid).float().sum().item() / n_rows)
+                metrics["sink_rate_pred"] = float((sink_pred & row_valid).float().sum().item() / n_rows)
+                metrics["sink_rate_true"] = float((sink_true & row_valid).float().sum().item() / n_rows)
+                rank_rows = row_valid & ~sink_true  # (B, T)
+                n_rank = int(rank_rows.sum().item())
+                metrics["n_rank_rows"] = n_rank
+                if n_rank > 0:
+                    rel = ctx_rel.float().masked_fill(~cand_valid, -1.0)[rank_rows]  # (n, T)
+                    sc = scores.masked_fill(~cand_valid, -1e4)[rank_rows]  # (n, T)
+                    cv = cand_valid[rank_rows]
+                    row_max = rel.amax(dim=-1, keepdim=True)
+                    pos = cv & ((rel >= float(pos_threshold)) | ((rel >= row_max) & (row_max > 0)))
+                    M = max(1, min(int(top_m), T))
+                    top_idx = sc.topk(M, dim=-1).indices  # (n, M)
+                    top_valid = torch.gather(cv, 1, top_idx)
+                    hit = torch.gather(pos, 1, top_idx) & top_valid  # (n, M)
+                    p1 = hit[:, 0].float()
+                    n_pos_row = pos.float().sum(dim=-1)
+                    rec = hit.float().sum(dim=-1) / n_pos_row.clamp(min=1.0)
+                    has_pos = n_pos_row > 0
+                    if bool(has_pos.any()):
+                        metrics["precision_at_1"] = float(p1[has_pos].mean().item())
+                        metrics["recall_at_m"] = float(rec[has_pos].mean().item())
+        return loss, metrics
+
+    @torch.no_grad()
+    def select_context_attractors(
+        self,
+        z_probe: torch.Tensor,
+        z_cand: torch.Tensor,
+        w_cand: torch.Tensor,
+        cand_valid: Optional[torch.Tensor] = None,
+        top_m: int = 3,
+        min_score: float = 0.25,
+        sink_threshold: float = 0.5,
+        pad_token_id: int = 0,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        #033 sink-aware attractor selection for ONE target clause per sample.
+          z_probe: (B, D); z_cand: (B, C, D); w_cand: (B, C, L) token ids; cand_valid: (B, C).
+        A sample gets NO attractors (use_attr=False, all-pad row, k_mask all False) when
+        sigmoid(sink_logit) > sink_threshold, or no valid candidate has sigmoid(score) >= min_score.
+        Otherwise the top-M candidates with sigmoid(score) >= min_score are packed in chronological
+        (index) order into `w_attractors (B, M*L)` + `k_mask = w != pad`.
+        Returns (None, None, info) if no sample uses attractors. info = {use_attr (B,) bool,
+        scores (B, C) sigmoid gates (invalid=0), sink_prob (B,), top_idx (B, M), keep (B, M)}.
+        Callers MUST route rows with use_attr=False through `k_attractors=None`
+        (see `crystallize_with_optional_attractors`).
+        """
+        B, C, L = w_cand.shape
+        device = w_cand.device
+        if cand_valid is None:
+            cand_valid = torch.ones((B, C), device=device, dtype=torch.bool)
+        cand_valid = cand_valid.bool()
+        if C == 0:
+            info = {
+                "use_attr": torch.zeros((B,), device=device, dtype=torch.bool),
+                "scores": torch.zeros((B, 0), device=device),
+                "sink_prob": torch.ones((B,), device=device),
+                "top_idx": torch.zeros((B, 0), device=device, dtype=torch.long),
+                "keep": torch.zeros((B, 0), device=device, dtype=torch.bool),
+            }
+            return None, None, info
+        scores, sink_logit = self.score_with_sink(z_probe, z_cand, cand_valid)
+        gates = torch.sigmoid(scores).masked_fill(~cand_valid, 0.0)
+        sink_prob = torch.sigmoid(sink_logit)
+        M = max(1, min(int(top_m), C))
+        top_g, top_idx = gates.topk(M, dim=-1)
+        keep = (top_g >= float(min_score)) & torch.gather(cand_valid, 1, top_idx)
+        use_attr = keep.any(dim=-1) & (sink_prob <= float(sink_threshold))
+        keep = keep & use_attr.unsqueeze(-1)
+        # chronological order among the selected clauses (unselected slots sorted to the end)
+        order_key = torch.where(keep, top_idx, top_idx + C)
+        order = order_key.argsort(dim=-1)
+        top_idx = torch.gather(top_idx, 1, order)
+        keep = torch.gather(keep, 1, order)
+        info = {"use_attr": use_attr, "scores": gates, "sink_prob": sink_prob, "top_idx": top_idx, "keep": keep}
+        if not bool(use_attr.any()):
+            return None, None, info
+        sel_w = torch.gather(w_cand, 1, top_idx.unsqueeze(-1).expand(B, M, L))
+        sel_w = torch.where(keep.unsqueeze(-1), sel_w, torch.full_like(sel_w, int(pad_token_id)))
+        w_attr = sel_w.reshape(B, M * L)
+        k_mask = w_attr != int(pad_token_id)
+        return w_attr, k_mask, info
 
     def score_clause_candidates(
         self,
@@ -1065,6 +1979,56 @@ class KnowledgeSelector(nn.Module):
 
         return bce_loss
 
+    # [Feature Addition - Task #029: Per-Clause Selection Loss]
+    # 1. Purpose: v2 moves KnowledgeSelector "after the Right Brain, per clause": every target clause step t
+    #    uses its own probe (true target clause + small noise during training, z_thought at inference) to
+    #    pick that clause's left-brain attractors. Labels are soft bigram-overlap pseudo-labels (T, C).
+    # 2. Method: flattens probes to (B*T, D), reuses `score_clause_candidates` against the per-sample
+    #    candidate pool expanded to (B*T, C, D), and applies masked soft-label BCE with pos_weight.
+    # 3. Caveats: cost scales with B*T*C*D^2 (candidate projections recomputed per probe); labels are
+    #    pseudo-labels with low recall for paraphrased answers. The sample-level `compute_selection_loss`
+    #    (goal probe) is kept as an auxiliary loss.
+    def compute_clause_selection_loss(
+        self,
+        z_probe: torch.Tensor,
+        z_candidates: torch.Tensor,
+        rel_labels: torch.Tensor,
+        cand_valid_mask: Optional[torch.Tensor] = None,
+        row_valid: Optional[torch.Tensor] = None,
+        max_pos_weight: float = 5.0,
+    ) -> torch.Tensor:
+        """
+        Per-clause soft-label selection loss.
+          z_probe: (B, T, D) per-clause probes; z_candidates: (B, C, D);
+          rel_labels: (B, T, C) soft relevance in [0, 1]; cand_valid_mask: (B, C); row_valid: (B, T).
+        Returns a scalar masked BCE (zero with intact graph if no valid (row, cand) pair).
+        """
+        B, T, D = z_probe.shape
+        C = z_candidates.shape[1]
+        device = z_probe.device
+        if cand_valid_mask is None:
+            cand_valid_mask = torch.ones((B, C), device=device, dtype=torch.bool)
+        if row_valid is None:
+            row_valid = torch.ones((B, T), device=device, dtype=torch.bool)
+        if C == 0 or T == 0:
+            return z_probe.sum() * 0.0
+
+        q_flat = z_probe.reshape(B * T, D)
+        c_flat = z_candidates.unsqueeze(1).expand(B, T, C, z_candidates.shape[-1]).reshape(B * T, C, -1)
+        cv_flat = cand_valid_mask.bool().unsqueeze(1).expand(B, T, C).reshape(B * T, C)
+        scores, _ = self.score_clause_candidates(z_query=q_flat, z_candidates=c_flat, cand_valid_mask=cv_flat)
+
+        pair_valid = (row_valid.bool().reshape(B * T, 1) & cv_flat)  # (B*T, C)
+        vf = pair_valid.float()
+        targets = rel_labels.reshape(B * T, C).float().clamp(0.0, 1.0) * vf
+        s_f = scores.float()
+        s_clean = torch.where(pair_valid, s_f, torch.zeros_like(s_f))
+        n_pos = (targets * vf).sum()
+        n_neg = ((1.0 - targets) * vf).sum()
+        pos_weight = (n_neg / n_pos.clamp(min=1e-3)).clamp(min=1.0, max=float(max_pos_weight)).detach()
+        bce = F.binary_cross_entropy_with_logits(s_clean, targets, pos_weight=pos_weight, reduction="none")
+        return (bce * vf).sum() / vf.sum().clamp(min=1.0)
+
     @torch.no_grad()
     def select_active_clause_attractors(
         self,
@@ -1210,3 +2174,74 @@ class KnowledgeSelector(nn.Module):
         A_active = selected_tokens.reshape(B, k_keep * L_c, D)
         A_mask = selected_mask.reshape(B, k_keep * L_c)
         return A_active, A_mask, scores, gates
+
+
+# [Feature Addition - Task #033: mixed "with / without attractors" left-brain decoding]
+# 1. Problem: with the sink-aware selector some samples of a batch get attractors and others must run
+#    with `k_attractors=None` (#031: irrelevant attractors hurt). Passing an all-False `k_mask` row to
+#    `OrthogonalAttractor` is NOT safe in general: every key is masked to -1e4 and multiplied by the
+#    logit scale (up to 35) -> -3.5e5 overflows to -inf under fp16 autocast -> softmax over all -inf = NaN
+#    (NaN * snap-gate 0 is still NaN). In fp32 / bf16 it happens to yield force == 0, but that depends on
+#    the gate saturating, so we never rely on it.
+# 2. Method: split the batch. Rows with (use_attr & k_mask.any()) run with their attractors, all other
+#    rows run with `k_attractors=None`; BOTH groups start from the SAME per-row initial noise `x0`
+#    (generated once for the full batch, or caller-supplied), and outputs are scattered back.
+#    The LeftBrainCrystallizer is row-independent (convs / per-sample attention), so a split run equals
+#    running each group on its own.
+# 3. Caveats: two forward passes per ODE step when the batch is mixed (cost ~ unchanged overall because
+#    each pass only sees its own rows). Returns DENORMALIZED x (`unet.denormalize`), like
+#    `crystallize_clause_euler_ode` in the #029 trainer. Duck-typed: works with any module exposing
+#    `forward(x, t, h_potential, k_attractors, k_mask)`, `denormalize`, and `hidden_dim`.
+@torch.no_grad()
+def crystallize_with_optional_attractors(
+    unet: nn.Module,
+    z: torch.Tensor,
+    x_attr_norm: Optional[torch.Tensor] = None,
+    k_mask: Optional[torch.Tensor] = None,
+    use_attr: Optional[torch.Tensor] = None,
+    steps: int = 10,
+    seq_len: int = 32,
+    x0: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Euler-integrates the frozen left brain for clause vectors `z: (B, D)`.
+      x_attr_norm: (B, La, D) normalized attractor embeddings or None; k_mask: (B, La) bool or None;
+      use_attr: (B,) bool (default: all rows that have >= 1 valid attractor token);
+      x0: (B, seq_len, D) initial noise (default randn, optionally from `generator`).
+    Returns x_gen (B, seq_len, D) in the encoder (denormalized) space.
+    """
+    B, D = z.shape
+    device = z.device
+    dtype = z.dtype
+    if x0 is None:
+        x0 = torch.randn((B, seq_len, D), device=device, dtype=torch.float32, generator=generator)
+    x0 = x0.to(device=device, dtype=dtype)
+
+    if x_attr_norm is None:
+        rows_attr = torch.zeros((B,), device=device, dtype=torch.bool)
+    else:
+        has_tok = k_mask.bool().any(dim=-1) if k_mask is not None else torch.ones((B,), device=device, dtype=torch.bool)
+        rows_attr = has_tok if use_attr is None else (use_attr.bool() & has_tok)
+
+    def _integrate(idx: torch.Tensor, with_attr: bool) -> torch.Tensor:
+        x = x0[idx].clone()
+        zc = z[idx]
+        ka = x_attr_norm[idx].to(dtype=dtype) if with_attr else None
+        km = (k_mask[idx].bool() if k_mask is not None else None) if with_attr else None
+        n = int(idx.numel())
+        dt = 1.0 / float(max(int(steps), 1))
+        for i in range(max(int(steps), 1)):
+            t_tensor = torch.full((n,), i * dt, device=device, dtype=torch.float32)
+            v = unet(x, t_tensor, h_potential=zc, k_attractors=ka, k_mask=km)
+            x = x + v * dt
+        return x
+
+    out = torch.empty_like(x0)
+    idx_attr = torch.nonzero(rows_attr, as_tuple=False).squeeze(-1)
+    idx_none = torch.nonzero(~rows_attr, as_tuple=False).squeeze(-1)
+    if idx_attr.numel() > 0:
+        out[idx_attr] = _integrate(idx_attr, True).to(dtype=out.dtype)
+    if idx_none.numel() > 0:
+        out[idx_none] = _integrate(idx_none, False).to(dtype=out.dtype)
+    return unet.denormalize(out)

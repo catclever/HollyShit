@@ -4,6 +4,7 @@ import glob
 import json
 import math
 import random
+import unicodedata
 from typing import List, Union, Optional, Tuple, Dict, Any
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -129,6 +130,26 @@ def _extract_clauses_from_text(
     if isinstance(text, str):
         return _split_into_short_clauses(text, min_chars=min_chars, max_chars=max_chars)
     return []
+
+
+def _normalize_for_bigram_overlap(text: str) -> str:
+    """
+    Strips all whitespace and Unicode punctuation (CJK full-width + ASCII, i.e. any char whose
+    Unicode general category starts with 'P') from `text`. Symbols (category 'S', e.g. `×`, `+`, `=`)
+    and alphanumerics/CJK ideographs are preserved. Used by the #029 per-clause relevance labels.
+    """
+    if not text:
+        return ""
+    return "".join(
+        ch for ch in text
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+    )
+
+
+def _char_bigrams(text: str) -> set:
+    """Set of character bigrams of the punctuation/whitespace-stripped `text` (empty if < 2 chars)."""
+    norm = _normalize_for_bigram_overlap(text)
+    return {norm[i : i + 2] for i in range(len(norm) - 1)}
 
 
 def is_non_cheating_knowledge(k: str, target: str) -> bool:
@@ -1147,6 +1168,8 @@ class BicameralClauseChainDataset(Dataset):
         max_samples: Optional[int] = None,
         seed: int = 42,
         verbose: bool = True,
+        rel_overlap_threshold: float = 0.15,
+        label_stats_sample: int = 2000,
     ):
         super().__init__()
         self.data_path = data_path
@@ -1160,6 +1183,11 @@ class BicameralClauseChainDataset(Dataset):
         self.max_samples = max_samples
         self.seed = int(seed)
         self.verbose = verbose
+        # #029: minimum bigram-overlap ratio for a (answer clause, K+ candidate) pair to receive a
+        # non-zero `cand_clause_rel` pseudo-label (sub-threshold overlaps are zeroed as noise).
+        self.rel_overlap_threshold = float(rel_overlap_threshold)
+        # #029: number of leading records used for the one-off verbose label statistics (0 disables).
+        self.label_stats_sample = int(label_stats_sample)
 
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", 0)
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -1188,6 +1216,8 @@ class BicameralClauseChainDataset(Dataset):
                 f"(global distractor pool: {len(self.global_distractor_pool)} clauses, "
                 f"G={self.max_goal_clauses}, C={self.max_cand_clauses}, T={self.max_discourse_clauses}, L={self.seq_len})."
             )
+            if self.label_stats_sample > 0 and self.records:
+                self._print_label_stats(self.label_stats_sample)
 
     def _collect_file_paths(self, data_path: Union[str, List[str]]) -> List[str]:
         if isinstance(data_path, str):
@@ -1387,41 +1417,16 @@ class BicameralClauseChainDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def _build_cand_entries(self, idx: int) -> List[Tuple[str, float, bool]]:
+        """
+        Builds the FINAL (shuffled + padded) candidate entry list `[(clause_str, pos_label, is_valid)] * C`
+        for record `idx`. Extracted verbatim from `__getitem__` (#029) so that label statistics can be
+        computed string-only without tokenization; RNG consumption order (`random.Random(seed + idx)`:
+        distractor sampling, then shuffle) is unchanged, so `w_cand` ordering is bit-identical to pre-#029.
+        """
         rec = self.records[idx]
         q_clauses: List[str] = rec["q_clauses"]
         a_clauses: List[str] = rec["a_clauses"]
-        pad_row = [self.pad_token_id] * self.seq_len
-
-        # 1. Goal Stream (`w_goal`, `goal_valid_mask`): up to `max_goal_clauses` from `q_clauses[-max_goal_clauses:]`
-        goal_selected = q_clauses[-self.max_goal_clauses :]
-        w_goal_list: List[List[int]] = []
-        goal_valid_list: List[bool] = []
-        for g_idx in range(self.max_goal_clauses):
-            if g_idx < len(goal_selected):
-                w_goal_list.append(self._encode_clause_tokens(goal_selected[g_idx]))
-                goal_valid_list.append(True)
-            else:
-                w_goal_list.append(list(pad_row))
-                goal_valid_list.append(False)
-
-        # 2. Discourse Stream (`w_discourse`, `discourse_valid_mask`):
-        #    Clause 0 is `q_clauses[-1]` (lead departure clause), Clauses 1..M are `a_clauses[:M]`
-        max_ans_clauses = self.max_discourse_clauses - 1
-        ans_selected = a_clauses[:max_ans_clauses]
-        discourse_clauses = [q_clauses[-1]] + ans_selected
-
-        w_discourse_list: List[List[int]] = []
-        discourse_valid_list: List[bool] = []
-        for t_idx in range(self.max_discourse_clauses):
-            if t_idx < len(discourse_clauses):
-                w_discourse_list.append(self._encode_clause_tokens(discourse_clauses[t_idx]))
-                discourse_valid_list.append(True)
-            else:
-                w_discourse_list.append(list(pad_row))
-                discourse_valid_list.append(False)
-
-        # 3. Candidate Knowledge Pool (`w_cand`, `cand_pos_mask`, `cand_valid_mask`)
         max_pos_slots = max(1, self.max_cand_clauses // 2)
         pos_pool: List[str] = []
         seen_pos = set()
@@ -1481,6 +1486,140 @@ class BicameralClauseChainDataset(Dataset):
 
         while len(cand_entries) < self.max_cand_clauses:
             cand_entries.append(("", 0.0, False))
+        return cand_entries
+
+    # ------------------------------------------------------------------------------------------
+    # #029 Right-Brain v2 (Adaptive Prior) clause-level supervision labels
+    # ------------------------------------------------------------------------------------------
+    # Purpose:
+    #   (a) `discourse_stop_mask (T,)`: target for the right-brain `stop_head` ("is the clause generated
+    #       at step t the LAST clause of the answer?"), aligned to `w_discourse` rows.
+    #   (b) `cand_clause_rel (T, C)` + `cand_clause_rel_valid (T,)`: per-clause pseudo-labels for the
+    #       KnowledgeSelector moved AFTER the right brain (design §2.5) — for each answer clause row t,
+    #       which K+ candidates in the FINAL shuffled `w_cand` order actually support that clause.
+    # Method:
+    #   - Stop: 1.0 at row `len(discourse_clauses) - 1` iff the answer fits inside the window
+    #     (`len(a_clauses) <= T - 1`); otherwise all zeros. Row 0 (lead question clause) is never 1.
+    #   - Rel: for valid answer rows t >= 1 and valid POSITIVE candidates c (pos_label == 1.0):
+    #       overlap = |bigrams(a_t) ∩ bigrams(cand_c)| / max(1, |bigrams(a_t)|)
+    #     on text with all whitespace + Unicode punctuation (CJK/ASCII) removed; the soft label is
+    #     `overlap` if `overlap >= rel_overlap_threshold` else 0.0. Negatives / padding / row 0 /
+    #     padded rows are all 0. `cand_clause_rel_valid[t]` = valid answer row AND max_c rel > 0, so
+    #     the selector loss should only be applied on rows that have at least one supporting K+.
+    # Caveats:
+    #   - Character-bigram overlap is a lexical pseudo-label: it UNDER-RECALLS paraphrased / abstractive
+    #     answers (synonyms, reordered numerals, translated terms score ~0) and can over-credit generic
+    #     bigrams shared with question-echo K+ (when no explicit knowledge exists K+ = question clauses).
+    #   - Truncated answers (> T-1 clauses) carry NO stop label at all (no true ending inside the window),
+    #     so stop-head positives are biased toward short answers; use BCE pos_weight balancing.
+    #   - Labels MUST be computed after `_build_cand_entries` (post-shuffle); never reorder `w_cand`
+    #     downstream without permuting `cand_clause_rel` columns identically.
+    def _compute_clause_labels(
+        self,
+        discourse_clauses: List[str],
+        num_answer_clauses: int,
+        cand_entries: List[Tuple[str, float, bool]],
+    ) -> Tuple[List[float], List[List[float]], List[bool]]:
+        T = self.max_discourse_clauses
+        C = self.max_cand_clauses
+
+        stop_list: List[float] = [0.0] * T
+        n_valid_rows = min(len(discourse_clauses), T)
+        answer_truncated = num_answer_clauses > (T - 1)
+        if num_answer_clauses > 0 and not answer_truncated and n_valid_rows >= 2:
+            stop_list[n_valid_rows - 1] = 1.0
+
+        rel_rows: List[List[float]] = [[0.0] * C for _ in range(T)]
+        rel_valid: List[bool] = [False] * T
+
+        pos_cand_bigrams: List[Tuple[int, set]] = []
+        for c_idx, (c_str, pos_label, is_valid) in enumerate(cand_entries[:C]):
+            if is_valid and c_str and float(pos_label) >= 1.0:
+                pos_cand_bigrams.append((c_idx, _char_bigrams(c_str)))
+
+        if pos_cand_bigrams:
+            for t_idx in range(1, n_valid_rows):
+                a_bigrams = _char_bigrams(discourse_clauses[t_idx])
+                denom = max(1, len(a_bigrams))
+                row_max = 0.0
+                for c_idx, c_bigrams in pos_cand_bigrams:
+                    overlap = len(a_bigrams & c_bigrams) / denom
+                    rel = overlap if overlap >= self.rel_overlap_threshold else 0.0
+                    rel_rows[t_idx][c_idx] = rel
+                    row_max = max(row_max, rel)
+                rel_valid[t_idx] = row_max > 0.0
+
+        return stop_list, rel_rows, rel_valid
+
+    def _discourse_clauses_for(self, rec: Dict[str, Any]) -> List[str]:
+        """Clause 0 = `q_clauses[-1]` (lead), clauses 1..M = `a_clauses[:T-1]` (same as `w_discourse`)."""
+        return [rec["q_clauses"][-1]] + rec["a_clauses"][: self.max_discourse_clauses - 1]
+
+    def _print_label_stats(self, max_records: int = 2000):
+        """One-off, string-only (no tokenization) statistics of the #029 labels on the first records."""
+        n = min(len(self.records), max(0, int(max_records)))
+        if n == 0:
+            return
+        n_stop = 0
+        n_answer_rows = 0
+        n_rel_valid_rows = 0
+        n_samples_any_rel = 0
+        for idx in range(n):
+            rec = self.records[idx]
+            disc = self._discourse_clauses_for(rec)
+            stop_list, _, rel_valid = self._compute_clause_labels(
+                disc, len(rec["a_clauses"]), self._build_cand_entries(idx)
+            )
+            n_stop += int(any(v > 0 for v in stop_list))
+            n_answer_rows += max(0, min(len(disc), self.max_discourse_clauses) - 1)
+            n_rel = sum(1 for v in rel_valid if v)
+            n_rel_valid_rows += n_rel
+            n_samples_any_rel += int(n_rel > 0)
+        print(
+            f"📊 #029 clause labels on first {n} records: "
+            f"stop-labelled samples={n_stop / n:.3f}, "
+            f"answer rows with cand_clause_rel_valid={n_rel_valid_rows / max(1, n_answer_rows):.3f} "
+            f"({n_rel_valid_rows}/{n_answer_rows}), "
+            f"samples with >=1 rel row={n_samples_any_rel / n:.3f} "
+            f"(rel_overlap_threshold={self.rel_overlap_threshold})."
+        )
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        rec = self.records[idx]
+        q_clauses: List[str] = rec["q_clauses"]
+        a_clauses: List[str] = rec["a_clauses"]
+        pad_row = [self.pad_token_id] * self.seq_len
+
+        # 1. Goal Stream (`w_goal`, `goal_valid_mask`): up to `max_goal_clauses` from `q_clauses[-max_goal_clauses:]`
+        goal_selected = q_clauses[-self.max_goal_clauses :]
+        w_goal_list: List[List[int]] = []
+        goal_valid_list: List[bool] = []
+        for g_idx in range(self.max_goal_clauses):
+            if g_idx < len(goal_selected):
+                w_goal_list.append(self._encode_clause_tokens(goal_selected[g_idx]))
+                goal_valid_list.append(True)
+            else:
+                w_goal_list.append(list(pad_row))
+                goal_valid_list.append(False)
+
+        # 2. Discourse Stream (`w_discourse`, `discourse_valid_mask`):
+        #    Clause 0 is `q_clauses[-1]` (lead departure clause), Clauses 1..M are `a_clauses[:M]`
+        max_ans_clauses = self.max_discourse_clauses - 1
+        ans_selected = a_clauses[:max_ans_clauses]
+        discourse_clauses = [q_clauses[-1]] + ans_selected
+
+        w_discourse_list: List[List[int]] = []
+        discourse_valid_list: List[bool] = []
+        for t_idx in range(self.max_discourse_clauses):
+            if t_idx < len(discourse_clauses):
+                w_discourse_list.append(self._encode_clause_tokens(discourse_clauses[t_idx]))
+                discourse_valid_list.append(True)
+            else:
+                w_discourse_list.append(list(pad_row))
+                discourse_valid_list.append(False)
+
+        # 3. Candidate Knowledge Pool (`w_cand`, `cand_pos_mask`, `cand_valid_mask`)
+        cand_entries = self._build_cand_entries(idx)
 
         w_cand_list: List[List[int]] = []
         cand_pos_list: List[float] = []
@@ -1495,6 +1634,13 @@ class BicameralClauseChainDataset(Dataset):
                 cand_pos_list.append(0.0)
                 cand_valid_list.append(False)
 
+        # 4. #029 clause-level labels (stop head + per-clause KnowledgeSelector pseudo-labels);
+        #    computed on the FINAL shuffled `cand_entries` so columns align with `w_cand` rows.
+        #    See the block comment above `_compute_clause_labels` for method and caveats.
+        stop_list, rel_rows, rel_valid = self._compute_clause_labels(
+            discourse_clauses, len(a_clauses), cand_entries
+        )
+
         return {
             "w_goal": torch.tensor(w_goal_list, dtype=torch.long),
             "goal_valid_mask": torch.tensor(goal_valid_list, dtype=torch.bool),
@@ -1503,6 +1649,9 @@ class BicameralClauseChainDataset(Dataset):
             "cand_valid_mask": torch.tensor(cand_valid_list, dtype=torch.bool),
             "w_discourse": torch.tensor(w_discourse_list, dtype=torch.long),
             "discourse_valid_mask": torch.tensor(discourse_valid_list, dtype=torch.bool),
+            "discourse_stop_mask": torch.tensor(stop_list, dtype=torch.float32),
+            "cand_clause_rel": torch.tensor(rel_rows, dtype=torch.float32),
+            "cand_clause_rel_valid": torch.tensor(rel_valid, dtype=torch.bool),
             "question_text": rec["question_text"],
             "answer_text": rec["answer_text"],
             "domain": rec["domain"],
@@ -1524,6 +1673,8 @@ def create_clause_chain_dataloader(
     max_samples: Optional[int] = None,
     seed: int = 42,
     verbose: bool = True,
+    rel_overlap_threshold: float = 0.15,
+    label_stats_sample: int = 2000,
 ) -> Tuple[BicameralClauseChainDataset, DataLoader]:
     """
     Convenience factory returning `(dataset, dataloader)` for `BicameralClauseChainDataset`.
@@ -1540,6 +1691,8 @@ def create_clause_chain_dataloader(
         max_samples=max_samples,
         seed=seed,
         verbose=verbose,
+        rel_overlap_threshold=rel_overlap_threshold,
+        label_stats_sample=label_stats_sample,
     )
     dataloader = DataLoader(
         dataset,
