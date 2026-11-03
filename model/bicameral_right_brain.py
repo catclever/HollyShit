@@ -342,6 +342,7 @@ class ThoughtFlowMatcher(nn.Module):
         train_ode_steps: int = 3,
         win_weight: float = 0.65,
         other_temp: float = 1.0,
+        prior_noise_scale: float = 0.2,
     ):
         super().__init__()
         if d_clause is not None:
@@ -355,6 +356,8 @@ class ThoughtFlowMatcher(nn.Module):
         self.train_ode_steps = int(train_ode_steps)
         self.win_weight = float(win_weight)
         self.other_temp = float(other_temp)
+        self.prior_noise_scale = float(prior_noise_scale)
+        self._upgraded_from_v1 = False
 
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.cond_proj = nn.Sequential(
@@ -369,7 +372,7 @@ class ThoughtFlowMatcher(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.final_proj = nn.Linear(hidden_dim, hidden_dim)
-        nn.init.normal_(self.final_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.final_proj.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.final_proj.bias)
 
         # In-Model Per-Dimension Manifold Auto-Calibration Buffers
@@ -377,7 +380,29 @@ class ThoughtFlowMatcher(nn.Module):
         self.register_buffer("z_mean", torch.zeros(hidden_dim, dtype=torch.float32))
         self.register_buffer("z_std", torch.ones(hidden_dim, dtype=torch.float32))
         self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("flow_version", torch.tensor(2, dtype=torch.long))
         self._register_load_state_dict_pre_hook(self._upgrade_scalar_calib_buffers)
+
+    def _reset_flow_mlp_parameters(self) -> None:
+        """Re-initializes the flow velocity MLP while preserving manifold calibration buffers."""
+        for m in (self.t_embedder, self.cond_proj, self.in_proj, self.final_norm):
+            for sub in m.modules():
+                if isinstance(sub, nn.Linear):
+                    nn.init.xavier_uniform_(sub.weight)
+                    if sub.bias is not None:
+                        nn.init.zeros_(sub.bias)
+                elif isinstance(sub, nn.LayerNorm) and sub.elementwise_affine:
+                    nn.init.ones_(sub.weight)
+                    nn.init.zeros_(sub.bias)
+        for block in self.blocks:
+            nn.init.zeros_(block.ada_mod.weight)
+            nn.init.zeros_(block.ada_mod.bias)
+            nn.init.xavier_uniform_(block.mlp[0].weight)
+            nn.init.zeros_(block.mlp[0].bias)
+            nn.init.normal_(block.mlp[-1].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(block.mlp[-1].bias)
+        nn.init.normal_(self.final_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.final_proj.bias)
 
     def _upgrade_scalar_calib_buffers(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -386,6 +411,23 @@ class ThoughtFlowMatcher(nn.Module):
             k = prefix + name
             if k in state_dict and state_dict[k].shape != (self.hidden_dim,):
                 state_dict[k] = state_dict[k].reshape(-1).expand(self.hidden_dim).clone()
+        v_key = prefix + "flow_version"
+        is_v1 = (v_key not in state_dict) or (int(state_dict[v_key].reshape(-1)[0].item()) < 2)
+        if is_v1:
+            self._upgraded_from_v1 = True
+            self._reset_flow_mlp_parameters()
+            state_dict[v_key] = self.flow_version.clone()
+            own_sd = self.state_dict()
+            mlp_prefixes = ("t_embedder.", "cond_proj.", "in_proj.", "blocks.", "final_norm.", "final_proj.")
+            for k, val in own_sd.items():
+                if k.startswith(mlp_prefixes):
+                    full_k = prefix + k
+                    if full_k in state_dict:
+                        state_dict[full_k] = val.clone().to(
+                            device=state_dict[full_k].device, dtype=state_dict[full_k].dtype
+                        )
+        else:
+            self._upgraded_from_v1 = False
 
     @torch.no_grad()
     def calibrate_z(
@@ -483,6 +525,28 @@ class ThoughtFlowMatcher(nn.Module):
             x = x + v.float() * dt
         return x
 
+    def _euler_integrate_with_trajectory(
+        self,
+        z0: torch.Tensor,
+        cond: torch.Tensor,
+        steps: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Euler-integrates the ODE from tau=0 to tau=1 in float32 state precision (keeps grad),
+        returning `(x1, x_traj, v_traj)` where `x_traj` and `v_traj` have shape `(steps, B, D)`.
+        """
+        x = z0.float()
+        n_steps = max(int(steps), 1)
+        dt = 1.0 / float(n_steps)
+        xs, vs = [], []
+        for i in range(n_steps):
+            tau = torch.full((x.shape[0],), i * dt, device=x.device, dtype=torch.float32)
+            v = self.forward(x, tau, cond).float()
+            xs.append(x)
+            vs.append(v)
+            x = x + v * dt
+        return x, torch.stack(xs, dim=0), torch.stack(vs, dim=0)
+
     def compute_branch_loss(
         self,
         z1_norm: torch.Tensor,
@@ -501,6 +565,7 @@ class ThoughtFlowMatcher(nn.Module):
         K = int(num_branches) if num_branches is not None else self.num_branches
         K = max(K, 1)
         S = int(train_ode_steps) if train_ode_steps is not None else self.train_ode_steps
+        n_steps = max(S, 1)
         N, D = z1_norm.shape
         nb, ds, L = self.num_bands, self.d_sub, self.sem_bands
         device = z1_norm.device
@@ -512,9 +577,14 @@ class ThoughtFlowMatcher(nn.Module):
 
         # ---- 1. K blind roll-outs from the adaptive prior cone (with grad, no target leakage)
         eps = torch.randn((K, N, D), device=device, dtype=torch.float32)
-        z0 = mu_d.unsqueeze(0) + sig_full.unsqueeze(0) * eps  # (K, N, D)
+        z0 = mu_d.unsqueeze(0) + (self.prior_noise_scale * sig_full).unsqueeze(0) * eps  # (K, N, D)
         cond_k = cond.unsqueeze(0).expand(K, N, D).reshape(K * N, D)
-        x1 = self._euler_integrate(z0.reshape(K * N, D), cond_k, S).reshape(K, N, D)
+        x1_flat, x_traj_flat, v_traj_flat = self._euler_integrate_with_trajectory(
+            z0.reshape(K * N, D), cond_k, n_steps
+        )
+        x1 = x1_flat.reshape(K, N, D)
+        x_traj = x_traj_flat.reshape(n_steps, K, N, D)
+        v_traj = v_traj_flat.reshape(n_steps, K, N, D)
 
         # ---- 2. Winner selection (no grad)
         with torch.no_grad():
@@ -522,42 +592,43 @@ class ThoughtFlowMatcher(nn.Module):
             k_star = err.argmin(dim=0)  # (N,)
         rows = torch.arange(N, device=device)
         x1_win = x1[k_star, rows]  # (N, D)
-        z0_win = z0[k_star, rows]  # (N, D), detached (built from detached mu/sigma)
+        x_traj_win = x_traj[:, k_star, rows, :]  # (n_steps, N, D)
+        v_traj_win = v_traj[:, k_star, rows, :]  # (n_steps, N, D)
 
-        # ---- 3. Winner loss: CFM velocity MSE on the winner's own z0 + endpoint MSE + 0.25 (1 - cos)
-        tau = torch.rand((N,), device=device, dtype=torch.float32).clamp(min=1e-4, max=1.0 - 1e-4)
-        tau_col = tau.unsqueeze(-1)
-        z_tau = (1.0 - tau_col) * z0_win + tau_col * z1f
-        v_target = z1f - z0_win
-        v_pred = self.forward(z_tau, tau, cond)
-        vel_loss = F.mse_loss(v_pred.float(), v_target)
+        # ---- 3. Winner loss: Leak-free on-policy residual velocity MSE + endpoint MSE + full & per-band cosine
+        step_idx = torch.arange(n_steps, device=device, dtype=torch.float32).view(n_steps, 1, 1)
+        rem_time = 1.0 - step_idx / float(n_steps)  # (n_steps, 1, 1) in (0, 1]
+        vel_loss = F.mse_loss(rem_time * v_traj_win, z1f.unsqueeze(0) - x_traj_win.detach())
         end_mse = F.mse_loss(x1_win, z1f)
         win_cos = F.cosine_similarity(x1_win, z1f, dim=-1, eps=1e-6)  # (N,)
         cos_loss = 1.0 - win_cos.mean()
-        win_loss = vel_loss + end_mse + 0.25 * cos_loss
-
-        # ---- 4. Loser ("other") loss: stay a legal clause vector
-        x1_b = to_bands(x1, nb)  # (K, N, nb, ds)
+        x1_win_b = to_bands(x1_win, nb)  # (N, nb, ds)
         z1_b = to_bands(z1f, nb)  # (N, nb, ds)
-        low_sq = (x1_b[:, :, :L] - z1_b.unsqueeze(0)[:, :, :L]).pow(2).sum(dim=-1)  # (K, N, L)
-        maha = (low_sq / (ds * sig_d[:, :L].pow(2)).unsqueeze(0)).mean(dim=-1)  # (K, N)
-        low_cos = F.cosine_similarity(
-            x1[..., : L * ds], z1f[..., : L * ds].unsqueeze(0), dim=-1, eps=1e-6
-        )  # (K, N)
-        x_hi_norm = (x1_b[:, :, L:].pow(2).sum(dim=-1) + 1e-8).sqrt()  # (K, N, nb - L)
-        z_hi_norm = (z1_b[:, L:].pow(2).sum(dim=-1) + 1e-8).sqrt()  # (N, nb - L)
-        energy = (x_hi_norm - z_hi_norm.unsqueeze(0)).pow(2).mean(dim=-1)  # (K, N)
-        other_per = maha + (1.0 - low_cos) + energy  # (K, N)
+        band_cos = F.cosine_similarity(x1_win_b, z1_b, dim=-1, eps=1e-6)  # (N, nb)
+        band_cos_loss = 1.0 - band_cos.mean()
+        win_loss = vel_loss + end_mse + 0.5 * cos_loss + 0.5 * band_cos_loss
+
+        # ---- 4. Non-winner branch regularization: prior-cone anchor + pairwise angular repulsion
+        x1_b = to_bands(x1, nb)  # (K, N, nb, ds)
+        mu_b = to_bands(mu_d, nb)  # (N, nb, ds)
+        prior_dev = (
+            (x1_b - mu_b.unsqueeze(0)).pow(2).sum(dim=-1)
+            / (ds * sig_d.pow(2).clamp(min=1e-4)).unsqueeze(0)
+        ).mean(dim=-1)  # (K, N)
 
         win_onehot = F.one_hot(k_star, num_classes=K).transpose(0, 1).bool()  # (K, N)
         if K > 1:
+            disp = F.normalize((x1 - mu_d.unsqueeze(0)).transpose(0, 1), dim=-1, eps=1e-6)  # (N, K, D)
+            sim = torch.bmm(disp, disp.transpose(1, 2))  # (N, K, K)
+            eye = torch.eye(K, device=device, dtype=torch.bool).unsqueeze(0)
+            repulse = F.relu(sim.masked_select(~eye) - 0.25).mean()
             with torch.no_grad():
-                logits = -(maha.detach() + energy.detach()) / max(self.other_temp, 1e-6)
+                logits = -prior_dev.detach() / max(self.other_temp, 1e-6)
                 logits = logits.masked_fill(win_onehot, float("-inf"))
                 w_other = torch.softmax(logits, dim=0)  # (K, N), winner weight == 0
-            other_loss = (w_other * other_per).sum(dim=0).mean()
+            other_loss = 0.1 * (w_other * prior_dev).sum(dim=0).mean() + repulse
         else:
-            other_loss = other_per.sum() * 0.0
+            other_loss = prior_dev.sum() * 0.0
 
         ww = self.win_weight
         loss = ww * win_loss + (1.0 - ww) * other_loss
@@ -674,9 +745,12 @@ class ThoughtFlowMatcher(nn.Module):
             if sigma_band is None else sigma_band.reshape(-1, self.num_bands).float()
         )
         eps = torch.randn((B, D), device=cond.device, dtype=torch.float32)
-        z0 = mu_2d + float(temperature) * self.expand_sigma(sig_2d) * eps
+        eff_temp = float(temperature) * self.prior_noise_scale
+        z0 = mu_2d + eff_temp * self.expand_sigma(sig_2d) * eps
         z = self._euler_integrate(z0, cond_2d, steps)
 
+        if renorm:
+            z = z / z.std(dim=-1, keepdim=True).clamp(min=1e-5)
         z_out = self.denormalize(z)
         if renorm:
             z_out = z_out / z_out.std(dim=-1, keepdim=True).clamp(min=1e-5)
@@ -1296,8 +1370,11 @@ class MultiStreamRightBrain(nn.Module):
         sig_v = sigma.reshape(-1, nb)[sel]
         z1n = fm.normalize(z1_v.float())
 
-        # Prior NLL (float32) — the ONLY loss that trains `prior_head`.
-        prior_nll = band_gaussian_nll(z1n, mu_v, sig_v, nb).mean()
+        # Prior NLL (float32) + full-spectrum directional alignment across all 32 bands — trains `prior_head`.
+        nll_raw = band_gaussian_nll(z1n, mu_v, sig_v, nb).mean()
+        mu_cos = F.cosine_similarity(mu_v, z1n, dim=-1, eps=1e-6).mean()
+        mu_band_cos = F.cosine_similarity(to_bands(mu_v, nb), to_bands(z1n, nb), dim=-1, eps=1e-6).mean()
+        prior_nll = nll_raw + 0.5 * ((1.0 - mu_cos) + (1.0 - mu_band_cos))
         # K-branch soft-competition flow loss (mu / sigma detached inside).
         flow_loss, fstats = fm.compute_branch_loss(z1n, h_v, mu_v, sig_v)
         if profile_cb is not None:

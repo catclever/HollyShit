@@ -223,6 +223,47 @@ def resume_training(
     try:
         loaded = checkpointer.load(path)
         global_step = loaded if loaded > 0 else step
+        rb = models.get("right_brain")
+        fm = getattr(rb, "flow_matcher", None) if rb is not None else None
+        if fm is not None and getattr(fm, "_upgraded_from_v1", False):
+            import shutil
+            for opt in checkpointer._optimizers.values():
+                if hasattr(opt, "state") and isinstance(opt.state, dict):
+                    opt.state.clear()
+            base_lr = float(getattr(args, "lr", 2e-4))
+            for opt in checkpointer._optimizers.values():
+                if hasattr(opt, "param_groups"):
+                    for pg in opt.param_groups:
+                        pg["lr"] = base_lr
+                        pg["initial_lr"] = base_lr
+            if scheduler is not None:
+                scheduler.base_lrs = [base_lr for _ in scheduler.base_lrs]
+                scheduler.last_epoch = 0
+                if hasattr(scheduler, "lr_lambdas"):
+                    for pg, lmbda in zip(scheduler.optimizer.param_groups, scheduler.lr_lambdas):
+                        pg["lr"] = base_lr * float(lmbda(0))
+                    scheduler._last_lr = [pg["lr"] for pg in scheduler.optimizer.param_groups]
+            if args.out_dir and os.path.isdir(args.out_dir) and args.ckpt_prefix:
+                archive_dir = os.path.join(args.out_dir, f"{args.ckpt_prefix}_v1_archive_step_{global_step}")
+                try:
+                    if os.path.isdir(path) and not os.path.exists(archive_dir):
+                        shutil.move(path, archive_dir)
+                        print(f"📦 Archived v1 checkpoint '{os.path.basename(path)}' -> '{os.path.basename(archive_dir)}'")
+                    for d in os.listdir(args.out_dir):
+                        dp = os.path.join(args.out_dir, d)
+                        if os.path.isdir(dp) and d.startswith(f"{args.ckpt_prefix}_step_"):
+                            shutil.rmtree(dp, ignore_errors=True)
+                except Exception as arch_err:
+                    print(f"⚠️ Could not archive old v1 checkpoints: {arch_err}")
+            fm._upgraded_from_v1 = False
+            checkpointer.set_step(0)
+            checkpointer.save(0)
+            print(
+                f"🔄 Upgraded v1 checkpoint from step {global_step} ({path}) to Flow-v2: "
+                f"preserved Mamba/PriorHead/StopHead + z_mean/z_std, re-initialized ThoughtFlowMatcher, "
+                f"and reset step counter -> 0 with fresh LR schedule."
+            )
+            return 0
         checkpointer.set_step(global_step)
         if not os.path.exists(os.path.join(path, "lr_sched.pt")) and global_step > 0:
             scheduler.step(global_step)
@@ -626,7 +667,8 @@ def evaluate_stage1(
                 s_sem, s_syn = _sigma_sem_syn(sig[0], nb_sem)
                 z1n = fm.normalize(z[:, k].float())
                 nll = float(band_gaussian_nll(z1n, mu.float(), sig.float(), right_brain.num_bands).item())
-                cos_mu = F.cosine_similarity(fm.denormalize(mu.float()), z[:, k].float(), dim=-1).item()
+                mu_unit = mu.float() / mu.float().std(dim=-1, keepdim=True).clamp(min=1e-5)
+                cos_mu = F.cosine_similarity(fm.denormalize(mu_unit), z[:, k].float(), dim=-1).item()
                 wht_cos_mu = F.cosine_similarity(mu.float(), z1n, dim=-1).item()
                 rows.append(
                     f"k={k}: σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} nll={nll:.3f} "
@@ -723,7 +765,7 @@ def build_parser():
     parser.add_argument("--eval_at_start", action="store_true", help="Run one eval before training")
     parser.add_argument("--log_interval", type=int, default=20, help="Log every N steps")
     parser.add_argument("--num_rollout_clauses", type=int, default=8, help="Max clauses per eval rollout")
-    parser.add_argument("--right_ode_steps", type=int, default=10, help="Right-brain ODE steps at eval")
+    parser.add_argument("--right_ode_steps", type=int, default=3, help="Right-brain ODE steps at eval")
     parser.add_argument("--left_ode_steps", "--euler_steps", dest="left_ode_steps", type=int, default=10,
                         help="Left-brain ODE steps at eval")
     parser.add_argument("--temperature", type=float, default=0.75, help="Prior temperature at eval")
