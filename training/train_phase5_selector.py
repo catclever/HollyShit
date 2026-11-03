@@ -334,8 +334,10 @@ def train():
             with torch.no_grad():
                 z_main = encode_clause_bank_to_2d(encoder, unet, hippo, w_main, main_valid, pad_id).float()
                 prof.mark("encode")
-                row_std = z_main.std(dim=-1, keepdim=True)
-                z_probe = z_main + float(args.probe_noise_std) * row_std * torch.randn_like(z_main)
+                if int(selector.calib_steps.item()) == 0 and bool(main_valid.any()):
+                    selector.calibrate_z(z_main[main_valid])
+                z_std_dim = selector.z_std.to(device=z_main.device, dtype=z_main.dtype).clamp(min=1e-3)
+                z_probe = z_main + float(args.probe_noise_std) * z_std_dim * torch.randn_like(z_main)
                 n_rb = 0
                 if right_brain is not None and args.p_rb_probe > 0 and z_main.shape[1] >= 2:
                     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):

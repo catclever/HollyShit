@@ -537,11 +537,18 @@ def evaluate_stage1(
             s_sem, s_syn = _sigma_sem_syn(sig[0], nb_sem)
             gt_r = first_t + c - 1
             cos_gt = (F.cosine_similarity(z_th, z[:, gt_r], dim=-1).item() if gt_r < n_valid else float("nan"))
+            wht_cos = (
+                F.cosine_similarity(fm.normalize(z_th.float()), fm.normalize(z[:, gt_r].float()), dim=-1).item()
+                if gt_r < n_valid else float("nan")
+            )
             attr_s = ""
             if info is not None:
                 attr_s = (f" attr={'Y' if bool(info['use_attr'][0]) else 'N'}"
                           f"(sink={float(info['sink_prob'][0]):.2f})")
-            lines.append(f"      c{c}: stop={stop_p:.3f} σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} cos(GT)={cos_gt:.3f}{attr_s} | {texts[0]}")
+            lines.append(
+                f"      c{c}: stop={stop_p:.3f} σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} "
+                f"cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f}{attr_s} | {texts[0]}"
+            )
             gen_strs.append(texts[0])
             if args.closed_loop_reencode:
                 z_next = hippo(unet.normalize(x_gen), return_sequence=False, valid_mask=gvalid,
@@ -589,7 +596,11 @@ def evaluate_stage1(
                 x_gen, _ = crystallize(z_s, pool_z, pool_w)
                 texts, _, _ = decode_x(x_gen, translator, tokenizer)
                 cos_gt = F.cosine_similarity(z_s, z[:, first_t], dim=-1).item() if first_t < n_valid else float("nan")
-                print(f"   #{i + 1} cos(GT)={cos_gt:.3f} | {texts[0]}")
+                wht_cos = (
+                    F.cosine_similarity(fm.normalize(z_s.float()), fm.normalize(z[:, first_t].float()), dim=-1).item()
+                    if first_t < n_valid else float("nan")
+                )
+                print(f"   #{i + 1} cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f} | {texts[0]}")
             if len(samples) >= 2:
                 zs = F.normalize(torch.stack(samples), dim=-1)
                 sim = zs @ zs.t()
@@ -616,7 +627,11 @@ def evaluate_stage1(
                 z1n = fm.normalize(z[:, k].float())
                 nll = float(band_gaussian_nll(z1n, mu.float(), sig.float(), right_brain.num_bands).item())
                 cos_mu = F.cosine_similarity(fm.denormalize(mu.float()), z[:, k].float(), dim=-1).item()
-                rows.append(f"k={k}: σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} nll={nll:.3f} cos(μ,GT)={cos_mu:.3f}")
+                wht_cos_mu = F.cosine_similarity(mu.float(), z1n, dim=-1).item()
+                rows.append(
+                    f"k={k}: σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} nll={nll:.3f} "
+                    f"cos(μ,GT)={cos_mu:.3f} wht_cos(μ,GT)={wht_cos_mu:.3f}"
+                )
             print(f"   [{tag}] " + " | ".join(rows))
     print("=" * 96 + "\n")
 
@@ -815,6 +830,8 @@ def train():
                 z_main = encode_clause_bank_to_2d(encoder, unet, hippo, w_main, main_valid, pad_id)  # (B, T, D)
                 prof.mark("encode")
                 target_valid = target_mask[:, 1:] & main_valid[:, 1:]  # (B, T-1)
+                if int(right_brain.flow_matcher.calib_steps.item()) == 0 and bool(main_valid.any()):
+                    right_brain.flow_matcher.calibrate_z(z_main[main_valid])
                 z_in = right_brain.jitter_high_bands(
                     z_main[:, :-1].clone(), p=args.p_band_jitter,
                     sem_bands=right_brain.sem_bands, num_bands=right_brain.num_bands,
@@ -887,9 +904,10 @@ def train():
                     f"{_fmt_opt(m.get('sigma_syn_qa'))} / {_fmt_opt(m.get('sigma_syn_cont'))} | samples qa/cont {n_qa}/{n_ct} "
                     f"| target rows qa/cont {m.get('n_rows_qa', 0)}/{m.get('n_rows_cont', 0)}"
                 )
+                z_std_t = right_brain.flow_matcher.z_std
                 print(
                     f"    BranchDiv {m['branch_diversity']:.4f} | Winners {m['winner_hist']} | p_self {p_self:.3f} "
-                    f"(fed {n_fed}) | z_std {right_brain.flow_matcher.z_std.item():.3f}"
+                    f"(fed {n_fed}) | z_std[min/mean/max] {z_std_t.min().item():.3f}/{z_std_t.mean().item():.3f}/{z_std_t.max().item():.3f}"
                 )
                 check_low_band_saturation(m.get("sigma_band", []), right_brain.sem_bands, args.sigma_max, tag="train")
                 if is_eval:

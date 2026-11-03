@@ -372,35 +372,48 @@ class ThoughtFlowMatcher(nn.Module):
         nn.init.normal_(self.final_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.final_proj.bias)
 
-        # In-Model Manifold Auto-Calibration Buffers (#027, unchanged)
-        self.register_buffer("z_mean", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("z_std", torch.tensor(1.0, dtype=torch.float32))
+        # In-Model Per-Dimension Manifold Auto-Calibration Buffers
+        # Whitens the ~600x variance anisotropy between PCA channel 0 (clause length) and channels 1..31 (lexical content)
+        self.register_buffer("z_mean", torch.zeros(hidden_dim, dtype=torch.float32))
+        self.register_buffer("z_std", torch.ones(hidden_dim, dtype=torch.float32))
         self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
+        self._register_load_state_dict_pre_hook(self._upgrade_scalar_calib_buffers)
+
+    def _upgrade_scalar_calib_buffers(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        for name in ("z_mean", "z_std"):
+            k = prefix + name
+            if k in state_dict and state_dict[k].shape != (self.hidden_dim,):
+                state_dict[k] = state_dict[k].reshape(-1).expand(self.hidden_dim).clone()
 
     @torch.no_grad()
     def calibrate_z(
         self,
         z_sample: torch.Tensor,
         max_calib_steps: int = 50,
-        momentum: float = 0.05,
+        momentum: float = 0.1,
     ) -> bool:
         """
-        Online EMA Auto-Calibration for 2D clause vectors `z_sample` over the first `max_calib_steps` steps.
+        Online EMA Per-Dimension Auto-Calibration for 2D clause vectors `z_sample` over the first
+        `max_calib_steps` steps. Standardizes each of the `D` dimensions independently to N(0, 1).
         """
         step = int(self.calib_steps.item())
         if step >= max_calib_steps:
             return False
 
-        z_float = z_sample.detach().float()
-        if z_float.numel() == 0:
+        z_float = z_sample.detach().float().reshape(-1, self.hidden_dim)
+        valid = z_float.abs().sum(dim=-1) > 1e-6
+        z_valid = z_float[valid]
+        if z_valid.numel() == 0:
             return False
 
-        batch_mean = z_float.mean()
-        batch_std = (
-            z_float.std().clamp(min=1e-5)
-            if z_float.numel() > 1
-            else torch.tensor(1.0, device=z_float.device, dtype=torch.float32)
-        )
+        batch_mean = z_valid.mean(dim=0)
+        if z_valid.shape[0] >= 2:
+            batch_std = z_valid.std(dim=0, unbiased=False).clamp(min=1e-3)
+        else:
+            s = z_valid.std().clamp(min=1e-3) if z_valid.numel() > 1 else torch.tensor(1.0, device=z_valid.device)
+            batch_std = s.expand(self.hidden_dim).clone()
 
         if step == 0:
             self.z_mean.copy_(batch_mean)
@@ -413,15 +426,15 @@ class ThoughtFlowMatcher(nn.Module):
         return True
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
-        """Normalizes clause vector `z` from `N(z_mean, z_std^2)` to unit manifold `N(0, 1)`."""
+        """Normalizes clause vector `z (..., D)` from `N(z_mean, diag(z_std^2))` to whitened `N(0, I_D)`."""
         mean = self.z_mean.to(device=z.device, dtype=z.dtype)
-        std = self.z_std.to(device=z.device, dtype=z.dtype).clamp(min=1e-5)
+        std = self.z_std.to(device=z.device, dtype=z.dtype).clamp(min=1e-3)
         return (z - mean) / std
 
     def denormalize(self, z: torch.Tensor) -> torch.Tensor:
-        """Denormalizes unit-manifold vector `z` back to `N(z_mean, z_std^2)` clause coordinate space."""
+        """Denormalizes whitened vector `z (..., D)` back to physical `z_clause` coordinate space."""
         mean = self.z_mean.to(device=z.device, dtype=z.dtype)
-        std = self.z_std.to(device=z.device, dtype=z.dtype).clamp(min=1e-5)
+        std = self.z_std.to(device=z.device, dtype=z.dtype).clamp(min=1e-3)
         return z * std + mean
 
     def forward(self, z_tau: torch.Tensor, tau: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
@@ -664,9 +677,10 @@ class ThoughtFlowMatcher(nn.Module):
         z0 = mu_2d + float(temperature) * self.expand_sigma(sig_2d) * eps
         z = self._euler_integrate(z0, cond_2d, steps)
 
+        z_out = self.denormalize(z)
         if renorm:
-            z = z / z.std(dim=-1, keepdim=True).clamp(min=1e-5)
-        z_out = self.denormalize(z).to(dtype=cond.dtype)
+            z_out = z_out / z_out.std(dim=-1, keepdim=True).clamp(min=1e-5)
+        z_out = z_out.to(dtype=cond.dtype)
         if len(orig_shape) == 3:
             z_out = z_out.reshape(orig_shape)
         return z_out
@@ -951,9 +965,15 @@ class MultiStreamRightBrain(nn.Module):
         dtype = auxs[0].dtype
         return torch.cat([a.to(dtype=dtype) for a in auxs], dim=1), torch.cat(valids, dim=1)
 
-    @staticmethod
+    def _normalize_clause_input(self, z: torch.Tensor) -> torch.Tensor:
+        """Whitens non-zero clause rows via `flow_matcher.normalize`, preserving all-zero padding rows at 0."""
+        nonzero = z.abs().sum(dim=-1, keepdim=True) > 1e-6
+        z_norm = self.flow_matcher.normalize(z.float()).to(dtype=z.dtype)
+        return torch.where(nonzero, z_norm, z)
+
     @torch.no_grad()
-    def jitter_high_bands(
+    def _jitter_high_bands_impl(
+        self: Optional["MultiStreamRightBrain"],
         z: torch.Tensor,
         p: float = 0.3,
         sem_bands: int = DEFAULT_SEM_BANDS,
@@ -962,8 +982,10 @@ class MultiStreamRightBrain(nn.Module):
         """
         Exposure-bias augmentation (§2.6): for each clause row independently with probability `p`,
         rotates every HIGH band (b >= sem_bands) by an independent random orthogonal matrix
-        (QR of a Gaussian, sign-fixed -> Haar). Norm-preserving per band; low bands and
-        all-zero (padded) rows are returned bit-identical. Works on any `(..., D)` tensor.
+        (QR of a Gaussian, sign-fixed -> Haar). When called on a calibrated `MultiStreamRightBrain`
+        instance, rotation is performed in the whitened `N(0, I_D)` space and denormalized back so
+        channel-0 variance does not leak into channels 1..31; low bands and all-zero (padded) rows
+        are returned bit-identical. Works on any `(..., D)` tensor.
         """
         if p <= 0.0 or z.numel() == 0 or sem_bands >= num_bands:
             return z
@@ -979,19 +1001,35 @@ class MultiStreamRightBrain(nn.Module):
         d_sub = D // num_bands
         n_hi = num_bands - int(sem_bands)
         n_sel = idx.numel()
-        rows_b = to_bands(flat[idx].float(), num_bands)  # (n_sel, nb, d_sub)
+        rows = flat[idx].float()
+        if self is not None:
+            rows = self.flow_matcher.normalize(rows)
+        rows_b = to_bands(rows, num_bands)  # (n_sel, nb, d_sub)
         hi = rows_b[:, sem_bands:, :]  # (n_sel, n_hi, d_sub)
-        G = torch.randn((n_sel, n_hi, d_sub, d_sub), device=z.device, dtype=torch.float32)
+        qr_dev = torch.device("cpu") if z.device.type == "mps" else z.device
+        G = torch.randn((n_sel, n_hi, d_sub, d_sub), device=qr_dev, dtype=torch.float32)
         Q, Rm = torch.linalg.qr(G)
         sgn = torch.sign(torch.diagonal(Rm, dim1=-2, dim2=-1))
         sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
-        Q = Q * sgn.unsqueeze(-2)
+        Q = (Q * sgn.unsqueeze(-2)).to(device=z.device)
         hi_rot = torch.einsum("nbij,nbj->nbi", Q, hi)
+        rows_rot = rows.clone()
+        rows_rot[:, sem_bands * d_sub:] = from_bands(hi_rot)
+        if self is not None:
+            rows_rot = self.flow_matcher.denormalize(rows_rot)
         new_rows = flat[idx].clone()
-        new_rows[:, sem_bands * d_sub:] = from_bands(hi_rot).to(dtype=z.dtype)
+        new_rows[:, sem_bands * d_sub:] = rows_rot[:, sem_bands * d_sub:].to(dtype=z.dtype)
         out = flat.clone()
         out[idx] = new_rows
         return out.reshape(orig_shape)
+
+    class _DualMethod:
+        def __init__(self, fn):
+            self.fn = fn
+        def __get__(self, instance, owner=None):
+            return lambda *args, **kwargs: self.fn(instance, *args, **kwargs)
+
+    jitter_high_bands = _DualMethod(_jitter_high_bands_impl)
 
     # ------------------------------------------------------------------ stream encoding
     def _use_aux(self, active_streams: Optional[Sequence[str]]) -> bool:
@@ -1058,7 +1096,7 @@ class MultiStreamRightBrain(nn.Module):
             )
         # Trim trailing all-padding positions (no stream needs them) before the sequential scan.
         S_eff = int(last_idx.max().item()) + 1
-        flat = aux.reshape(B * N, S, D)[:, :S_eff]
+        flat = self._normalize_clause_input(aux.reshape(B * N, S, D)[:, :S_eff])
         h_seq = self.aux_stream(flat)  # (B*N, S_eff, D)
         gidx = last_idx.clamp(min=0).view(B * N, 1, 1).expand(B * N, 1, h_seq.shape[-1])
         h_last = torch.gather(h_seq, dim=1, index=gidx).squeeze(1)  # (B*N, D)
@@ -1144,7 +1182,8 @@ class MultiStreamRightBrain(nn.Module):
         elif not self._use_aux(active_streams):
             h_aux, stream_valid = None, None
 
-        h0, new_main = self.main_stream(z_main_seq, states=main_states, return_state=True)
+        z_main_in = self._normalize_clause_input(z_main_seq)
+        h0, new_main = self.main_stream(z_main_in, states=main_states, return_state=True)
         out = self._fuse(h0, h_aux, stream_valid)
         out["h_aux"] = h_aux
         out["stream_valid"] = stream_valid
@@ -1213,9 +1252,6 @@ class MultiStreamRightBrain(nn.Module):
             knowledge_valid=knowledge_valid, goal_valid=goal_valid,
         )
         if z_target is not None:
-            ctx = self.forward_context(z_discourse_seq, aux, aux_valid, **ctx_kwargs)
-            ctx = {k: (v[:, -1:] if (torch.is_tensor(v) and k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum")) else v)
-                   for k, v in ctx.items()}
             z1 = z_target.reshape(z_target.shape[0], 1, -1)
             valid = target_valid_mask.reshape(-1, 1) if target_valid_mask is not None else None
         else:
@@ -1226,7 +1262,6 @@ class MultiStreamRightBrain(nn.Module):
             z_in = z_in_override if z_in_override is not None else z_discourse_seq[:, :-1, :]
             z1 = z_discourse_seq[:, 1:, :]
             valid = target_valid_mask
-            ctx = self.forward_context(z_in, aux, aux_valid, **ctx_kwargs)
 
         B, Tp, D = z1.shape
         nb = self.num_bands
@@ -1234,24 +1269,31 @@ class MultiStreamRightBrain(nn.Module):
             valid = torch.ones((B, Tp), device=z1.device, dtype=torch.bool)
         valid = valid.reshape(B, Tp).bool()
 
+        mask_flat = valid.reshape(-1)
+        empty_valid = not bool(mask_flat.any())
+        sel = mask_flat if not empty_valid else torch.zeros_like(mask_flat).index_fill_(0, torch.zeros(1, dtype=torch.long, device=z1.device), True)
+        z1_v = z1.reshape(-1, D)[sel]
+
+        fm = self.flow_matcher
+        if self.training and not empty_valid and int(fm.calib_steps.item()) < 50:
+            fm.calibrate_z(z1_v)
+
+        if z_target is not None:
+            ctx = self.forward_context(z_discourse_seq, aux, aux_valid, **ctx_kwargs)
+            ctx = {k: (v[:, -1:] if (torch.is_tensor(v) and k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum")) else v)
+                   for k, v in ctx.items()}
+        else:
+            ctx = self.forward_context(z_in, aux, aux_valid, **ctx_kwargs)
+
         mu, sigma = self.predict_prior(ctx)  # (B, Tp, D), (B, Tp, nb) float32
         h = ctx["h"]
         stop_logits = self.stop_head(h).squeeze(-1).float()  # (B, Tp)
         if profile_cb is not None:
             profile_cb("mamba_prior")
 
-        mask_flat = valid.reshape(-1)
-        empty_valid = not bool(mask_flat.any())
-        sel = mask_flat if not empty_valid else torch.zeros_like(mask_flat).index_fill_(0, torch.zeros(1, dtype=torch.long, device=z1.device), True)
-
-        z1_v = z1.reshape(-1, D)[sel]
         h_v = h.reshape(-1, D)[sel]
         mu_v = mu.reshape(-1, D)[sel]
         sig_v = sigma.reshape(-1, nb)[sel]
-
-        fm = self.flow_matcher
-        if self.training and not empty_valid and int(fm.calib_steps.item()) < 50:
-            fm.calibrate_z(z1_v)
         z1n = fm.normalize(z1_v.float())
 
         # Prior NLL (float32) — the ONLY loss that trains `prior_head`.
@@ -1388,7 +1430,8 @@ class MultiStreamRightBrain(nn.Module):
         """
         states = {} if states is None else states
         new_states: Dict[str, Any] = dict(states)
-        h0_t, new_states["main"] = self.main_stream.step(z_t, states.get("main"))
+        z_t_in = self._normalize_clause_input(z_t)
+        h0_t, new_states["main"] = self.main_stream.step(z_t_in, states.get("main"))
         ctx = self._fuse(h0_t.unsqueeze(1), h_aux, stream_valid)
         ctx = {k: v.squeeze(1) for k, v in ctx.items()}
         return ctx, new_states
@@ -1553,12 +1596,16 @@ class KnowledgeSelector(nn.Module):
         with torch.no_grad():
             nn.init.normal_(self.sink_head[-1].weight, mean=0.0, std=0.02)
             self.sink_head[-1].bias.zero_()
+        self.register_buffer("z_mean", torch.zeros(hidden_dim, dtype=torch.float32))
+        self.register_buffer("z_std", torch.ones(hidden_dim, dtype=torch.float32))
+        self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
         self._register_load_state_dict_pre_hook(self._fill_missing_sink_keys)
 
     _SINK_PREFIXES = ("sink_probe.", "sink_head.")
+    _CALIB_BUFFERS = ("z_mean", "z_std", "calib_steps")
 
     def _fill_missing_sink_keys(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        """#033 backward compatibility: injects fresh sink parameters into pre-#033 selector state dicts."""
+        """#033 backward compatibility: injects fresh sink parameters & calib buffers into older selector state dicts."""
         own = None
         filled = 0
         for name, tensor in self.named_parameters():
@@ -1570,20 +1617,64 @@ class KnowledgeSelector(nn.Module):
                     own = {k: v for k, v in self.state_dict().items()}
                 state_dict[key] = own[name].detach().clone()
                 filled += 1
+        for name in self._CALIB_BUFFERS:
+            key = prefix + name
+            if key not in state_dict:
+                if own is None:
+                    own = {k: v for k, v in self.state_dict().items()}
+                state_dict[key] = own[name].detach().clone()
+            elif name in ("z_mean", "z_std") and state_dict[key].shape != (self.hidden_dim,):
+                state_dict[key] = state_dict[key].reshape(-1).expand(self.hidden_dim).clone()
         if filled:
             print(f"ℹ️ KnowledgeSelector: checkpoint has no sink head ({filled} tensors) — using fresh (untrained) sink weights.")
+
+    @torch.no_grad()
+    def calibrate_z(
+        self,
+        z_sample: torch.Tensor,
+        max_calib_steps: int = 50,
+        momentum: float = 0.1,
+    ) -> bool:
+        step = int(self.calib_steps.item())
+        if step >= max_calib_steps:
+            return False
+        z_float = z_sample.detach().float().reshape(-1, self.hidden_dim)
+        valid = z_float.abs().sum(dim=-1) > 1e-6
+        z_valid = z_float[valid]
+        if z_valid.numel() == 0:
+            return False
+        batch_mean = z_valid.mean(dim=0)
+        if z_valid.shape[0] >= 2:
+            batch_std = z_valid.std(dim=0, unbiased=False).clamp(min=1e-3)
+        else:
+            s = z_valid.std().clamp(min=1e-3) if z_valid.numel() > 1 else torch.tensor(1.0, device=z_valid.device)
+            batch_std = s.expand(self.hidden_dim).clone()
+        if step == 0:
+            self.z_mean.copy_(batch_mean)
+            self.z_std.copy_(batch_std)
+        else:
+            self.z_mean.lerp_(batch_mean, momentum)
+            self.z_std.lerp_(batch_std, momentum)
+        self.calib_steps.add_(1)
+        return True
+
+    def normalize_z(self, z: torch.Tensor) -> torch.Tensor:
+        nonzero = z.abs().sum(dim=-1, keepdim=True) > 1e-6
+        mean = self.z_mean.to(device=z.device, dtype=z.dtype)
+        std = self.z_std.to(device=z.device, dtype=z.dtype).clamp(min=1e-3)
+        return torch.where(nonzero, (z - mean) / std, z)
 
     # ------------------------------------------------------------------ #033 shared projections
     def _project_probe(self, z_probe: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """z_probe (..., D) -> (q_normed (..., D), q_full unit (..., D), q_sub unit (..., d_proj))."""
-        q_normed = self.probe_norm(z_probe)
+        q_normed = self.probe_norm(self.normalize_z(z_probe))
         q_full = F.normalize(self.probe_proj(q_normed), dim=-1, eps=1e-6)
         q_sub = F.normalize(self.query_sub_proj(q_normed), dim=-1, eps=1e-6)
         return q_normed, q_full, q_sub
 
     def _project_cand(self, z_cand: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """z_cand (..., D) -> (k_full unit (..., D), k_sub unit (..., d_proj))."""
-        c_normed = self.cand_norm(z_cand)
+        c_normed = self.cand_norm(self.normalize_z(z_cand))
         k_full = F.normalize(self.cand_proj(c_normed), dim=-1, eps=1e-6)
         k_sub = F.normalize(self.cand_sub_proj(c_normed), dim=-1, eps=1e-6)
         return k_full, k_sub
@@ -1685,6 +1776,8 @@ class KnowledgeSelector(nn.Module):
         B, T, D = z_main.shape
         device = z_main.device
         mv = main_valid.bool()
+        if self.training and bool(mv.any()) and int(self.calib_steps.item()) < 50:
+            self.calibrate_z(z_main[mv])
         q_normed, q_full, q_sub = self._project_probe(z_probe)
         k_full, k_sub = self._project_cand(z_main)
         sim_full = torch.einsum("btd,bjd->btj", q_full, k_full)

@@ -1343,7 +1343,7 @@ def train():
                 sec_per_step = (now - last_log_time - excluded_time) / max(1, global_step - last_log_step)
                 last_log_time, last_log_step, excluded_time = now, global_step, 0.0
                 cur_lr = optimizer.param_groups[0]["lr"]
-                z_std_cal = right_brain.flow_matcher.z_std.item()
+                z_std_cal = right_brain.flow_matcher.z_std.mean().item()
                 n_groups = [int((group == g).sum().item()) for g in (0, 1, 2)]
 
                 def _grp(key: str) -> str:
