@@ -935,8 +935,8 @@ def train():
                 n_ct = int((source_id == 1).sum().item())
                 print(
                     f"Epoch {epoch + 1} | Step {global_step} | LR {optimizer.param_groups[0]['lr']:.2e} | {sps:.2f}s/step | "
-                    f"Total {m['total_loss']:.4f} | Flow {m['flow_loss']:.4f} (win {m['win_loss']:.4f}, other "
-                    f"{m['other_loss']:.4f}) | PriorNLL {m['prior_nll']:.4f} | Stop {m['stop_loss']:.4f} "
+                    f"Total {m['total_loss']:.4f} | Flow {m['flow_loss']:.4f} (win {m['win_loss']:.4f}, slot {m.get('slot_loss', 0.0):.4f}, "
+                    f"other {m['other_loss']:.4f}) | PriorNLL {m['prior_nll']:.4f} | Stop {m['stop_loss']:.4f} "
                     f"(acc {_fmt_opt(m.get('stop_acc'))}, rec {_fmt_opt(m.get('stop_recall'))}, rows {m.get('n_stop_rows', 0)}) | "
                     f"ThoughtCos {m['thought_cos']:.4f}"
                 )

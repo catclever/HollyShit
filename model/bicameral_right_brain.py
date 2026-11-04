@@ -300,6 +300,37 @@ def band_gaussian_nll(
     return nll_b.mean(dim=-1)
 
 
+def _build_discrete_legendre_basis(K: int, L: int) -> torch.Tensor:
+    """
+    Computes the first K discrete-orthonormal Legendre polynomials evaluated on [0, L-1]
+    with uniform midpoint coordinates tau_l = (l + 0.5) / L in (0, 1), orthonormalized via
+    two-pass Gram-Schmidt in float64 (matching HiPPOOracleCUDA._get_legendre_basis).
+    Returns `basis` of shape (K, L).
+    """
+    tau = (torch.arange(L, device="cpu", dtype=torch.float64) + 0.5) / float(max(L, 1))
+    u = 2.0 * tau - 1.0
+    polys = []
+    for k in range(K):
+        if k == 0:
+            p_k = torch.ones_like(u)
+        elif k == 1:
+            p_k = u
+        else:
+            p_k = ((2.0 * k - 1.0) * u * polys[-1] - (k - 1.0) * polys[-2]) / float(k)
+        polys.append(p_k)
+    raw_basis = torch.stack(polys, dim=0)
+    ortho_rows = []
+    for k in range(K):
+        v = raw_basis[k]
+        if k < L:
+            for _ in range(2):
+                for prev in ortho_rows:
+                    v = v - torch.dot(v, prev) * prev
+        norm = v.norm(p=2).clamp(min=1e-12)
+        ortho_rows.append(v / norm)
+    return torch.stack(ortho_rows, dim=0).to(dtype=torch.float32)
+
+
 # [Design Change Documentation - Task #029: ThoughtFlowMatcher v2]
 # 1. What changed vs #027:
 #    - REMOVED the hard residual `v_pred = (h_t - z_tau) + final_proj(...)`. That residual made every
@@ -381,6 +412,11 @@ class ThoughtFlowMatcher(nn.Module):
         self.register_buffer("z_std", torch.ones(hidden_dim, dtype=torch.float32))
         self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
         self.register_buffer("flow_version", torch.tensor(2, dtype=torch.long))
+        self.register_buffer(
+            "legendre_basis",
+            _build_discrete_legendre_basis(self.num_bands, self.num_bands),
+            persistent=False,
+        )
         self._register_load_state_dict_pre_hook(self._upgrade_scalar_calib_buffers)
 
     def _reset_flow_mlp_parameters(self) -> None:
@@ -478,6 +514,66 @@ class ThoughtFlowMatcher(nn.Module):
         mean = self.z_mean.to(device=z.device, dtype=z.dtype)
         std = self.z_std.to(device=z.device, dtype=z.dtype).clamp(min=1e-3)
         return z * std + mean
+
+    def reconstruct_spatial_slots(self, z_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Reconstructs the 32 spatial character-slot vectors `X_slot: (..., L, d_sub)` from a whitened
+        clause vector `z_norm: (..., D)` via the exact orthogonal inverse Legendre transform `B^T`.
+        Uses channel-wise RMS scaling `D_chan^{-1}` on the right (which commutes with `B^T` on the left),
+        eliminating the 600x PCA channel-0 variance anisotropy while 100% preserving relative band norms
+        and cross-band phase relationships across all K Legendre bands.
+        """
+        nb = self.num_bands
+        z_phys = self.denormalize(z_norm.float())  # (..., D)
+        z_bands = to_bands(z_phys, nb)  # (..., nb, d_sub)
+        std_b = to_bands(self.z_std.to(device=z_norm.device, dtype=torch.float32).clamp(min=1e-3), nb)  # (nb, d_sub)
+        chan_scale = std_b.pow(2).mean(dim=0).sqrt().clamp(min=1e-3)  # (d_sub,)
+        z_chan_wht = z_bands / chan_scale  # (..., nb, d_sub)
+        basis = self.legendre_basis.to(device=z_norm.device, dtype=torch.float32)  # (nb, L)
+        return torch.einsum("...kd,kl->...ld", z_chan_wht, basis)
+
+    def compute_spatial_slot_loss(
+        self,
+        z_pred_norm: torch.Tensor,
+        z_target_norm: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Computes inverse-Legendre spatial slot cosine alignment (`slot_cos_loss`) and adjacent-slot
+        first-difference transition alignment (`slot_diff_loss`) to lock cross-band phases on interior
+        character slots (`l = 4..25`) and prevent multi-slot flat polynomial plateaus.
+        """
+        x_pred = self.reconstruct_spatial_slots(z_pred_norm)  # (..., L, d_sub)
+        x_gt = self.reconstruct_spatial_slots(z_target_norm)  # (..., L, d_sub)
+
+        slot_norm_gt = x_gt.norm(dim=-1)  # (..., L)
+        active_mask = (slot_norm_gt > 0.15).float()
+        if active_mask.sum().item() < 1.0:
+            active_mask = torch.ones_like(slot_norm_gt)
+
+        if self.d_sub > 1:
+            lex_cos = F.cosine_similarity(x_pred[..., 1:], x_gt[..., 1:], dim=-1, eps=1e-6)
+            full_cos = F.cosine_similarity(x_pred, x_gt, dim=-1, eps=1e-6)
+            slot_cos = 0.75 * lex_cos + 0.25 * full_cos
+        else:
+            slot_cos = F.cosine_similarity(x_pred, x_gt, dim=-1, eps=1e-6)
+        slot_cos_loss = ((1.0 - slot_cos) * active_mask).sum() / active_mask.sum().clamp(min=1.0)
+
+        dx_pred = x_pred[..., 1:, :] - x_pred[..., :-1, :]  # (..., L-1, d_sub)
+        dx_gt = x_gt[..., 1:, :] - x_gt[..., :-1, :]        # (..., L-1, d_sub)
+        dx_norm_gt = dx_gt.norm(dim=-1)
+        trans_mask = (dx_norm_gt > 0.15).float()
+        if trans_mask.sum().item() < 1.0:
+            trans_mask = torch.ones_like(dx_norm_gt)
+        trans_cos = F.cosine_similarity(dx_pred, dx_gt, dim=-1, eps=1e-6)
+        slot_diff_cos_loss = ((1.0 - trans_cos) * trans_mask).sum() / trans_mask.sum().clamp(min=1.0)
+        slot_diff_mse = F.mse_loss(dx_pred, dx_gt)
+        slot_diff_loss = slot_diff_cos_loss + 0.25 * slot_diff_mse
+
+        total_slot_loss = slot_cos_loss + slot_diff_loss
+        return total_slot_loss, {
+            "slot_cos_loss": slot_cos_loss.detach(),
+            "slot_diff_loss": slot_diff_loss.detach(),
+        }
 
     def forward(self, z_tau: torch.Tensor, tau: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
         """
@@ -586,16 +682,22 @@ class ThoughtFlowMatcher(nn.Module):
         x_traj = x_traj_flat.reshape(n_steps, K, N, D)
         v_traj = v_traj_flat.reshape(n_steps, K, N, D)
 
-        # ---- 2. Winner selection (no grad)
+        # ---- 2. Winner selection (no grad, spectral + spatial slot transition alignment)
         with torch.no_grad():
-            err = (x1.detach() - z1f.unsqueeze(0)).pow(2).mean(dim=-1)  # (K, N)
+            spec_err = (x1.detach() - z1f.unsqueeze(0)).pow(2).mean(dim=-1)  # (K, N)
+            x1_slots = self.reconstruct_spatial_slots(x1.detach())           # (K, N, L_slots, ds)
+            z1_slots = self.reconstruct_spatial_slots(z1f).unsqueeze(0)      # (1, N, L_slots, ds)
+            dx1_slots = x1_slots[..., 1:, :] - x1_slots[..., :-1, :]
+            dz1_slots = z1_slots[..., 1:, :] - z1_slots[..., :-1, :]
+            trans_err = (dx1_slots - dz1_slots).pow(2).mean(dim=(-1, -2))    # (K, N)
+            err = spec_err + 0.5 * trans_err
             k_star = err.argmin(dim=0)  # (N,)
         rows = torch.arange(N, device=device)
         x1_win = x1[k_star, rows]  # (N, D)
         x_traj_win = x_traj[:, k_star, rows, :]  # (n_steps, N, D)
         v_traj_win = v_traj[:, k_star, rows, :]  # (n_steps, N, D)
 
-        # ---- 3. Winner loss: Leak-free on-policy residual velocity MSE + endpoint MSE + full & per-band cosine
+        # ---- 3. Winner loss: Leak-free on-policy residual velocity MSE + endpoint MSE + spectral & spatial slot alignment
         step_idx = torch.arange(n_steps, device=device, dtype=torch.float32).view(n_steps, 1, 1)
         rem_time = 1.0 - step_idx / float(n_steps)  # (n_steps, 1, 1) in (0, 1]
         vel_loss = F.mse_loss(rem_time * v_traj_win, z1f.unsqueeze(0) - x_traj_win.detach())
@@ -606,7 +708,11 @@ class ThoughtFlowMatcher(nn.Module):
         z1_b = to_bands(z1f, nb)  # (N, nb, ds)
         band_cos = F.cosine_similarity(x1_win_b, z1_b, dim=-1, eps=1e-6)  # (N, nb)
         band_cos_loss = 1.0 - band_cos.mean()
-        win_loss = vel_loss + end_mse + 0.5 * cos_loss + 0.5 * band_cos_loss
+        x1_implied = x_traj_win.detach() + rem_time * v_traj_win  # (n_steps, N, D)
+        traj_slot_loss, _ = self.compute_spatial_slot_loss(x1_implied, z1f.unsqueeze(0).expand_as(x1_implied))
+        end_slot_loss, slot_stats = self.compute_spatial_slot_loss(x1_win, z1f)
+        slot_loss = 0.5 * traj_slot_loss + 0.5 * end_slot_loss
+        win_loss = vel_loss + end_mse + 0.5 * cos_loss + 0.5 * band_cos_loss + 0.5 * slot_loss
 
         # ---- 4. Non-winner branch regularization: prior-cone anchor + pairwise angular repulsion
         x1_b = to_bands(x1, nb)  # (K, N, nb, ds)
@@ -647,6 +753,9 @@ class ThoughtFlowMatcher(nn.Module):
             "vel_loss": vel_loss.detach(),
             "end_mse": end_mse.detach(),
             "cos_loss": cos_loss.detach(),
+            "slot_loss": slot_loss.detach(),
+            "slot_cos_loss": slot_stats["slot_cos_loss"],
+            "slot_diff_loss": slot_stats["slot_diff_loss"],
             "thought_cos": win_cos.mean().detach(),
             "win_loss": win_loss.detach(),
             "other_loss": other_loss.detach(),
@@ -1370,11 +1479,12 @@ class MultiStreamRightBrain(nn.Module):
         sig_v = sigma.reshape(-1, nb)[sel]
         z1n = fm.normalize(z1_v.float())
 
-        # Prior NLL (float32) + full-spectrum directional alignment across all 32 bands — trains `prior_head`.
+        # Prior NLL (float32) + full-spectrum & spatial-slot directional alignment — trains `prior_head`.
         nll_raw = band_gaussian_nll(z1n, mu_v, sig_v, nb).mean()
         mu_cos = F.cosine_similarity(mu_v, z1n, dim=-1, eps=1e-6).mean()
         mu_band_cos = F.cosine_similarity(to_bands(mu_v, nb), to_bands(z1n, nb), dim=-1, eps=1e-6).mean()
-        prior_nll = nll_raw + 0.5 * ((1.0 - mu_cos) + (1.0 - mu_band_cos))
+        mu_slot_loss, _ = fm.compute_spatial_slot_loss(mu_v, z1n)
+        prior_nll = nll_raw + 0.5 * ((1.0 - mu_cos) + (1.0 - mu_band_cos)) + 0.5 * mu_slot_loss
         # K-branch soft-competition flow loss (mu / sigma detached inside).
         flow_loss, fstats = fm.compute_branch_loss(z1n, h_v, mu_v, sig_v)
         if profile_cb is not None:
@@ -1425,6 +1535,9 @@ class MultiStreamRightBrain(nn.Module):
                 "flow_loss": float(flow_loss.detach().item()),
                 "vel_loss": float(fstats["vel_loss"].item()),
                 "cos_loss": float(fstats["cos_loss"].item()),
+                "slot_loss": float(fstats["slot_loss"].item()),
+                "slot_cos_loss": float(fstats["slot_cos_loss"].item()),
+                "slot_diff_loss": float(fstats["slot_diff_loss"].item()),
                 "thought_cos": float(fstats["thought_cos"].item()),
                 "end_mse": float(fstats["end_mse"].item()),
                 "win_loss": float(fstats["win_loss"].item()),
