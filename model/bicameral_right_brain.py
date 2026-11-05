@@ -1164,7 +1164,7 @@ class CausalContextLookback(nn.Module):
 
             if T >= 3:
                 succ_boost = torch.zeros_like(sim)
-                succ_boost[:, :, 1:] = F.relu(sim[:, :, :-1])
+                succ_boost[:, :, 1:] = F.relu(sim[:, :, :-1] - 0.35) / 0.65
                 succ_boost = succ_boost.masked_fill(~strict_prev.unsqueeze(0), 0.0)
                 logits = logits + F.softplus(self.succ_scale.float()).view(1, H, 1, 1) * succ_boost.unsqueeze(1)
 
@@ -1183,18 +1183,31 @@ class CausalContextLookback(nn.Module):
         attn = attn.masked_fill(~key_allow.unsqueeze(1), 0.0)
         attn = attn * valid_mask.unsqueeze(1).unsqueeze(-1).float()
 
-        # Direct spectral copy of attended clauses + learned residual refinement
-        z_copy = torch.matmul(attn, z_heads).transpose(1, 2).contiguous().view(B, T, D)
+        # Unified clause-level spectral copy over all 32 Legendre bands (prevents cross-head band splicing)
+        clause_logits_with_sink = logits_with_sink.mean(dim=1)  # (B, T, T + 1)
+        attn_clause = F.softmax(clause_logits_with_sink, dim=-1)[..., :T]  # (B, T, T)
+        attn_clause = attn_clause.masked_fill(~key_allow, 0.0) * valid_mask.unsqueeze(-1).float()
+        attn_mass = attn_clause.sum(dim=-1, keepdim=True)  # (B, T, 1)
+        z_in_f = z_in.float()
+        z_copy_raw = torch.bmm(attn_clause, z_in_f)  # (B, T, D)
+        z_in_b = to_bands(z_in_f, self.num_bands)  # (B, T, nb, d_sub)
+        r_in_b = (z_in_b.pow(2).mean(dim=-1) + 1e-6).sqrt()  # (B, T, nb)
+        r_copy_b = (torch.bmm(attn_clause, r_in_b) / attn_mass.clamp(min=1e-6)).unsqueeze(-1)  # (B, T, nb, 1)
+        u_copy_b = F.normalize(to_bands(z_copy_raw, self.num_bands), dim=-1, eps=1e-6) * math.sqrt(self.d_sub)
+        z_copy_unit = from_bands(u_copy_b * r_copy_b)  # (B, T, D), full clause amplitude when attn_mass > 0
+
         out_heads = torch.matmul(attn, V.to(dtype=attn.dtype))  # (B, H, T, dh)
         out_feat = self.out_proj(out_heads.transpose(1, 2).contiguous().view(B, T, D).to(dtype=h0.dtype)).float()
-        out = (z_copy + out_feat) * valid_mask.unsqueeze(-1).float()
+        vm_col = valid_mask.unsqueeze(-1).float()
+        has_prev = key_allow.any(dim=-1, keepdim=True).float()  # (B, T, 1), 0 at t=0
+        out_h = (attn_mass * z_copy_unit + out_feat) * vm_col
+        out_lb = (z_copy_unit + out_feat) * vm_col * has_prev
 
-        h_out = (h0.float() + torch.tanh(self.alpha_lookback.float()) * out).to(dtype=h0.dtype)
+        h_out = (h0.float() + torch.tanh(self.alpha_lookback.float()) * out_h).to(dtype=h0.dtype)
         if return_delta:
-            has_prev = key_allow.any(dim=-1, keepdim=True).float()  # (B, T, 1), 0 at t=0
-            attn_peak = attn.amax(dim=-1).mean(dim=1).unsqueeze(-1) * valid_mask.unsqueeze(-1).float() * has_prev
+            attn_peak = attn_clause.amax(dim=-1, keepdim=True) * vm_col * has_prev
             gate_lb = (torch.sigmoid(self.beta_prior.float()) * attn_peak).to(dtype=h0.dtype)
-            return h_out, out.to(dtype=h0.dtype), gate_lb
+            return h_out, out_lb.to(dtype=h0.dtype), gate_lb
         return h_out
 
     def step(
@@ -1702,15 +1715,26 @@ class MultiStreamRightBrain(nn.Module):
         return out
 
     def predict_prior(self, ctx: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies `prior_head` + convex pointer-generator `z_lookback` blend to a `forward_context` dict -> (mu (…,D), sigma_band (…,nb)), float32."""
-        mu, sigma = self.prior_head(ctx["h0"], ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"])
+        """Applies `prior_head` + polar-band pointer-generator `z_lookback` interpolation -> (mu (…,D), sigma_band (…,nb)), float32."""
+        mu_head, sigma = self.prior_head(ctx["h0"], ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"])
+        ctx["mu_head"] = mu_head
         z_lb = ctx.get("z_lookback")
         g_lb = ctx.get("gate_lb")
         if z_lb is not None and g_lb is not None:
-            gf = g_lb.float()
-            mu = (1.0 - gf) * mu + gf * z_lb.float()
+            gf = g_lb.float().unsqueeze(-1)  # (..., 1, 1)
+            mh_b = to_bands(mu_head.float(), self.num_bands)  # (..., nb, d_sub)
+            lb_b = to_bands(z_lb.float(), self.num_bands)     # (..., nb, d_sub)
+            r_mh = (mh_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+            r_lb = (lb_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+            u_mh = mh_b / r_mh
+            u_lb = lb_b / r_lb
+            r_blend = (1.0 - gf) * r_mh + gf * r_lb
+            u_blend = F.normalize((1.0 - gf) * u_mh + gf * u_lb, dim=-1, eps=1e-6) * math.sqrt(self.d_sub)
+            mu = from_bands(u_blend * r_blend)
         elif z_lb is not None:
-            mu = mu + z_lb.float()
+            mu = mu_head + z_lb.float()
+        else:
+            mu = mu_head
         return mu, sigma
 
     # ------------------------------------------------------------------ training loss
@@ -1840,6 +1864,11 @@ class MultiStreamRightBrain(nn.Module):
         mu_slot_loss, _ = fm.compute_spatial_slot_loss(mu_v, z1n)
         mu_cart_mse = F.mse_loss(mu_v.float(), z1n.float())
         prior_nll = nll_raw + 0.5 * mu_polar_loss + 0.5 * mu_slot_loss + 0.15 * mu_cart_mse
+        if "mu_head" in ctx:
+            mu_head_v = ctx["mu_head"].reshape(-1, D)[sel]
+            head_polar_loss, _ = fm.compute_polar_band_loss(mu_head_v, z1n)
+            head_slot_loss, _ = fm.compute_spatial_slot_loss(mu_head_v, z1n)
+            prior_nll = prior_nll + 0.30 * (head_polar_loss + head_slot_loss)
         # K-branch soft-competition flow loss (mu / sigma detached inside).
         flow_loss, fstats = fm.compute_branch_loss(z1n, h_v, mu_v, sig_v)
         if profile_cb is not None:
