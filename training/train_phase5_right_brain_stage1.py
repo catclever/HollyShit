@@ -498,7 +498,11 @@ def ids_to_clause_tokens(ids: List[int], tokenizer: CharTokenizer, seq_len: int,
 
 
 def _ctx_last(ctx: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    return {k: v[:, -1] for k, v in ctx.items() if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum")}
+    return {
+        k: v[:, -1]
+        for k, v in ctx.items()
+        if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb") and v is not None
+    }
 
 
 def _short(s: str, n: int = 160) -> str:
@@ -590,7 +594,7 @@ def evaluate_stage1(
             sim_sem = F.cosine_similarity(z_th_n[:, :sem_dim], zc_n[:, :sem_dim], dim=-1)
             sim_full = F.cosine_similarity(z_th_n, zc_n, dim=-1)
             scores = 0.6 * sim_sem + 0.4 * sim_full  # (N_pool,)
-            thr = min(float(args.min_selector_score), 0.20)
+            thr = max(float(args.min_selector_score), 0.25)
             k = min(int(args.top_m), int((scores >= thr).sum().item()))
             max_cos_val = float(scores.max().item()) if scores.numel() > 0 else 0.0
             if k > 0:
@@ -609,6 +613,15 @@ def evaluate_stage1(
                 unet, z_th, x_attr, k_mask, use_attr, steps=args.left_ode_steps, seq_len=args.seq_len,
             )
         return x_gen.float(), info
+
+    if int(fm.calib_steps.item()) == 0 and bench:
+        calib_rows = []
+        for _, b_item in bench:
+            _, b_mv, _, b_z, b_n_valid, _ = prepare(b_item)
+            if b_n_valid > 0:
+                calib_rows.append(b_z[0, :b_n_valid])
+        if calib_rows:
+            fm.calibrate_z(torch.cat(calib_rows, dim=0))
 
     first_of: Dict[int, Tuple[str, Dict[str, Any]]] = {}
     for tag, item in bench:
@@ -665,9 +678,6 @@ def evaluate_stage1(
                                subspace_proj=unet.subspace_proj).float()
             else:
                 z_next = z_th
-            if translator is not None:
-                pool_z.append(z_next[0])
-                pool_w.append(ids_to_clause_tokens(ids[0], tokenizer, w.shape[-1], device))
             if stop_p > float(args.stop_threshold):
                 stopped = c
                 break

@@ -1175,7 +1175,9 @@ class CausalContextLookback(nn.Module):
         key_allow = strict_prev.unsqueeze(0) & valid_mask.unsqueeze(1)  # (B, T, T), strictly j <= t - 1
         logits = logits.masked_fill(~key_allow.unsqueeze(1), -1e4)
 
-        sink = self.sink_logit.float().view(1, H, 1, 1).expand(B, H, T, 1)
+        # Length-invariant sink logit: adding log(n_prev) keeps total diffuse background mass constant across T
+        n_prev = key_allow.float().sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, T, 1)
+        sink = self.sink_logit.float().view(1, H, 1, 1) + n_prev.log().unsqueeze(1)  # (B, H, T, 1)
         logits_with_sink = torch.cat([logits, sink], dim=-1)  # (B, H, T, T + 1)
         attn = F.softmax(logits_with_sink, dim=-1)[..., :T]   # (B, H, T, T)
         attn = attn.masked_fill(~key_allow.unsqueeze(1), 0.0)
@@ -1189,8 +1191,9 @@ class CausalContextLookback(nn.Module):
 
         h_out = (h0.float() + torch.tanh(self.alpha_lookback.float()) * out).to(dtype=h0.dtype)
         if return_delta:
-            attn_mass = attn.sum(dim=-1).mean(dim=1).unsqueeze(-1) * valid_mask.unsqueeze(-1).float()  # (B, T, 1) in [0, 1]
-            gate_lb = (torch.sigmoid(self.beta_prior.float()) * attn_mass).to(dtype=h0.dtype)
+            has_prev = key_allow.any(dim=-1, keepdim=True).float()  # (B, T, 1), 0 at t=0
+            attn_peak = attn.amax(dim=-1).mean(dim=1).unsqueeze(-1) * valid_mask.unsqueeze(-1).float() * has_prev
+            gate_lb = (torch.sigmoid(self.beta_prior.float()) * attn_peak).to(dtype=h0.dtype)
             return h_out, out.to(dtype=h0.dtype), gate_lb
         return h_out
 
