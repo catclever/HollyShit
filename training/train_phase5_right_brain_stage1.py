@@ -264,6 +264,31 @@ def resume_training(
                 f"and reset step counter -> 0 with fresh LR schedule."
             )
             return 0
+        if getattr(rb, "_upgraded_context_lookback", False):
+            # #038: When resuming a pre-#038 checkpoint that lacked `context_lookback.*`, restore the saved
+            # AdamW state for all existing parameters (indices 0..P_old-1) and leave `context_lookback.*` fresh.
+            opt_file = os.path.join(path, "engine_opt.pt")
+            opt = checkpointer._optimizers.get("engine_opt")
+            if opt is not None and os.path.isfile(opt_file):
+                try:
+                    opt_sd = torch.load(opt_file, map_location=device, weights_only=True)
+                    if (
+                        isinstance(opt_sd, dict)
+                        and len(opt_sd.get("param_groups", [])) == 1
+                        and len(opt.param_groups) == 1
+                    ):
+                        n_old = len(opt_sd["param_groups"][0].get("params", []))
+                        n_new = len(opt.param_groups[0].get("params", []))
+                        if 0 < n_old < n_new:
+                            opt_sd["param_groups"][0]["params"] = list(range(n_new))
+                            opt.load_state_dict(opt_sd)
+                            print(
+                                f"🔄 Restored AdamW state for {n_old}/{n_new} parameters "
+                                f"(initialized fresh state for {n_new - n_old} CausalContextLookback params)."
+                            )
+                except Exception as opt_err:
+                    print(f"⚠️ Could not partially restore optimizer state: {opt_err}")
+            rb._upgraded_context_lookback = False
         checkpointer.set_step(global_step)
         if not os.path.exists(os.path.join(path, "lr_sched.pt")) and global_step > 0:
             scheduler.step(global_step)
@@ -502,10 +527,28 @@ def evaluate_stage1(
     pad = tokenizer.pad_token_id
     nb_sem = int(right_brain.sem_bands)
     fm = right_brain.flow_matcher
-    use_ctx_attr = args.eval_attractors == "context" and selector is not None
-    attr_desc = "context(selector)" if use_ctx_attr else "none"
-    if args.eval_attractors == "context" and selector is None:
-        attr_desc += " [no --selector_ckpt -> none]"
+    # =====================================================================================
+    # [Feature Addition & Bug Fix - Task #038: CausalContextLookback History & Auto Context Attractors]
+    # 1. Problem fixed:
+    #    - `evaluate_stage1` previously initialized `states = {"main": ctx["main_states"]}` without passing
+    #      `history_h` and `history_z` from `forward_context` into `right_brain.step(...)`.
+    #    - Without a trained `selector_ckpt`, `--eval_attractors` defaulted to `none`, leaving the Left Brain
+    #      without context attractors during Stage-1 evaluation.
+    # 2. Method used:
+    #    - Pass `history_h` and `history_z` in `states` so `right_brain.step` attends over the full context prefix.
+    #    - Support `--eval_attractors auto`: uses `selector.select_context_attractors` if `selector` is loaded,
+    #      otherwise falls back to Whitened Clause Cosine Top-M Attractor Selection (`0.6 * sim_sem + 0.4 * sim_full`).
+    # 3. Caveats for subsequent development:
+    #    - Keep `return_state=True` in `forward_context` before sequential `step` loops so `history_h`/`history_z` are populated.
+    # =====================================================================================
+    use_sel_attr = args.eval_attractors in ("auto", "context") and selector is not None
+    use_wht_attr = args.eval_attractors in ("auto", "context") and selector is None
+    if use_sel_attr:
+        attr_desc = "context(selector)"
+    elif use_wht_attr:
+        attr_desc = "auto(wht_cos)"
+    else:
+        attr_desc = "none"
     print("\n" + "=" * 96)
     print(f"🧠 [Step {step}] Stage-1 single-stream rollout | attractors={attr_desc} | "
           f"RightODE={args.right_ode_steps} LeftODE={args.left_ode_steps} T={args.temperature} "
@@ -527,7 +570,7 @@ def evaluate_stage1(
 
     def crystallize(z_th: torch.Tensor, pool_z: List[torch.Tensor], pool_w: List[torch.Tensor]):
         x_attr, k_mask, use_attr, info = None, None, None, None
-        if use_ctx_attr and pool_z:
+        if use_sel_attr and pool_z:
             zc = torch.stack(pool_z, dim=0).unsqueeze(0)
             wc = torch.stack(pool_w, dim=0).unsqueeze(0)
             w_attr, k_mask, info = selector.select_context_attractors(
@@ -538,6 +581,29 @@ def evaluate_stage1(
             use_attr = info["use_attr"]
             if w_attr is not None:
                 x_attr = unet.normalize(encode_tokens(encoder, w_attr))
+        elif use_wht_attr and pool_z:
+            zc = torch.stack(pool_z, dim=0)  # (N_pool, D)
+            wc = torch.stack(pool_w, dim=0)  # (N_pool, L)
+            z_th_n = fm.normalize(z_th.float())  # (1, D)
+            zc_n = fm.normalize(zc.float())      # (N_pool, D)
+            sem_dim = int(right_brain.sem_bands) * int(fm.d_sub)
+            sim_sem = F.cosine_similarity(z_th_n[:, :sem_dim], zc_n[:, :sem_dim], dim=-1)
+            sim_full = F.cosine_similarity(z_th_n, zc_n, dim=-1)
+            scores = 0.6 * sim_sem + 0.4 * sim_full  # (N_pool,)
+            thr = min(float(args.min_selector_score), 0.20)
+            k = min(int(args.top_m), int((scores >= thr).sum().item()))
+            max_cos_val = float(scores.max().item()) if scores.numel() > 0 else 0.0
+            if k > 0:
+                top_idx = scores.topk(k).indices
+                top_idx, _ = torch.sort(top_idx)
+                w_attr = wc[top_idx].reshape(1, -1)  # (1, k * L)
+                k_mask = (w_attr != pad)
+                use_attr = torch.ones((1,), device=device, dtype=torch.bool)
+                x_attr = unet.normalize(encode_tokens(encoder, w_attr))
+                info = {"use_attr": use_attr, "max_cos": max_cos_val}
+            else:
+                use_attr = torch.zeros((1,), device=device, dtype=torch.bool)
+                info = {"use_attr": use_attr, "max_cos": max_cos_val}
         with autocast():
             x_gen = crystallize_with_optional_attractors(
                 unet, z_th, x_attr, k_mask, use_attr, steps=args.left_ode_steps, seq_len=args.seq_len,
@@ -560,7 +626,7 @@ def evaluate_stage1(
 
         with autocast():
             ctx = right_brain.forward_context(z[:, :ctx_len], return_state=True)
-        states = {"main": ctx["main_states"]}
+        states = {"main": ctx["main_states"], "history_h": ctx.get("history_h"), "history_z": ctx.get("history_z")}
         last = _ctx_last(ctx)
         pool_z = [z[0, r] for r in range(ctx_len)]
         pool_w = [w[0, r] for r in range(ctx_len)]
@@ -584,8 +650,11 @@ def evaluate_stage1(
             )
             attr_s = ""
             if info is not None:
-                attr_s = (f" attr={'Y' if bool(info['use_attr'][0]) else 'N'}"
-                          f"(sink={float(info['sink_prob'][0]):.2f})")
+                if "max_cos" in info:
+                    attr_s = f" attr={'Y' if bool(info['use_attr'][0]) else 'N'}(cos={float(info['max_cos']):.2f})"
+                elif "sink_prob" in info:
+                    attr_s = (f" attr={'Y' if bool(info['use_attr'][0]) else 'N'}"
+                              f"(sink={float(info['sink_prob'][0]):.2f})")
             lines.append(
                 f"      c{c}: stop={stop_p:.3f} σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} "
                 f"cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f}{attr_s} | {texts[0]}"
@@ -774,8 +843,8 @@ def build_parser():
     parser.add_argument("--context_lengths", type=str, default="2,4,8,16", help="k values for the σ-vs-context curve")
     parser.add_argument("--bench_qa", type=int, default=3, help="QA samples in the fixed benchmark")
     parser.add_argument("--bench_cont", type=int, default=3, help="Continuation samples in the fixed benchmark")
-    parser.add_argument("--eval_attractors", type=str, default="none", choices=["none", "context"],
-                        help="Left-brain attractors at eval: none | context (needs --selector_ckpt)")
+    parser.add_argument("--eval_attractors", type=str, default="auto", choices=["auto", "context", "none"],
+                        help="Left-brain attractors at eval: auto (selector if loaded, else whitened-cosine context top-M) | context | none")
     parser.add_argument("--selector_ckpt", type=str, default=None, help="Trained #033 KnowledgeSelector (file / dir)")
     parser.add_argument("--top_m", type=int, default=3, help="Max attractor clauses (context mode)")
     parser.add_argument("--min_selector_score", type=float, default=0.25, help="Min sigmoid score of a selected clause")
@@ -806,7 +875,7 @@ def train():
     print(f"📌 Fixed benchmark: {', '.join(t for t, _ in bench) if bench else '(none found)'}")
 
     encoder, hippo, unet, translator = load_frozen_modules(args, tokenizer, device, need_translator=True)
-    selector = load_selector(args.selector_ckpt, device) if args.eval_attractors == "context" else None
+    selector = load_selector(args.selector_ckpt, device) if args.eval_attractors in ("auto", "context") else None
 
     right_brain = build_right_brain_from_args(vars(args)).to(device)
     # Stage 1 never feeds companions: only parameters on the main path are optimised (aux_stream / gates /
