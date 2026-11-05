@@ -1078,10 +1078,10 @@ class CausalContextLookback(nn.Module):
         self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
         self.sink_logit = nn.Parameter(torch.full((self.num_heads,), 1.5))
-        self.qk_scale = nn.Parameter(torch.full((self.num_heads,), 6.0))
+        self.qk_scale = nn.Parameter(torch.full((self.num_heads,), 10.0))
         self.succ_scale = nn.Parameter(torch.full((self.num_heads,), 8.0))
         self.alpha_lookback = nn.Parameter(torch.tensor(0.50))
-        self.beta_prior = nn.Parameter(torch.tensor(1.50))
+        self.beta_prior = nn.Parameter(torch.tensor(2.00))
 
         with torch.no_grad():
             nn.init.normal_(self.q_proj.weight, mean=0.0, std=0.02)
@@ -1146,8 +1146,8 @@ class CausalContextLookback(nn.Module):
         V = self.v_proj(v_in).view(B, T, H, dh).transpose(1, 2).float()  # (B, H, T, dh)
         z_heads = z_in.float().view(B, T, H, dh).transpose(1, 2)  # (B, H, T, dh)
 
-        scale_qk = F.softplus(self.qk_scale.float()).clamp(max=8.0).view(1, H, 1, 1)
-        logits = scale_qk * torch.matmul(Q, K.transpose(-2, -1))  # (B, H, T, T), bounded in [-8, +8]
+        scale_qk = F.softplus(self.qk_scale.float()).clamp(max=20.0).view(1, H, 1, 1)
+        logits = scale_qk * torch.matmul(Q, K.transpose(-2, -1))  # (B, H, T, T)
         strict_prev = torch.tril(torch.ones((T, T), device=h0.device, dtype=torch.bool), diagonal=-1)  # j <= t - 1
 
         # Clause-Level Successor Relay & Self-Repeat Suppression (100% Causal, Zero Target Leakage)
@@ -1175,37 +1175,35 @@ class CausalContextLookback(nn.Module):
         key_allow = strict_prev.unsqueeze(0) & valid_mask.unsqueeze(1)  # (B, T, T), strictly j <= t - 1
         logits = logits.masked_fill(~key_allow.unsqueeze(1), -1e4)
 
-        # Length-invariant sink logit: adding log(n_prev) keeps total diffuse background mass constant across T
-        n_prev = key_allow.float().sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, T, 1)
-        sink = self.sink_logit.float().view(1, H, 1, 1) + n_prev.log().unsqueeze(1)  # (B, H, T, 1)
+        sink = self.sink_logit.float().view(1, H, 1, 1).expand(B, H, T, 1)  # (B, H, T, 1)
         logits_with_sink = torch.cat([logits, sink], dim=-1)  # (B, H, T, T + 1)
         attn = F.softmax(logits_with_sink, dim=-1)[..., :T]   # (B, H, T, T)
         attn = attn.masked_fill(~key_allow.unsqueeze(1), 0.0)
         attn = attn * valid_mask.unsqueeze(1).unsqueeze(-1).float()
 
-        # Unified clause-level spectral copy over all 32 Legendre bands (prevents cross-head band splicing)
-        clause_logits_with_sink = logits_with_sink.mean(dim=1)  # (B, T, T + 1)
+        # Straight-Through Top-1 Clause Copy over all 32 Legendre bands:
+        # In forward, copies a single intact context clause (preventing <PAD>/<EOS> contamination at slot 5
+        # from short header clauses like "背景资料：" or "叙事片段："); in backward, flows dense softmax gradients.
+        clause_logits_with_sink = 0.5 * logits_with_sink.mean(dim=1) + 0.5 * logits_with_sink.amax(dim=1)  # (B, T, T + 1)
         attn_clause = F.softmax(clause_logits_with_sink, dim=-1)[..., :T]  # (B, T, T)
         attn_clause = attn_clause.masked_fill(~key_allow, 0.0) * valid_mask.unsqueeze(-1).float()
         attn_mass = attn_clause.sum(dim=-1, keepdim=True)  # (B, T, 1)
-        z_in_f = z_in.float()
-        z_copy_raw = torch.bmm(attn_clause, z_in_f)  # (B, T, D)
-        z_in_b = to_bands(z_in_f, self.num_bands)  # (B, T, nb, d_sub)
-        r_in_b = (z_in_b.pow(2).mean(dim=-1) + 1e-6).sqrt()  # (B, T, nb)
-        r_copy_b = (torch.bmm(attn_clause, r_in_b) / attn_mass.clamp(min=1e-6)).unsqueeze(-1)  # (B, T, nb, 1)
-        u_copy_b = F.normalize(to_bands(z_copy_raw, self.num_bands), dim=-1, eps=1e-6) * math.sqrt(self.d_sub)
-        z_copy_unit = from_bands(u_copy_b * r_copy_b)  # (B, T, D), full clause amplitude when attn_mass > 0
+        probs_norm = attn_clause / attn_mass.clamp(min=1e-6)
+        peak_idx = attn_clause.argmax(dim=-1, keepdim=True)  # (B, T, 1)
+        one_hot = torch.zeros_like(attn_clause).scatter_(-1, peak_idx, 1.0) * key_allow.float()
+        vm_col = valid_mask.unsqueeze(-1).float()
+        has_prev = key_allow.any(dim=-1, keepdim=True).float()  # (B, T, 1), 0 at t=0
+        attn_copy = (one_hot - probs_norm.detach() + probs_norm) * vm_col * has_prev
+        z_copy_unit = torch.bmm(attn_copy, z_in.float())  # (B, T, D)
 
         out_heads = torch.matmul(attn, V.to(dtype=attn.dtype))  # (B, H, T, dh)
         out_feat = self.out_proj(out_heads.transpose(1, 2).contiguous().view(B, T, D).to(dtype=h0.dtype)).float()
-        vm_col = valid_mask.unsqueeze(-1).float()
-        has_prev = key_allow.any(dim=-1, keepdim=True).float()  # (B, T, 1), 0 at t=0
-        out_h = (attn_mass * z_copy_unit + out_feat) * vm_col
+        attn_peak = attn_clause.amax(dim=-1, keepdim=True) * vm_col * has_prev
+        out_h = (attn_peak * z_copy_unit + out_feat) * vm_col
         out_lb = (z_copy_unit + out_feat) * vm_col * has_prev
 
         h_out = (h0.float() + torch.tanh(self.alpha_lookback.float()) * out_h).to(dtype=h0.dtype)
         if return_delta:
-            attn_peak = attn_clause.amax(dim=-1, keepdim=True) * vm_col * has_prev
             gate_lb = (torch.sigmoid(self.beta_prior.float()) * attn_peak).to(dtype=h0.dtype)
             return h_out, out_lb.to(dtype=h0.dtype), gate_lb
         return h_out
