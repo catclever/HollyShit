@@ -578,14 +578,31 @@ class ThoughtFlowMatcher(nn.Module):
         band_cos = F.cosine_similarity(z_pred_b, z_gt_b, dim=-1, eps=1e-6)
         band_cos_loss = 1.0 - band_cos.mean()
 
-        global_cos = F.cosine_similarity(zp, zt, dim=-1, eps=1e-6)
+        u_pred_b = z_pred_b / r_pred.unsqueeze(-1)
+        u_gt_b = z_gt_b / r_gt.unsqueeze(-1)
+        zp_iso = from_bands(u_pred_b * r_gt.detach().unsqueeze(-1))
+        global_cos = F.cosine_similarity(zp_iso, zt, dim=-1, eps=1e-6)
         global_cos_loss = 1.0 - global_cos.mean()
 
-        total_polar = band_norm_loss + band_cos_loss + 0.5 * global_cos_loss
+        if self.d_sub > 1:
+            # PCA Channel 0 (`d=0` across all `nb` bands) is the physical clause-length / <PAD> envelope
+            # (`z_std` up to 6.381 vs ~0.10 on channels 1..31). Supervise its within-band normalized coordinate
+            # `u_pred_b[..., 0]` (`z_pred_b[..., 0] / r_pred`) so Channel 0 gets dedicated sign + energy-share
+            # alignment without any cross-band radial shrinkage on `r_pred` (`d/dr_k u_pred_b == 0`!).
+            u_pred_0 = u_pred_b[..., 0]  # (..., nb)
+            u_gt_0 = u_gt_b[..., 0]      # (..., nb)
+            c0_dir_mse = F.mse_loss(u_pred_0, u_gt_0)
+            c0_cos_loss = 1.0 - F.cosine_similarity(u_pred_0, u_gt_0, dim=-1, eps=1e-6).mean()
+            chan0_loss = 0.5 * c0_dir_mse + 0.5 * c0_cos_loss
+        else:
+            chan0_loss = band_norm_loss * 0.0
+
+        total_polar = band_norm_loss + band_cos_loss + 0.5 * global_cos_loss + 0.5 * chan0_loss
         return total_polar, {
             "band_norm_loss": band_norm_loss.detach(),
             "band_cos_loss": band_cos_loss.detach(),
             "global_cos_loss": global_cos_loss.detach(),
+            "chan0_loss": chan0_loss.detach(),
         }
 
     def compute_spatial_slot_loss(
@@ -595,12 +612,21 @@ class ThoughtFlowMatcher(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Computes inverse-Legendre spatial slot cosine alignment (`slot_cos_loss`), per-slot RMS
-        envelope matching (`slot_norm_loss`), and polar adjacent-slot first-difference transition
+        envelope matching (`slot_norm_loss`), radially-decoupled Channel-0 character-vs-<PAD> step
+        envelope alignment (`env_slot_loss`), and polar adjacent-slot first-difference transition
         alignment (`slot_diff_loss` with step-size norm matching + anti-stagnation hinge) to lock
-        cross-band phases on interior character slots (`l = 4..25`) without shrinking step sizes.
+        cross-band phases on interior character slots (`l = 4..25`) and exact clause termination length.
         """
-        x_pred = self.reconstruct_spatial_slots(z_pred_norm)  # (..., L, d_sub)
-        x_gt = self.reconstruct_spatial_slots(z_target_norm)  # (..., L, d_sub)
+        nb = self.num_bands
+        zp_b = to_bands(z_pred_norm.float(), nb)
+        zt_b = to_bands(z_target_norm.float(), nb)
+        rp = (zp_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+        rt = (zt_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt().detach()
+        z_pred_iso = from_bands((zp_b / rp) * rt)
+
+        x_pred = self.reconstruct_spatial_slots(z_pred_norm)      # (..., L, d_sub)
+        x_pred_iso = self.reconstruct_spatial_slots(z_pred_iso)   # (..., L, d_sub) radially decoupled (`d/dr_k == 0`)
+        x_gt = self.reconstruct_spatial_slots(z_target_norm)      # (..., L, d_sub)
 
         slot_rms_pred = (x_pred.pow(2).mean(dim=-1) + 1e-6).sqrt()  # (..., L)
         slot_rms_gt = (x_gt.pow(2).mean(dim=-1) + 1e-6).sqrt()      # (..., L)
@@ -612,20 +638,26 @@ class ThoughtFlowMatcher(nn.Module):
             active_mask = torch.ones_like(slot_norm_gt)
 
         if self.d_sub > 1:
-            lex_cos = F.cosine_similarity(x_pred[..., 1:], x_gt[..., 1:], dim=-1, eps=1e-6)
-            full_cos = F.cosine_similarity(x_pred, x_gt, dim=-1, eps=1e-6)
+            lex_cos = F.cosine_similarity(x_pred_iso[..., 1:], x_gt[..., 1:], dim=-1, eps=1e-6)
+            full_cos = F.cosine_similarity(x_pred_iso, x_gt, dim=-1, eps=1e-6)
             slot_cos = 0.75 * lex_cos + 0.25 * full_cos
+            # Radially-decoupled 32-slot spatial Character-vs-<PAD> envelope supervision (Channel 0):
+            env_pred = x_pred_iso[..., 0]  # (..., L)
+            env_gt = x_gt[..., 0]          # (..., L)
+            env_slot_loss = 1.0 - F.cosine_similarity(env_pred, env_gt, dim=-1, eps=1e-6).mean()
         else:
-            slot_cos = F.cosine_similarity(x_pred, x_gt, dim=-1, eps=1e-6)
+            slot_cos = F.cosine_similarity(x_pred_iso, x_gt, dim=-1, eps=1e-6)
+            env_slot_loss = slot_norm_loss * 0.0
         slot_cos_loss = ((1.0 - slot_cos) * active_mask).sum() / active_mask.sum().clamp(min=1.0)
 
-        dx_pred = x_pred[..., 1:, :] - x_pred[..., :-1, :]  # (..., L-1, d_sub)
-        dx_gt = x_gt[..., 1:, :] - x_gt[..., :-1, :]        # (..., L-1, d_sub)
+        dx_pred = x_pred[..., 1:, :] - x_pred[..., :-1, :]          # (..., L-1, d_sub)
+        dx_pred_iso = x_pred_iso[..., 1:, :] - x_pred_iso[..., :-1, :]  # (..., L-1, d_sub)
+        dx_gt = x_gt[..., 1:, :] - x_gt[..., :-1, :]                # (..., L-1, d_sub)
         dx_norm_gt = dx_gt.norm(dim=-1)
         trans_mask = (dx_norm_gt > 0.15).float()
         if trans_mask.sum().item() < 1.0:
             trans_mask = torch.ones_like(dx_norm_gt)
-        trans_cos = F.cosine_similarity(dx_pred, dx_gt, dim=-1, eps=1e-6)
+        trans_cos = F.cosine_similarity(dx_pred_iso, dx_gt, dim=-1, eps=1e-6)
         slot_diff_cos_loss = ((1.0 - trans_cos) * trans_mask).sum() / trans_mask.sum().clamp(min=1.0)
 
         dx_rms_pred = (dx_pred.pow(2).mean(dim=-1) + 1e-6).sqrt()  # (..., L-1)
@@ -634,13 +666,14 @@ class ThoughtFlowMatcher(nn.Module):
         anti_stag = (F.relu(0.85 * dx_rms_gt - dx_rms_pred).pow(2) * trans_mask).sum() / trans_mask.sum().clamp(min=1.0)
         slot_diff_loss = slot_diff_cos_loss + 0.5 * slot_diff_norm_loss + 0.5 * anti_stag
 
-        total_slot_loss = slot_cos_loss + 0.25 * slot_norm_loss + slot_diff_loss
+        total_slot_loss = slot_cos_loss + 0.25 * slot_norm_loss + slot_diff_loss + 0.5 * env_slot_loss
         return total_slot_loss, {
             "slot_cos_loss": slot_cos_loss.detach(),
             "slot_norm_loss": slot_norm_loss.detach(),
             "slot_diff_loss": slot_diff_loss.detach(),
             "slot_diff_norm_loss": slot_diff_norm_loss.detach(),
             "anti_stag_loss": anti_stag.detach(),
+            "env_slot_loss": env_slot_loss.detach(),
         }
 
     def forward(self, z_tau: torch.Tensor, tau: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
@@ -765,7 +798,14 @@ class ThoughtFlowMatcher(nn.Module):
             dx1_slots = x1_slots[..., 1:, :] - x1_slots[..., :-1, :]
             dz1_slots = z1_slots[..., 1:, :] - z1_slots[..., :-1, :]
             trans_err = (dx1_slots - dz1_slots).pow(2).mean(dim=(-1, -2))  # (K, N)
-            err = 0.5 * spec_err + (1.0 - band_cos_k) + 0.5 * band_norm_err + 0.5 * trans_err
+            env_cos_k = F.cosine_similarity(x1_slots[..., 0], z1_slots[..., 0], dim=-1, eps=1e-6)  # (K, N)
+            err = (
+                0.5 * spec_err
+                + (1.0 - band_cos_k)
+                + 0.5 * band_norm_err
+                + 0.5 * trans_err
+                + 0.5 * (1.0 - env_cos_k)
+            )
             k_star = err.argmin(dim=0)  # (N,)
         rows = torch.arange(N, device=device)
         x1_win = x1[k_star, rows]  # (N, D)
@@ -939,10 +979,15 @@ class ThoughtFlowMatcher(nn.Module):
         z = self._euler_integrate(z0, cond_2d, steps)
 
         if renorm:
-            z = z / z.std(dim=-1, keepdim=True).clamp(min=1e-5)
+            # Gentle whitened RMS safety clamp only (`[0.35, 2.5]`): preserves the learned per-clause and
+            # per-band whitened radii while guarding against extreme runaway trajectories.
+            # NEVER divide `z_out = self.denormalize(z)` by `z_out.std(dim=-1)`: `self.denormalize(z)` is
+            # already in the exact physical `z_clause` scale of `HiPPOOracleCUDA` / `LeftBrainCrystallizer`,
+            # where medium-length clauses naturally have `z_gt.std(dim=-1) ~ 0.55`; dividing `z_out` by its
+            # std multiplies `self.z_mean` (<PAD> offset on PCA Channel 0) by ~1.8x and truncates clauses!
+            z_rms = (z.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+            z = z * (z_rms.clamp(min=0.35, max=2.5) / z_rms)
         z_out = self.denormalize(z)
-        if renorm:
-            z_out = z_out / z_out.std(dim=-1, keepdim=True).clamp(min=1e-5)
         z_out = z_out.to(dtype=cond.dtype)
         if len(orig_shape) == 3:
             z_out = z_out.reshape(orig_shape)
@@ -1196,9 +1241,15 @@ class CausalContextLookback(nn.Module):
         attn_copy = (one_hot - probs_norm.detach() + probs_norm) * vm_col * has_prev
         z_copy_unit = torch.bmm(attn_copy, z_in.float())  # (B, T, D)
 
+        # Pairwise Top-1 vs Sink copy confidence: compares the winning context clause `peak_idx` directly
+        # against the Sink (no-copy) logit so the presence of 15-18 other context clauses in the denominator
+        # never dilutes `attn_peak` / `gate_lb` (fixes `qa#383582 c2` and `qa#405886 c1` gate dilution).
+        max_clause_logit = clause_logits_with_sink[..., :T].amax(dim=-1, keepdim=True)  # (B, T, 1)
+        sink_clause_logit = clause_logits_with_sink[..., T:]                           # (B, T, 1)
+        attn_peak = torch.sigmoid(max_clause_logit - sink_clause_logit) * vm_col * has_prev
+
         out_heads = torch.matmul(attn, V.to(dtype=attn.dtype))  # (B, H, T, dh)
         out_feat = self.out_proj(out_heads.transpose(1, 2).contiguous().view(B, T, D).to(dtype=h0.dtype)).float()
-        attn_peak = attn_clause.amax(dim=-1, keepdim=True) * vm_col * has_prev
         out_h = (attn_peak * z_copy_unit + out_feat) * vm_col
         out_lb = (z_copy_unit + out_feat) * vm_col * has_prev
 
@@ -1713,7 +1764,7 @@ class MultiStreamRightBrain(nn.Module):
         return out
 
     def predict_prior(self, ctx: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies `prior_head` + polar-band pointer-generator `z_lookback` interpolation -> (mu (…,D), sigma_band (…,nb)), float32."""
+        """Applies `prior_head` + decoupled Channel-0 / Lexical polar-band pointer-generator `z_lookback` interpolation -> (mu (…,D), sigma_band (…,nb)), float32."""
         mu_head, sigma = self.prior_head(ctx["h0"], ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"])
         ctx["mu_head"] = mu_head
         z_lb = ctx.get("z_lookback")
@@ -1722,13 +1773,37 @@ class MultiStreamRightBrain(nn.Module):
             gf = g_lb.float().unsqueeze(-1)  # (..., 1, 1)
             mh_b = to_bands(mu_head.float(), self.num_bands)  # (..., nb, d_sub)
             lb_b = to_bands(z_lb.float(), self.num_bands)     # (..., nb, d_sub)
-            r_mh = (mh_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
-            r_lb = (lb_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
-            u_mh = mh_b / r_mh
-            u_lb = lb_b / r_lb
-            r_blend = (1.0 - gf) * r_mh + gf * r_lb
-            u_blend = F.normalize((1.0 - gf) * u_mh + gf * u_lb, dim=-1, eps=1e-6) * math.sqrt(self.d_sub)
-            mu = from_bands(u_blend * r_blend)
+            if self.d_sub > 1:
+                # Decouple PCA Channel 0 (`[..., :1]`, the 32-band clause-length / <PAD> envelope spectrum)
+                # from Channels 1..31 (`[..., 1:]`, the 31 lexical channels per band) so lexical angle
+                # differences never cross-contaminate or rescale Channel 0's physical length envelope.
+                mh_0, lb_0 = mh_b[..., :1], lb_b[..., :1]  # (..., nb, 1)
+                r_mh_0 = (mh_0.pow(2).mean(dim=-2, keepdim=True) + 1e-6).sqrt()
+                r_lb_0 = (lb_0.pow(2).mean(dim=-2, keepdim=True) + 1e-6).sqrt()
+                u_mh_0 = mh_0 / r_mh_0
+                u_lb_0 = lb_0 / r_lb_0
+                r_blend_0 = (1.0 - gf) * r_mh_0 + gf * r_lb_0
+                u_blend_0 = F.normalize((1.0 - gf) * u_mh_0 + gf * u_lb_0, dim=-2, eps=1e-6) * math.sqrt(self.num_bands)
+                mu_b_0 = u_blend_0 * r_blend_0  # (..., nb, 1)
+
+                mh_lex, lb_lex = mh_b[..., 1:], lb_b[..., 1:]  # (..., nb, d_sub - 1)
+                r_mh_lex = (mh_lex.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+                r_lb_lex = (lb_lex.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+                u_mh_lex = mh_lex / r_mh_lex
+                u_lb_lex = lb_lex / r_lb_lex
+                r_blend_lex = (1.0 - gf) * r_mh_lex + gf * r_lb_lex
+                u_blend_lex = F.normalize((1.0 - gf) * u_mh_lex + gf * u_lb_lex, dim=-1, eps=1e-6) * math.sqrt(self.d_sub - 1)
+                mu_b_lex = u_blend_lex * r_blend_lex  # (..., nb, d_sub - 1)
+
+                mu = from_bands(torch.cat([mu_b_0, mu_b_lex], dim=-1))
+            else:
+                r_mh = (mh_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+                r_lb = (lb_b.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+                u_mh = mh_b / r_mh
+                u_lb = lb_b / r_lb
+                r_blend = (1.0 - gf) * r_mh + gf * r_lb
+                u_blend = F.normalize((1.0 - gf) * u_mh + gf * u_lb, dim=-1, eps=1e-6) * math.sqrt(self.d_sub)
+                mu = from_bands(u_blend * r_blend)
         elif z_lb is not None:
             mu = mu_head + z_lb.float()
         else:
@@ -1984,8 +2059,9 @@ class MultiStreamRightBrain(nn.Module):
             z_knowledge_seq=z_knowledge_seq, z_goal_seq=z_goal_seq,
         )
         mu, sigma = self.predict_prior(ctx)
+        eff_temp = min(float(temperature), 0.35)
         z_hat = self.flow_matcher.sample(
-            ctx["h"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=temperature, renorm=renorm,
+            ctx["h"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=eff_temp, renorm=renorm,
         )
         return z_hat.to(dtype=z_in.dtype)
 
@@ -2099,7 +2175,11 @@ class MultiStreamRightBrain(nn.Module):
             discourse_seq, aux, aux_valid, active_streams=active_streams,
             z_knowledge_seq=knowledge_seq, z_goal_seq=goal_seq,
         )
-        last = {k: v[:, -1] for k, v in ctx.items() if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum")}
+        last = {
+            k: v[:, -1]
+            for k, v in ctx.items()
+            if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb") and v is not None
+        }
         mu, sigma = self.predict_prior(last)
         z_thought = self.flow_matcher.sample(last["h"], mu=mu, sigma_band=sigma, steps=steps, temperature=temperature)
         return z_thought, last["h"]
