@@ -1,6 +1,6 @@
 """
 =====================================================================================================
-Phase 5 · Stage-1 Single-Stream Clause Dataset (+ Knowledge-Selector Pseudo Labels)   [#032]
+Phase 5 · Stage-1 Single-Stream Clause Dataset (+ Knowledge-Selector Pseudo Labels)   [#032 / #043]
 =====================================================================================================
 Purpose:
   - Builds ONE main clause stream per sample for the Stage-1 single-stream right brain:
@@ -67,6 +67,21 @@ _ASSISTANT_ROLES = ("assistant", "bot", "gpt", "model")
 
 _DIGIT_RUN_RE = re.compile(r"\d+")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+# Interrogative / instruction markers stripped from the tail of QA prefixes when deriving continuation docs (#043).
+_QA_TAIL_MARKERS = (
+    "请问",
+    "为什么",
+    "如何",
+    "什么",
+    "哪",
+    "根据上述",
+    "回答以下",
+    "问题：",
+    "问题:",
+    "提问：",
+    "提问:",
+)
 
 # Entries of ctx_rel below this value are zeroed to keep labels sparse.
 _REL_SPARSE_FLOOR = 0.15
@@ -179,9 +194,12 @@ class ClauseStreamDataset(Dataset):
         # Continuation doc: {"clauses": [str], "domain": str}
         self.cont_docs: List[Dict[str, Any]] = []
         self.used_fallback = False
+        self.cont_from_qa_fallback = False
 
         self._load_qa(qa_paths)
         self._load_cont(cont_paths)
+        if not self.cont_docs and self.cont_ratio > 0.0 and self.qa_records:
+            self._populate_cont_from_qa()
         if not self.qa_records and not self.cont_docs:
             self._load_builtin_fallback(qa_paths, cont_paths)
 
@@ -391,6 +409,80 @@ class ClauseStreamDataset(Dataset):
                         self._add_cont_doc(val, domain=dom)
                         break
 
+    # =================================================================================================
+    # [Feature Addition & Bug Fix - Task #043: Rolling Continuation Stream Fallback from QA Passages]
+    # 1. Problem fixed:
+    #    When `--cont_paths` is empty (default in `train_phase5_right_brain_stage1.py`) and the dataset
+    #    consists solely of QA records (e.g. `omni_knowledge_corpus.jsonl`), `self.cont_docs` was empty
+    #    and `self.eff_cont_ratio` collapsed to `0.0` (`samples qa/cont = 320/0`), disabling both:
+    #      (a) 30% rolling window continuation training (`source_id == 1`) on Mamba's main stream;
+    #      (b) `bench_cont=3` benchmark items and the `📉 σ vs context length` diagnostic curve in eval.
+    # 2. Method used:
+    #    `_populate_cont_from_qa` derives multi-clause continuation documents from `self.qa_records`
+    #    whenever `not self.cont_docs and self.cont_ratio > 0.0 and self.qa_records`:
+    #      (a) Extracts contiguous narrative passages from `rec["prefix"]` after stripping leading
+    #          short colon-header clauses (e.g. `"叙事片段："`, `"背景资料："`, `"阅读材料："`) and trailing
+    #          question/instruction clauses (`"？"`, `"?"`, `"为什么"`, `"请问"`, `"如何"`, etc.).
+    #          If the original prefix did not end with a question and `len(rec["answer"]) >= 3`,
+    #          appends `rec["answer"]` to form a full continuation sequence.
+    #      (b) Otherwise, if `rec["answer"]` itself is a long explanatory passage (`>= self.min_cont_clauses`),
+    #          uses `rec["answer"]` as a continuation document.
+    # 3. Caveats for subsequent development:
+    #    - Only triggered when `cont_paths` yields 0 documents and `cont_ratio > 0.0`.
+    #    - Continuation items always keep `stop_valid` all False (window boundaries are not true stops).
+    # =================================================================================================
+    @staticmethod
+    def _is_trailing_question_or_prompt(clause: str) -> bool:
+        s = clause.strip()
+        if not s:
+            return True
+        if s.endswith(("？", "?")):
+            return True
+        if len(s) <= 8 and s.endswith(("：", ":")):
+            return True
+        return any(m in s for m in _QA_TAIL_MARKERS)
+
+    def _populate_cont_from_qa(self) -> int:
+        min_ctx_body = max(6, self.min_cont_clauses - 2)
+        for rec in self.qa_records:
+            if self.max_cont_docs and len(self.cont_docs) >= self.max_cont_docs:
+                break
+            prefix = list(rec.get("prefix") or [])
+            answer = list(rec.get("answer") or [])
+            domain = str(rec.get("domain", "continuation") or "continuation")
+
+            orig_ended_with_question = bool(prefix) and self._is_trailing_question_or_prompt(prefix[-1])
+            ctx_body = list(prefix)
+
+            # Strip leading short colon-header clauses (e.g. "叙事片段：", "背景资料：", "阅读材料：")
+            while ctx_body and len(ctx_body[0].strip()) <= 8 and ctx_body[0].strip().endswith(("：", ":")):
+                ctx_body.pop(0)
+            if ctx_body:
+                m_hdr = re.match(r"^([^，,。！？；：:\s]{1,7}[：:])\s*(.+)$", ctx_body[0].strip())
+                if m_hdr and len(m_hdr.group(1)) <= 8 and len(m_hdr.group(2).strip()) >= self.min_q_clause_chars:
+                    ctx_body[0] = m_hdr.group(2).strip()
+
+            # Strip trailing question/instruction clauses at the end of prefix
+            while ctx_body and self._is_trailing_question_or_prompt(ctx_body[-1]):
+                ctx_body.pop()
+                orig_ended_with_question = True
+
+            if len(ctx_body) >= min_ctx_body:
+                if len(answer) >= 3 and not orig_ended_with_question:
+                    ctx_body.extend(answer)
+                self.cont_docs.append({"clauses": list(ctx_body), "domain": domain})
+            elif len(answer) >= self.min_cont_clauses:
+                self.cont_docs.append({"clauses": list(answer), "domain": domain})
+
+        if self.cont_docs:
+            self.cont_from_qa_fallback = True
+            if self.verbose:
+                print(
+                    f"📖 [ClauseStream] derived {len(self.cont_docs)} continuation documents "
+                    f"from multi-clause QA passages (cont_ratio={self.cont_ratio:.2f})."
+                )
+        return len(self.cont_docs)
+
     def _load_builtin_fallback(self, qa_paths, cont_paths):
         print(
             f"⚠️ Warning: [ClauseStream] no QA ('{qa_paths}') or continuation ('{cont_paths}') data found; "
@@ -555,7 +647,8 @@ class ClauseStreamDataset(Dataset):
         n = len(doc["clauses"])
         W = min(self.max_clauses, n)
         start = rng.randint(0, n - W)
-        k = rng.randint(self.cont_min_context, self.cont_max_context)
+        max_k = max(self.cont_min_context, min(self.cont_max_context, W - 4))
+        k = rng.randint(self.cont_min_context, max_k)
         k = max(1, min(k, W - 1))
         return doc["clauses"][start:start + W], k, doc["domain"]
 
@@ -684,6 +777,7 @@ class ClauseStreamDataset(Dataset):
             f">={self.rel_threshold}={s['mean_rel_ctx_rows_ge_thr']:.2f} | "
             f"IDF docs={s['idf_docs']} rare-bigram thr={s['rare_bigram_idf_threshold']:.3f} "
             f"(q={self.rel_min_idf_quantile}, unseen idf={self.idf_default:.3f})"
+            + (" [QA->CONT FALLBACK]" if self.cont_from_qa_fallback else "")
             + (" [BUILTIN FALLBACK]" if self.used_fallback else "")
         )
         bigrams = [(k, v) for k, v in self.idf.items() if k not in self._atomic_keys]
