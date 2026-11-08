@@ -2001,7 +2001,14 @@ class MultiStreamRightBrain(nn.Module):
             if key not in state_dict:
                 if own_sd is None:
                     own_sd = self.state_dict()
-                state_dict[key] = own_sd[f"context_lookback.{name}"].detach().clone()
+                own_key = f"context_lookback.{name}"
+                # [Bug Fix - Task #045] Skip non-persistent buffers (e.g. v3 `legendre_basis`, registered with
+                # `persistent=False`): they never appear in any state_dict, so looking them up raised
+                # `KeyError` and made `find_compatible_ckpt` treat every v3 checkpoint as incompatible
+                # (silent restart from step 0 under `--continue`).
+                if own_key not in own_sd:
+                    continue
+                state_dict[key] = own_sd[own_key].detach().clone()
                 filled += 1
         self._upgraded_context_lookback = filled > 0
         if filled > 0:
