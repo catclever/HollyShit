@@ -249,6 +249,8 @@ def train():
     parser.add_argument("--attractor_prob", type=float, default=0.90, help="Probability of enabling k_attractors during Phase 4 training (default 0.90)")
     parser.add_argument("--pad_loss_weight", type=float, default=0.05, help="Relative weight for <PAD> tokens in flow matching MSE loss")
     parser.add_argument("--num_subbands", type=int, default=32, help="Number of Legendre harmonic modes K in Z_clause (default 32 for full-rank L=32)")
+    parser.add_argument("--cavity_prob", type=float, default=0.70, help="Probability of corrupting Z_clause with spectral coarsening / multi-clause cavity mix (default 0.70)")
+    parser.add_argument("--ce_weight", type=float, default=0.35, help="Weight for frozen translator token cross-entropy loss (default 0.35)")
     parser.set_defaults(
         seq_len=32,
         warmup_steps=500,
@@ -347,8 +349,10 @@ def train():
     hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=args.num_subbands).to(device)
     hippo_oracle.eval()
 
-    # 5. Stateless Universal Left Brain Crystallizer (`LeftBrainCrystallizer` / `FlowMatching1DUnet` 025)
+    # 5. Stateless Universal Left Brain Crystallizer v2 (`LeftBrainCrystallizer` / `FlowMatching1DUnet` #025 / #050)
     unet = LeftBrainCrystallizer(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=args.num_subbands).to(device)
+    if translator is not None:
+        unet.bind_translator_codebook(translator)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
 
     max_steps = max(1, args.epochs * len(dataloader))
@@ -473,6 +477,10 @@ def train():
                     prompt_mask=prompt_mask,
                     pad_loss_weight=args.pad_loss_weight,
                     return_metrics=True,
+                    translator=translator,
+                    w_target=w_tgt,
+                    cavity_prob=args.cavity_prob,
+                    ce_weight=args.ce_weight,
                 )
                 loss_scaled = loss / args.accum_steps
 
@@ -500,9 +508,12 @@ def train():
                 scale_factor = 1.0 / unet.manifold_std.item()
                 print(
                     f"Epoch {epoch+1} | Step {global_step} | "
-                    f"Loss: {loss.item():.4f} (Vel: {metrics['loss_vel'].item():.4f}, Cos: {metrics['loss_cos'].item():.4f}) | "
+                    f"Loss: {loss.item():.4f} (Vel: {metrics['loss_vel'].item():.4f}, "
+                    f"Slot32: {metrics['loss_slot32'].item():.4f}, "
+                    f"CE: {metrics['loss_ce'].item():.4f}, "
+                    f"Cos: {metrics['loss_cos'].item():.4f}) | "
                     f"Z_clause Std: {metrics['z_sent_std'].item():.3f} | "
-                    f"Attractor Prob: {p_attractor:.2f} | Scale: {scale_factor:.2f}x"
+                    f"Attractor Prob: {p_attractor:.2f} | Cavity Prob: {args.cavity_prob:.2f} | Scale: {scale_factor:.2f}x"
                 )
 
             # Upgraded cross-domain evaluation: 1 representative sample per domain (up to 8 domains)
@@ -514,42 +525,78 @@ def train():
                         f"🔮 [Step {global_step}] 2D Punctuation-Clause Cross-Domain Euler ODE Evaluation "
                         f"({len(eval_benchmark_samples)} domains, {args.euler_steps} steps)"
                     )
-                    for s_idx, (dom_name, ds_idx) in enumerate(eval_benchmark_samples):
+                    # Pre-collect benchmark Z_clause vectors so we can form deterministic multi-clause cavity distractors
+                    bench_entries = []
+                    for dom_name, ds_idx in eval_benchmark_samples:
                         item_data = dataset[ds_idx]
                         if len(item_data) == 2:
                             w_p_s, w_t_s = item_data
                         else:
                             w_p_s, w_t_s = item_data[0], item_data[-1]
-
                         w_p_s = w_p_s.unsqueeze(0).to(device)
                         w_t_s = w_t_s.unsqueeze(0).to(device)
                         tgt_valid_mask = (w_t_s != tokenizer.pad_token_id)
                         p_valid_mask = (w_p_s != tokenizer.pad_token_id)
-
                         p_sample = encode_tokens(encoder, w_p_s)
                         tgt_sample = encode_tokens(encoder, w_t_s)
                         tgt_sample_norm = unet.normalize(tgt_sample)
-
                         z_sent = hippo_oracle(
                             tgt_sample_norm,
                             return_sequence=False,
                             valid_mask=tgt_valid_mask,
                             subspace_proj=unet.subspace_proj,
                         )
+                        bench_entries.append(
+                            (dom_name, ds_idx, w_p_s, w_t_s, tgt_valid_mask, p_valid_mask, p_sample, tgt_sample, z_sent)
+                        )
+
+                    z_bench_all = torch.cat([e[8] for e in bench_entries], dim=0)  # (N_bench, 1024)
+                    n_bench = z_bench_all.shape[0]
+
+                    for s_idx, (
+                        dom_name,
+                        ds_idx,
+                        w_p_s,
+                        w_t_s,
+                        tgt_valid_mask,
+                        p_valid_mask,
+                        p_sample,
+                        tgt_sample,
+                        z_sent,
+                    ) in enumerate(bench_entries):
+                        # Build Cavity/Low-Freq (alpha=0.40 & k=0..5) corrupted Z_clause alongside Exact Z_clause
+                        if n_bench > 1:
+                            other_mask = [i for i in range(n_bench) if i != s_idx][:4]
+                            z_dist_mean = z_bench_all[other_mask].mean(dim=0, keepdim=True)
+                        else:
+                            z_dist_mean = torch.zeros_like(z_sent)
+                        z_cav = 0.40 * z_sent + 0.60 * z_dist_mean
+                        z_cav = z_cav / z_cav.float().std(dim=-1, keepdim=True).clamp(min=1e-5).to(z_cav.dtype)
+
+                        z_lowf_sub = z_sent.view(1, args.num_subbands, -1).clone()
+                        z_lowf_sub[:, 6:, :] = 0.0
+                        z_lowf = z_lowf_sub.reshape(1, -1)
+                        z_lowf = z_lowf / z_lowf.float().std(dim=-1, keepdim=True).clamp(min=1e-5).to(z_lowf.dtype)
+
+                        z_eval_3 = torch.cat([z_sent, z_cav, z_lowf], dim=0)  # (3, 1024)
+                        p_sample_3 = p_sample.expand(3, -1, -1)
+                        p_mask_3 = p_valid_mask.expand(3, -1)
 
                         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                            x_gen = sample_euler_ode(
+                            x_gen_3 = sample_euler_ode(
                                 unet=unet,
-                                x_prompt=p_sample,
-                                h_potential=z_sent,
+                                x_prompt=p_sample_3,
+                                h_potential=z_eval_3,
                                 steps=args.euler_steps,
                                 seq_len=args.seq_len,
-                                prompt_mask=p_valid_mask,
+                                prompt_mask=p_mask_3,
                                 device=device,
                             )
 
-                        gen_tokens = translator.decode_greedy(x_gen.float())[0].tolist()
-                        gen_text = decode_with_eos_marker(tokenizer, gen_tokens)
+                        pred_3 = translator.decode_greedy(x_gen_3.float())
+                        gen_text = decode_with_eos_marker(tokenizer, pred_3[0].tolist())
+                        cav_text = decode_with_eos_marker(tokenizer, pred_3[1].tolist())
+                        lowf_text = decode_with_eos_marker(tokenizer, pred_3[2].tolist())
 
                         ref_tokens = translator.decode_greedy(tgt_sample.float())[0].tolist()
                         ref_text = decode_with_eos_marker(tokenizer, ref_tokens)
@@ -560,7 +607,8 @@ def train():
                         print(f"--- [{dom_name}] Sample #{s_idx + 1} (idx={ds_idx}) ---")
                         print(f"Prompt + Knowledge (k_attractors): {prompt_text}")
                         print(f"Target Clause (len={valid_len}, Z_clause shape: {tuple(z_sent.shape)}): {ref_text}")
-                        print(f"Left-Brain Crystallized (from 1x1024 Z_clause + k_attractors): {gen_text}")
+                        print(f"Left-Brain Crystallized [Exact Z_clause]          : {gen_text}")
+                        print(f"Left-Brain Crystallized [Cavity/Low-Freq (α=0.40 & k=0..5)]: [α=0.40] {cav_text} | [k=0..5] {lowf_text}")
                     print("=" * 70 + "\n")
 
                 unet.train()

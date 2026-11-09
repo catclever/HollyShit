@@ -170,13 +170,13 @@ class Gated1DResBlock(nn.Module):
 
         self.adaLN1 = AdaLN(hidden_dim, cond_dim)
         self.attractor = OrthogonalAttractor(hidden_dim)
-        # Initialized to 0.1 so Step 0 gently engages k_attractors and opens smoothly via gradient descent
-        self.attractor_gate = nn.Parameter(torch.full((hidden_dim,), 0.1))
+        # Initialized to 0.25 so Step 0 actively engages k_attractors and opens smoothly via gradient descent
+        self.attractor_gate = nn.Parameter(torch.full((hidden_dim,), 0.25))
 
         # Upgrade B: Full-Clause Structural Self-Attention (32x32 global syntax & bracket weaver)
         self.struct_norm = nn.LayerNorm(hidden_dim)
         self.struct_attn = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
-        self.struct_gate = nn.Parameter(torch.zeros(hidden_dim))
+        self.struct_gate = nn.Parameter(torch.full((hidden_dim,), 0.15))
 
         padding = ((kernel_size - 1) * dilation) // 2
         self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=padding, dilation=dilation)
@@ -229,18 +229,262 @@ class Gated1DResBlock(nn.Module):
         return residual + x
 
 
+class CavitySpectralSlotRefiner(nn.Module):
+    """
+    Mean-Field Cavity Debiasing + High-Band Spectral Mode Completion + 32-D Spatial Slot Deblurring (#050):
+      1. Restores centered clause fluctuation amplitude (`target_fluct_std`) when multi-clause cavity
+         superposition shrinks orthogonal fluctuations around the common clause mean `z_mu`, while leaving
+         clean unit-shell clauses untouched (`is_cavity == 0`).
+      2. Synthesizes / rescales attenuated high Legendre bands (k >= 6) from low bands (k = 0..5) via
+         `spectral_mode_mlp`.
+      3. Applies contextual 1D slot deblurring (`slot_deblur_conv`) strictly inside the 32-D `subspace_proj`
+         coordinates to prevent 992-D nullspace overfitting (#049).
+    """
+
+    def __init__(self, hidden_dim: int = 1024, num_subbands: int = 32, seq_len: int = 32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_subbands = num_subbands
+        self.d_sub = hidden_dim // num_subbands
+        self.seq_len = seq_len
+
+        self.register_buffer("z_mu", torch.zeros(1, hidden_dim, dtype=torch.float32))
+        self.register_buffer("target_fluct_std", torch.tensor([[0.90]], dtype=torch.float32))
+        init_bands = torch.arange(1, num_subbands + 1, dtype=torch.float32).pow(-0.25)
+        init_bands = init_bands / init_bands.pow(2).mean().sqrt().clamp(min=1e-5)
+        self.register_buffer("band_rms", init_bands)
+        self.register_buffer("slot_mu", torch.zeros(1, seq_len, self.d_sub, dtype=torch.float32))
+        self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
+
+        self.spectral_mode_mlp = nn.Sequential(
+            nn.Linear(num_subbands, num_subbands * 2),
+            nn.SiLU(),
+            nn.Linear(num_subbands * 2, num_subbands),
+        )
+        nn.init.normal_(self.spectral_mode_mlp[0].weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.spectral_mode_mlp[0].bias)
+        nn.init.normal_(self.spectral_mode_mlp[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.spectral_mode_mlp[-1].bias)
+
+        self.slot_deblur_conv = nn.Sequential(
+            nn.Conv1d(self.d_sub * 2, self.d_sub * 4, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Conv1d(self.d_sub * 4, self.d_sub * 4, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Conv1d(self.d_sub * 4, self.d_sub, kernel_size=3, padding=1),
+        )
+        nn.init.normal_(self.slot_deblur_conv[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.slot_deblur_conv[-1].bias)
+
+    @torch.no_grad()
+    def update_stats(
+        self,
+        z_clean: torch.Tensor,
+        basis: torch.Tensor,
+        max_calib_steps: int = 100,
+        momentum: float = 0.05,
+    ) -> bool:
+        step = int(self.calib_steps.item())
+        if step >= max_calib_steps or z_clean.shape[0] < 2:
+            return False
+
+        zf = z_clean.detach().float()
+        B = zf.shape[0]
+        batch_z_mu = zf.mean(dim=0, keepdim=True)
+        proj = (zf * batch_z_mu).sum(dim=-1, keepdim=True) / (batch_z_mu.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+        fluct = zf - proj * batch_z_mu
+        batch_fluct_std = fluct.std(dim=-1).mean().clamp(min=0.20, max=0.995).view(1, 1)
+
+        z_sub = zf.view(B, self.num_subbands, self.d_sub)
+        batch_band_rms = z_sub.pow(2).mean(dim=(0, 2)).sqrt().clamp(min=1e-5)
+
+        if basis.shape[1] == self.seq_len:
+            hw_32 = torch.einsum("bkd,kl->bld", z_sub, basis.float()) * math.sqrt(float(self.num_subbands))
+            batch_slot_mu = hw_32.mean(dim=0, keepdim=True)
+        else:
+            batch_slot_mu = self.slot_mu
+
+        if step == 0:
+            self.z_mu.copy_(batch_z_mu)
+            self.target_fluct_std.copy_(batch_fluct_std)
+            self.band_rms.copy_(batch_band_rms)
+            self.slot_mu.copy_(batch_slot_mu)
+        else:
+            self.z_mu.lerp_(batch_z_mu, momentum)
+            self.target_fluct_std.lerp_(batch_fluct_std, momentum)
+            self.band_rms.lerp_(batch_band_rms, momentum)
+            self.slot_mu.lerp_(batch_slot_mu, momentum)
+
+        self.calib_steps.add_(1)
+        return True
+
+    def forward(
+        self,
+        z_in: torch.Tensor,
+        basis: torch.Tensor,
+        subspace_proj: torch.Tensor,
+    ):
+        """
+        Args:
+            z_in: (B, D) input 2D clause vector
+            basis: (K, L) orthonormal Legendre basis
+            subspace_proj: (D, d_sub) principal character subspace projection
+        Returns:
+            z_ref: (B, D) refined 2D clause vector
+            h_wave_ref: (B, L, D) unpacked 1024-D wave in span(subspace_proj)
+            h_wave_32: (B, L, d_sub) deblurred 32-D slot trajectory
+            corrupt_strength: (B, 1) estimated cavity/spectral corruption level in [0, 1]
+        """
+        B, D = z_in.shape
+        K = self.num_subbands
+        d_sub = self.d_sub
+        L = basis.shape[1]
+
+        z_sub = z_in.view(B, K, d_sub)
+        band_energy = z_sub.pow(2).mean(dim=-1).sqrt()  # (B, K)
+        band_rms = self.band_rms.to(device=z_in.device, dtype=z_in.dtype).unsqueeze(0).clamp(min=1e-5)
+
+        hi_rms_in = band_energy[:, 6:].pow(2).mean(dim=-1, keepdim=True).sqrt()
+        hi_rms_ref = band_rms[:, 6:].pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-5)
+        hi_ratio = hi_rms_in / hi_rms_ref
+        hi_alive = torch.where(
+            hi_ratio >= 0.65,
+            torch.ones_like(hi_ratio),
+            (hi_ratio / 0.65).clamp(min=0.0, max=1.0),
+        )
+        per_band_gate = ((band_energy / band_rms) / 0.45).clamp(min=0.0, max=1.0)
+        active_band = torch.where(hi_ratio >= 0.65, (band_energy > 1e-3).to(z_in.dtype), per_band_gate)
+
+        # 1. Mean-Field Cavity Debiasing
+        t_std = self.target_fluct_std.to(device=z_in.device, dtype=z_in.dtype).clamp(min=0.20, max=0.995)
+        if self.z_mu.norm().item() > 1e-5:
+            z_mu = self.z_mu.to(device=z_in.device, dtype=z_in.dtype)
+        elif B >= 2:
+            bm = z_in.mean(dim=0, keepdim=True)
+            bm_unit = F.normalize(bm, dim=-1, eps=1e-6)
+            canon_mu_norm = math.sqrt(float(D)) * (1.0 - t_std.pow(2)).clamp(min=0.02).sqrt()
+            z_mu = bm_unit * canon_mu_norm
+        else:
+            z_mu = self.z_mu.to(device=z_in.device, dtype=z_in.dtype)
+
+        mu_norm_sq = z_mu.pow(2).sum(dim=-1, keepdim=True)
+        if mu_norm_sq.item() > 1e-5:
+            proj_c = (z_in * z_mu).sum(dim=-1, keepdim=True) / (mu_norm_sq + 1e-6)
+            z_fluct = z_in - proj_c * z_mu
+            fluct_std = z_fluct.std(dim=-1, keepdim=True).clamp(min=1e-5)
+            is_cavity = ((fluct_std < 0.96 * t_std) | (proj_c > 1.03)).to(dtype=z_in.dtype)
+            gain = (t_std / fluct_std).clamp(min=1.0, max=4.0)
+            z_deb_raw = z_mu + z_fluct * gain
+            z_deb_raw = z_deb_raw / z_deb_raw.std(dim=-1, keepdim=True).clamp(min=1e-5)
+            z_deb = is_cavity * z_deb_raw + (1.0 - is_cavity) * z_in
+            cavity_severity = is_cavity * (1.0 - (fluct_std / t_std).clamp(max=1.0))
+        else:
+            z_deb = z_in
+            cavity_severity = torch.zeros((B, 1), device=z_in.device, dtype=z_in.dtype)
+
+        # 2. High-Band Spectral Mode Completion (synthesizes attenuated k >= 6 from k = 0..5)
+        expected_e = (
+            (band_rms.pow(2) * active_band).sum(dim=-1, keepdim=True)
+            / band_rms.pow(2).sum().clamp(min=1e-5)
+        ).clamp(min=0.05, max=1.0)
+        z_trunc_scaled = z_sub * expected_e.sqrt().unsqueeze(-1)
+        mode_delta = self.spectral_mode_mlp(z_trunc_scaled.transpose(1, 2)).transpose(1, 2)
+        mode_gate = (1.0 - active_band).unsqueeze(-1)
+        if self.training:
+            mode_gate = mode_gate.clamp(min=0.05)
+        z_synth_modes = z_trunc_scaled + mode_gate * mode_delta
+        z_spec = z_synth_modes.reshape(B, D)
+        z_spec = z_spec / z_spec.std(dim=-1, keepdim=True).clamp(min=1e-5)
+
+        spec_mix = 1.0 - hi_alive
+        if self.training:
+            spec_mix = spec_mix.clamp(min=0.05)
+        z_ref = (1.0 - spec_mix) * z_deb + spec_mix * z_spec
+        z_ref = z_ref / z_ref.std(dim=-1, keepdim=True).clamp(min=1e-5)
+
+        corrupt_strength = torch.maximum(1.0 - hi_alive, cavity_severity).clamp(min=0.0, max=1.0)
+
+        # 3. 32-D Spatial Slot Unpacking & Deblurring
+        scale_k = math.sqrt(float(K))
+        x_low_eff = torch.einsum("bkd,kl->bld", z_ref.view(B, K, d_sub), basis) * scale_k
+        x_low_raw = torch.einsum("bkd,kl->bld", z_sub, basis) * scale_k
+        if self.slot_mu.shape[1] == L:
+            slot_mu = self.slot_mu.to(device=z_in.device, dtype=z_in.dtype)
+        else:
+            slot_mu = F.interpolate(
+                self.slot_mu.to(device=z_in.device, dtype=z_in.dtype).transpose(1, 2),
+                size=L,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+
+        deblur_in = torch.cat([x_low_eff, x_low_raw - slot_mu], dim=-1).transpose(1, 2)
+        deblur_delta = self.slot_deblur_conv(deblur_in).transpose(1, 2)
+        deblur_gate = corrupt_strength.unsqueeze(-1)
+        if self.training:
+            deblur_gate = deblur_gate.clamp(min=0.05)
+        h_wave_32 = x_low_eff + deblur_gate * deblur_delta
+        h_wave_ref = torch.matmul(h_wave_32, subspace_proj.T)
+        return z_ref, h_wave_ref, h_wave_32, corrupt_strength
+
+
+class SubspaceSlotGeneratorHead(nn.Module):
+    """
+    Orthogonally-Isolated 32-D Character Subspace Endpoint Generator (#049 / #050):
+    Operates strictly on 32-D principal subspace coordinates `[h_wave_32, x_normed_32, x_t_32]`
+    plus scalar timestep embedding `t_emb` so the 32-D character prediction cannot overfit to
+    992-D orthogonal nullspace noise.
+    """
+
+    def __init__(self, hidden_dim: int = 1024, d_sub: int = 32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.d_sub = d_sub
+        self.t_proj = nn.Linear(hidden_dim, d_sub)
+        nn.init.normal_(self.t_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.t_proj.bias)
+
+        self.conv_net = nn.Sequential(
+            nn.Conv1d(d_sub * 4, d_sub * 4, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(d_sub * 4, d_sub * 4, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(d_sub * 4, d_sub, kernel_size=3, padding=1),
+        )
+        nn.init.normal_(self.conv_net[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.conv_net[-1].bias)
+
+        self.res_linear = nn.Linear(d_sub * 3, d_sub)
+        nn.init.normal_(self.res_linear.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.res_linear.bias)
+
+    def forward(
+        self,
+        h_wave_32: torch.Tensor,
+        x_normed_32: torch.Tensor,
+        x_t_32: torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        t_32 = self.t_proj(t_emb).unsqueeze(1).expand_as(h_wave_32)
+        feat_4 = torch.cat([h_wave_32, x_normed_32, x_t_32, t_32], dim=-1)
+        conv_delta = self.conv_net(feat_4.transpose(1, 2)).transpose(1, 2)
+        lin_delta = self.res_linear(torch.cat([h_wave_32, x_normed_32, x_t_32], dim=-1))
+        return conv_delta + lin_delta
+
+
 class FlowMatching1DUnet(nn.Module):
     """
-    Stateless Universal Left-Brain Crystallizer (`LeftBrainCrystallizer` / `FlowMatching1DUnet` 025):
+    Stateless Universal Left-Brain Crystallizer v2 (`LeftBrainCrystallizer` / `FlowMatching1DUnet` #025 / #050):
     - Unpacks a 2D Punctuation-Clause Vector `h_potential: (B, 1024)` into a full-spectrum
-      32-mode Legendre trajectory `h_wave: (B, L, 1024)` over the 32-D principal manifold subspace.
-      With `seq_len = 32` (10-28 char punctuation clauses), K=32 uniform modes provide exact 1:1
-      full-rank character resolution (`P = B^T B = I_32`, 0.0000 neighbor bleed) across the clause.
-    - Combines:
-      1. `unpack_sentence_vector`: Full-rank Legendre wave unpacker;
-      2. `struct_attn` in `Gated1DResBlock`: 32x32 global clause syntax & bracket coordinator;
-      3. Span-aware `OrthogonalAttractor`: 3-gram context matching + diagonal span relay + Pauli exclusion.
-    - Includes built-in Adaptive Manifold Auto-Calibration (`manifold_mean`, `manifold_std`, `subspace_proj`).
+      32-mode Legendre trajectory `h_wave_ref: (B, L, 1024)` over the 32-D principal manifold subspace
+      via `CavitySpectralSlotRefiner` (mean-field cavity debiasing + high-band mode completion + 32-D slot deblur).
+    - Removes the legacy `x_1_hat = h_wave + ...` hard skip cheat and restores `x_t` with full `1.0` weight
+      as the primary ODE trajectory: `x = x_t + sigmoid(wave_in_gate) * h_wave_ref + 0.1 * pos_x`.
+    - Enforces the 992-D Nullspace Isolation Rule (#049):
+      * 32-D character subspace endpoint `x_1_hat_32` is generated strictly from 32-D features
+        `[h_wave_32, x_normed @ P, x_t @ P]` + `t_emb` via `slot_subspace_head` + gated `alpha_skip_32`;
+      * 992-D complement endpoint `x_1_hat_orth` projects out `P`: `raw_full - (raw_full @ P) @ P.T`;
+      * Combines `x_1_hat = x_1_hat_32 @ P.T + x_1_hat_orth` + optional frozen `Translator` codebook snap.
     """
     def __init__(
         self,
@@ -265,6 +509,13 @@ class FlowMatching1DUnet(nn.Module):
         self.register_buffer("ortho_mix", ortho_mix)
         self.register_buffer("subspace_proj", ortho_mix[:, : self.d_sub].contiguous())
 
+        # Cavity-Tolerant Spectral & 32-D Slot Refiner (#050)
+        self.cavity_refiner = CavitySpectralSlotRefiner(
+            hidden_dim=hidden_dim,
+            num_subbands=num_subbands,
+            seq_len=32,
+        )
+
         self.sent_wave_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
@@ -272,6 +523,9 @@ class FlowMatching1DUnet(nn.Module):
         )
         nn.init.normal_(self.sent_wave_proj[-1].weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.sent_wave_proj[-1].bias)
+
+        # Primary stream wave conditioning gate (x_t has full 1.0 weight)
+        self.wave_in_gate = nn.Parameter(torch.full((1, 1, hidden_dim), 0.85))
 
         self.blocks = nn.ModuleList([
             Gated1DResBlock(
@@ -283,11 +537,22 @@ class FlowMatching1DUnet(nn.Module):
         ])
 
         self.final_norm = AdaLN(hidden_dim, cond_dim)
-        # Full-rank 1024x1024 projection head for velocity residual output
+        # 992-D Orthogonal Complement projection head (32-D subspace component is projected out)
         self.final_proj = nn.Linear(hidden_dim, hidden_dim)
         with torch.no_grad():
             self.final_proj.weight.mul_(0.01)
             nn.init.zeros_(self.final_proj.bias)
+
+        # Dedicated 32-D Principal Subspace Generator Head + Gated 32-D Wave Skip (#049 / #050)
+        # sigmoid(0.75) ~= 0.679 matches canonical valid-span Parseval ratio at Step 0
+        self.alpha_skip_32 = nn.Parameter(torch.full((1, 1, self.d_sub), 0.75))
+        self.slot_subspace_head = SubspaceSlotGeneratorHead(hidden_dim=hidden_dim, d_sub=self.d_sub)
+
+        # Optional In-Flow Frozen Translator Codebook Langevin Snap parameters & non-persistent buffer
+        self.snap_temp = nn.Parameter(torch.tensor(0.18, dtype=torch.float32))
+        self.snap_step = nn.Parameter(torch.tensor(-0.80, dtype=torch.float32))
+        self.register_buffer("_char_codebook_norm", None, persistent=False)
+        self.__dict__["_bound_translator"] = None
 
         # In-Model Adaptive Manifold Auto-Calibration Buffers (persisted in unet.pt)
         self.register_buffer("manifold_mean", torch.tensor(0.0, dtype=torch.float32))
@@ -296,6 +561,128 @@ class FlowMatching1DUnet(nn.Module):
 
         self._pos_cache = {}
         self._basis_cache = {}
+
+    def upgrade_legacy_state_dict(self, state_dict: dict, prefix: str = "") -> dict:
+        """
+        Upgrades a legacy Phase-4 v1 `unet.pt` state_dict in-place so `load_state_dict(..., strict=True)`
+        succeeds seamlessly:
+          1. Pre-fills any missing v2 parameters/buffers (`cavity_refiner.*`, `slot_subspace_head.*`,
+             `wave_in_gate`, `alpha_skip_32`, `snap_temp`, `snap_step`) from current model defaults.
+          2. Wakes up dormant legacy `struct_gate` (< 0.13 -> 0.15) and `attractor_gate` (< 0.13 -> 0.25)
+             across all 6 blocks while preserving already-active gates (such as block 0's 0.981 attractor_gate).
+        """
+        is_legacy = f"{prefix}alpha_skip_32" not in state_dict
+        own_state = self.state_dict()
+        for k, v in own_state.items():
+            full_k = f"{prefix}{k}"
+            if full_k not in state_dict:
+                state_dict[full_k] = v.detach().clone()
+
+        if is_legacy:
+            for i in range(len(self.blocks)):
+                sg_key = f"{prefix}blocks.{i}.struct_gate"
+                if sg_key in state_dict:
+                    sg = state_dict[sg_key]
+                    if sg.float().abs().mean().item() < 0.13:
+                        sign = torch.where(sg >= 0, torch.ones_like(sg), -torch.ones_like(sg))
+                        state_dict[sg_key] = sign * sg.abs().clamp(min=0.15)
+                ag_key = f"{prefix}blocks.{i}.attractor_gate"
+                if ag_key in state_dict:
+                    ag = state_dict[ag_key]
+                    if ag.float().abs().mean().item() < 0.13:
+                        sign = torch.where(ag >= 0, torch.ones_like(ag), -torch.ones_like(ag))
+                        state_dict[ag_key] = sign * ag.abs().clamp(min=0.25)
+        return state_dict
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self.upgrade_legacy_state_dict(state_dict, prefix=prefix)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def bind_translator_codebook(self, translator: nn.Module = None) -> None:
+        """
+        Binds a frozen `ContinuousToTextTranslatorCUDA` (or raw `(V, D)` codebook tensor) for in-flow
+        character-manifold Langevin snapping without registering `translator` as a persistent submodule
+        in `unet.state_dict()`.
+        """
+        if translator is None:
+            self.__dict__["_bound_translator"] = None
+            self._char_codebook_norm = None
+            return
+
+        if isinstance(translator, torch.Tensor):
+            self.__dict__["_bound_translator"] = None
+            self._char_codebook_norm = F.normalize(translator.detach().float(), dim=-1).to(
+                device=self.subspace_proj.device
+            )
+        else:
+            self.__dict__["_bound_translator"] = translator
+            if hasattr(translator, "fc") and hasattr(translator.fc, "weight"):
+                w_norm = F.normalize(translator.fc.weight.detach().float(), dim=-1)
+                self._char_codebook_norm = w_norm.to(device=self.subspace_proj.device)
+
+    def apply_char_manifold_snap(
+        self,
+        x_1_raw: torch.Tensor,
+        corrupt_strength: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        When `_char_codebook_norm` is bound, performs a gated soft-argmax Langevin step toward
+        the frozen Translator's character prototypes `W_fc_norm`.
+        """
+        if self._char_codebook_norm is None:
+            return x_1_raw
+
+        cb = self._char_codebook_norm.to(device=x_1_raw.device, dtype=x_1_raw.dtype)
+        temp = self.snap_temp.to(device=x_1_raw.device, dtype=x_1_raw.dtype).clamp(min=0.05, max=0.50)
+        bound_trans = self.__dict__.get("_bound_translator", None)
+        if bound_trans is not None:
+            bound_trans = bound_trans.to(device=x_1_raw.device)
+            logits = bound_trans(self.denormalize(x_1_raw).float()).to(dtype=x_1_raw.dtype)
+            probs = F.softmax(logits / temp, dim=-1)
+        else:
+            x_u = F.normalize(x_1_raw, dim=-1, eps=1e-6)
+            probs = F.softmax(torch.matmul(x_u, cb.T) / temp, dim=-1)
+
+        char_dir = torch.matmul(probs, cb)
+        if corrupt_strength is not None:
+            cs_gate = 0.20 + 0.80 * corrupt_strength.unsqueeze(-1).to(dtype=x_1_raw.dtype)
+        else:
+            cs_gate = 0.35
+        step_sz = F.softplus(self.snap_step.to(device=x_1_raw.device, dtype=x_1_raw.dtype))
+        return x_1_raw + cs_gate * step_sz * char_dir
+
+    @torch.no_grad()
+    def calibrate_cavity_stats(
+        self,
+        z_clean: torch.Tensor,
+        seq_len: int = 32,
+        max_calib_steps: int = 100,
+        momentum: float = 0.05,
+    ) -> bool:
+        basis = self._get_legendre_basis(seq_len, z_clean.device, z_clean.dtype)
+        return self.cavity_refiner.update_stats(
+            z_clean,
+            basis=basis,
+            max_calib_steps=max_calib_steps,
+            momentum=momentum,
+        )
 
     def _get_legendre_basis(self, L: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -443,7 +830,7 @@ class FlowMatching1DUnet(nn.Module):
         std = self.manifold_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-5)
         return x * std + mean
 
-    def forward(
+    def predict_x1(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
@@ -452,29 +839,34 @@ class FlowMatching1DUnet(nn.Module):
         k_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Sign-Aligned Velocity Field Predictor for OT-CFM (`LeftBrainCrystallizer`):
-        - Unpacks 2D `z_sent` into full-spectrum 16-mode Legendre trajectory `h_wave` (`(B, L, D)`).
-        - Initializes internal stream `x = h_wave + 0.2 * x_t + 0.1 * pos_x` in the +x_1 manifold.
-        - Predicts velocity via endpoint prediction `x_1_hat = h_wave + self.final_proj(x_normed)`.
+        Predicts the denoised normalized endpoint `x_1_hat` (`(B, L, D)`) without the hard `h_wave` skip cheat:
+          1. Refines 2D `z_sent` via `self.cavity_refiner` into `z_ref`, `h_wave_ref`, and `h_wave_32`.
+          2. Runs `x = x_t + sigmoid(wave_in_gate) * h_wave_ref + 0.1 * pos_x` through all 6 `Gated1DResBlock`s.
+          3. Synthesizes 32-D character coordinates `x_1_hat_32` strictly from `[h_wave_32, x_normed @ P, x_t @ P]` + `t_emb`
+             and 992-D orthogonal complement `x_1_hat_orth` by projecting `P` out of `final_proj(x_normed)`.
+          4. Applies optional frozen-Translator character manifold Langevin snap when bound.
         """
         B, L, D = x_t.shape
         t_emb = self.t_embedder(t)
-
         pos_x = self._get_pos_emb(L, x_t.device, x_t.dtype)
+        P = self.subspace_proj.to(device=x_t.device, dtype=x_t.dtype)
 
         if h_potential.dim() == 2:
             h_pot = h_potential.to(device=x_t.device, dtype=x_t.dtype)
-            h_wave = self.unpack_sentence_vector(h_pot, L)
-            h_global = h_pot.unsqueeze(1).expand(B, L, D)
-            h_cond = h_wave + 0.5 * h_global + self.sent_wave_proj(
-                torch.cat([h_wave, h_global + pos_x], dim=-1)
+            basis = self._get_legendre_basis(L, x_t.device, x_t.dtype)
+            z_ref, h_wave_ref, h_wave_32, corrupt_strength = self.cavity_refiner(h_pot, basis, P)
+            h_global = z_ref.unsqueeze(1).expand(B, L, D)
+            h_cond = h_wave_ref + 0.5 * h_global + self.sent_wave_proj(
+                torch.cat([h_wave_ref, h_global + pos_x], dim=-1)
             )
         else:
-            h_wave = h_potential.to(device=x_t.device, dtype=x_t.dtype)
-            h_cond = h_wave
+            h_wave_ref = h_potential.to(device=x_t.device, dtype=x_t.dtype)
+            h_wave_32 = torch.matmul(h_wave_ref, P)
+            corrupt_strength = torch.zeros((B, 1), device=x_t.device, dtype=x_t.dtype)
+            h_cond = h_wave_ref
 
-        # Anchor internal residual stream in the +x_1 manifold so OrthogonalAttractor locks on at t=0
-        x = h_wave + 0.2 * x_t + 0.1 * pos_x
+        # Primary ODE trajectory x_t with full 1.0 weight + gated refined wave anchor
+        x = x_t + torch.sigmoid(self.wave_in_gate.to(dtype=x_t.dtype)) * h_wave_ref + 0.1 * pos_x
 
         k_pos = None
         if k_attractors is not None:
@@ -485,7 +877,41 @@ class FlowMatching1DUnet(nn.Module):
             x = block(x, t_emb, h_cond, k_attractors=k_pos, k_val=k_attractors, k_mask=k_mask)
 
         x_normed = self.final_norm(x, h_cond)
-        x_1_hat = h_wave + self.final_proj(x_normed)
+
+        # Orthogonally-Isolated 32-D Subspace Generator + 992-D Complement Projection (#049 / #050)
+        x_normed_32 = torch.matmul(x_normed, P)
+        x_t_32 = torch.matmul(x_t, P)
+        delta_32 = self.slot_subspace_head(h_wave_32, x_normed_32, x_t_32, t_emb)
+        skip_32 = torch.sigmoid(self.alpha_skip_32.to(dtype=x_t.dtype))
+        x_1_hat_32 = skip_32 * h_wave_32 + delta_32
+
+        raw_full = self.final_proj(x_normed)
+        x_1_hat_orth = raw_full - torch.matmul(torch.matmul(raw_full, P), P.T)
+        x_1_hat = torch.matmul(x_1_hat_32, P.T) + x_1_hat_orth
+
+        x_1_hat = self.apply_char_manifold_snap(x_1_hat, corrupt_strength=corrupt_strength)
+        return x_1_hat
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        h_potential: torch.Tensor,
+        k_attractors: torch.Tensor = None,
+        k_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Sign-Aligned Velocity Field Predictor for OT-CFM (`LeftBrainCrystallizer` v2):
+        Predicts velocity via no-skip subspace-isolated endpoint `x_1_hat = self.predict_x1(...)`.
+        """
+        B = x_t.shape[0]
+        x_1_hat = self.predict_x1(
+            x_t=x_t,
+            t=t,
+            h_potential=h_potential,
+            k_attractors=k_attractors,
+            k_mask=k_mask,
+        )
         t_expand = t.view(B, 1, 1).to(dtype=x_t.dtype)
         denom = (1.0 - t_expand).clamp(min=0.05)
         v_pred = (x_1_hat - x_t) / denom

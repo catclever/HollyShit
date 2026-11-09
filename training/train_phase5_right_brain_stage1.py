@@ -265,8 +265,9 @@ def resume_training(
             )
             return 0
         if getattr(rb, "_upgraded_context_lookback", False):
-            # #038: When resuming a pre-#038 checkpoint that lacked `context_lookback.*`, restore the saved
-            # AdamW state for all existing parameters (indices 0..P_old-1) and leave `context_lookback.*` fresh.
+            # #038 / #051: When resuming an older checkpoint upgraded with new parameters (e.g. `context_lookback.*`,
+            # `infonce_proj.*`, or v4 `flow_matcher.*` mode queries / slot phase-locker), remap saved AdamW state
+            # onto the matching existing parameter indices and leave newly added parameters with fresh state.
             opt_file = os.path.join(path, "engine_opt.pt")
             opt = checkpointer._optimizers.get("engine_opt")
             if opt is not None and os.path.isfile(opt_file):
@@ -280,11 +281,25 @@ def resume_training(
                         n_old = len(opt_sd["param_groups"][0].get("params", []))
                         n_new = len(opt.param_groups[0].get("params", []))
                         if 0 < n_old < n_new:
+                            aux_prefixes = ("aux_stream.", "gate_q.", "gate_k.", "gate_bias", "aux_v.", "alpha_aux")
+                            pre_names = getattr(rb, "_pre_upgrade_param_names", None)
+                            trainable_names = [n for n, _ in rb.named_parameters() if not n.startswith(aux_prefixes)]
+                            if pre_names:
+                                old_to_new = [i for i, n in enumerate(trainable_names) if n in pre_names]
+                            else:
+                                old_to_new = list(range(n_old))
+                            if len(old_to_new) == n_old and "state" in opt_sd:
+                                new_state = {}
+                                for old_i, st in opt_sd["state"].items():
+                                    idx_int = int(old_i)
+                                    if 0 <= idx_int < len(old_to_new):
+                                        new_state[old_to_new[idx_int]] = st
+                                opt_sd["state"] = new_state
                             opt_sd["param_groups"][0]["params"] = list(range(n_new))
                             opt.load_state_dict(opt_sd)
                             print(
                                 f"🔄 Restored AdamW state for {n_old}/{n_new} parameters "
-                                f"(initialized fresh state for {n_new - n_old} CausalContextLookback params)."
+                                f"(initialized fresh state for {n_new - n_old} upgraded v4 params)."
                             )
                 except Exception as opt_err:
                     print(f"⚠️ Could not partially restore optimizer state: {opt_err}")
@@ -501,7 +516,7 @@ def _ctx_last(ctx: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return {
         k: v[:, -1]
         for k, v in ctx.items()
-        if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb") and v is not None
+        if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
     }
 
 
@@ -689,9 +704,10 @@ def evaluate_stage1(
             print(ln)
         print("-" * 96)
 
-    # ---- diversity demo: next clause sampled N times for the first QA and first continuation sample
+    # ---- diversity / explicit multi-candidate demo: K=4 explicit mode branches for first QA & continuation sample
     n_div = int(args.eval_num_samples or 0)
     if n_div > 0:
+        n_cands = max(n_div, int(right_brain.flow_matcher.num_branches))
         for src in (0, 1):
             if src not in first_of:
                 continue
@@ -703,29 +719,65 @@ def evaluate_stage1(
                 ctx = right_brain.forward_context(z[:, :ctx_len])
                 last = _ctx_last(ctx)
                 mu, sig = right_brain.predict_prior(last)
+                z_cands, cand_scores = fm.sample_candidates(
+                    last["h"],
+                    mu=mu,
+                    sigma_band=sig,
+                    steps=args.right_ode_steps,
+                    temperature=args.temperature,
+                    num_candidates=n_cands,
+                )
             s_sem, s_syn = _sigma_sem_syn(sig[0], nb_sem)
-            print(f"🎲 Diversity [{tag}] next clause x{n_div} (T={args.temperature}, σ_sem={s_sem:.3f}, σ_syn={s_syn:.3f}) | GT: {gt}")
+            print(
+                f"🎲 Explicit Multi-Candidate [{tag}] next clause K={n_cands} "
+                f"(T={args.temperature}, σ_sem={s_sem:.3f}, σ_syn={s_syn:.3f}) | GT: {gt}"
+            )
             samples = []
             pool_z = [z[0, r] for r in range(ctx_len)]
             pool_w = [w[0, r] for r in range(ctx_len)]
-            for i in range(n_div):
-                with autocast():
-                    z_s = fm.sample(last["h"], mu=mu, sigma_band=sig, steps=args.right_ode_steps,
-                                    temperature=args.temperature).float()
+            cand_rows = []
+            for i in range(n_cands):
+                z_s = z_cands[:, i, :].float()
                 samples.append(z_s[0])
                 x_gen, _ = crystallize(z_s, pool_z, pool_w)
-                texts, _, _ = decode_x(x_gen, translator, tokenizer)
+                texts, ids_list, gvalid = decode_x(x_gen, translator, tokenizer)
+                if translator is not None:
+                    logits_tr = translator(x_gen.float())
+                    probs_tr = F.softmax(logits_tr, dim=-1).amax(dim=-1)
+                    act_mask = gvalid.float()
+                    char_conf = float(((probs_tr * act_mask).sum() / act_mask.sum().clamp(min=1.0)).item())
+                else:
+                    char_conf = 0.0
+                w_re = ids_to_clause_tokens(ids_list[0], tokenizer, args.seq_len, device).unsqueeze(0)
+                re_valid = w_re != pad
+                if bool(re_valid.any()):
+                    x_re = unet.normalize(encode_tokens(encoder, w_re))
+                    z_re = hippo(
+                        x_re, return_sequence=False, valid_mask=re_valid, subspace_proj=unet.subspace_proj
+                    ).float()
+                    rt_cos = float(F.cosine_similarity(fm.normalize(z_s), fm.normalize(z_re), dim=-1).item())
+                else:
+                    rt_cos = 0.0
+                branch_sc = float(cand_scores[0, i].item())
+                fluency = 0.45 * rt_cos + 0.35 * char_conf + 0.20 * branch_sc
                 cos_gt = F.cosine_similarity(z_s, z[:, first_t], dim=-1).item() if first_t < n_valid else float("nan")
                 wht_cos = (
                     F.cosine_similarity(fm.normalize(z_s.float()), fm.normalize(z[:, first_t].float()), dim=-1).item()
                     if first_t < n_valid else float("nan")
                 )
-                print(f"   #{i + 1} cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f} | {texts[0]}")
+                cand_rows.append((fluency, i, rt_cos, char_conf, cos_gt, wht_cos, texts[0]))
+            cand_rows.sort(key=lambda r: r[0], reverse=True)
+            for rank_idx, (fluency, br_id, rt_cos, char_conf, cos_gt, wht_cos, txt) in enumerate(cand_rows, start=1):
+                print(
+                    f"   #{rank_idx} [branch {br_id}] Fluency={fluency:.3f} "
+                    f"(RoundTripCos={rt_cos:.3f}, CharConf={char_conf:.3f}) "
+                    f"cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f} | {txt}"
+                )
             if len(samples) >= 2:
                 zs = F.normalize(torch.stack(samples), dim=-1)
                 sim = zs @ zs.t()
                 off = sim[~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)]
-                print(f"   mean pairwise cos between samples = {off.mean().item():.4f}")
+                print(f"   mean pairwise cos between K={n_cands} candidates = {off.mean().item():.4f}")
 
     # ---- sigma vs context length (implicit-condition evidence) on up to 2 continuation samples
     ks = [int(k) for k in str(args.context_lengths).split(",") if k.strip()]
@@ -849,7 +901,7 @@ def build_parser():
                         help="Left-brain ODE steps at eval")
     parser.add_argument("--temperature", type=float, default=0.75, help="Prior temperature at eval")
     parser.add_argument("--stop_threshold", type=float, default=0.5, help="Rollout stops when stop_prob exceeds this")
-    parser.add_argument("--eval_num_samples", type=int, default=3, help="Diversity-demo samples (0 = off)")
+    parser.add_argument("--eval_num_samples", type=int, default=4, help="Explicit K=4 multi-candidate samples at eval (0 = off)")
     parser.add_argument("--context_lengths", type=str, default="2,4,8,16", help="k values for the σ-vs-context curve")
     parser.add_argument("--bench_qa", type=int, default=3, help="QA samples in the fixed benchmark")
     parser.add_argument("--bench_cont", type=int, default=3, help="Continuation samples in the fixed benchmark")
@@ -888,6 +940,7 @@ def train():
     selector = load_selector(args.selector_ckpt, device) if args.eval_attractors in ("auto", "context") else None
 
     right_brain = build_right_brain_from_args(vars(args)).to(device)
+    right_brain.bind_left_brain_manifold(encoder, unet, translator)
     # Stage 1 never feeds companions: only parameters on the main path are optimised (aux_stream / gates /
     # aux_v would get no gradient anyway; excluding them keeps AdamW weight decay from shrinking them).
     aux_prefixes = ("aux_stream.", "gate_q.", "gate_k.", "gate_bias", "aux_v.", "alpha_aux")
@@ -902,9 +955,10 @@ def train():
     checkpointer.register_optimizer("lr_sched", scheduler)
     checkpointer.register_args(args)
     global_step = resume_training(args, checkpointer, {"right_brain": right_brain}, scheduler, device)
+    right_brain.bind_left_brain_manifold(encoder, unet, translator)
 
     n_params = sum(p.numel() for p in trainable)
-    print(f"🚀 Stage-1 single-stream Right-Brain (#033) | trainable {n_params / 1e6:.1f}M | d_mamba={args.d_mamba} "
+    print(f"🚀 Stage-1 single-stream Right-Brain v4 (#051) | trainable {n_params / 1e6:.1f}M | d_mamba={args.d_mamba} "
           f"main_layers={args.n_layers_main} | T={args.max_clauses} cont_ratio={args.cont_ratio}")
     print(f"   Flow: K={args.num_branches} x {args.train_ode_steps} ODE, win={args.win_weight} | Prior: sem_bands="
           f"{args.sem_bands} σ∈[{args.sigma_min},{args.sigma_max}] w={args.prior_weight} | Stop w={args.stop_weight} | "
@@ -979,6 +1033,10 @@ def train():
                     stop_labels=stop_labels[:, 1:],
                     stop_valid_mask=stop_valid[:, 1:],
                     z_in_override=z_in,
+                    w_target=w_main[:, 1:],
+                    left_brain_unet=unet,
+                    translator=translator,
+                    pad_token_id=pad_id,
                     sample_group=source_id,
                     group_names=SOURCE_NAMES,
                     return_metrics=True,
@@ -1015,7 +1073,8 @@ def train():
                 print(
                     f"Epoch {epoch + 1} | Step {global_step} | LR {optimizer.param_groups[0]['lr']:.2e} | {sps:.2f}s/step | "
                     f"Total {m['total_loss']:.4f} | Flow {m['flow_loss']:.4f} (win {m['win_loss']:.4f}, slot {m.get('slot_loss', 0.0):.4f}, "
-                    f"other {m['other_loss']:.4f}) | PriorNLL {m['prior_nll']:.4f} | Stop {m['stop_loss']:.4f} "
+                    f"other {m['other_loss']:.4f}) | PriorNLL {m['prior_nll']:.4f} | InfoNCE {m.get('infonce_loss', 0.0):.4f} | "
+                    f"Bridge {m.get('bridge_loss', 0.0):.4f} | Stop {m['stop_loss']:.4f} "
                     f"(acc {_fmt_opt(m.get('stop_acc'))}, rec {_fmt_opt(m.get('stop_recall'))}, rows {m.get('n_stop_rows', 0)}) | "
                     f"ThoughtCos {m['thought_cos']:.4f}"
                 )

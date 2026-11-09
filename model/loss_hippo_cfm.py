@@ -12,21 +12,29 @@ def hippo_cfm_loss(
     prompt_mask=None,
     pad_loss_weight: float = 0.05,
     return_metrics: bool = False,
+    translator=None,
+    w_target=None,
+    cavity_prob: float = 0.70,
+    ce_weight: float = 0.35,
+    corrupt_z_sent: bool = True,
 ):
     """
-    Phase 4 Loss (021): Train Flow Match Unet (Right Brain) using the 2D Sentence Vector Bottleneck
-    (`z_sent` of shape `(B, D)`) from HiPPOOracleCUDA + Orthogonal Knowledge Attractors `k_attractors`.
-
-    x_prompt: (B, L_p, D) Raw continuous embeddings of the context + knowledge (used as k_attractors)
-    x_target: (B, L_t, D) Raw continuous embeddings of the single-clause target sentence
-    use_knowledge_attractor: (bool) Toggle for orthogonal attraction from k_attractors
-    valid_mask: (B, L_t) Boolean mask (True for non-PAD tokens, False for PAD tokens)
-    prompt_mask: (B, L_p) Boolean mask (True for non-PAD tokens in prompt, False for PAD tokens)
-    pad_loss_weight: Relative loss weight on PAD positions (default 0.05) to prevent gradient dilution
-    return_metrics: (bool) If True, returns (loss, metrics_dict)
+    Phase 4 v2 Loss (#021 / #050): Train No-Skip Cavity-Tolerant LeftBrainCrystallizer (`FlowMatching1DUnet`)
+    using the 2D Sentence Vector Bottleneck (`z_sent` of shape `(B, D)`) from `HiPPOOracleCUDA` +
+    Orthogonal Knowledge Attractors `k_attractors` + 3-Mode Cavity-Immunization Curriculum:
+      - 30% Exact Mode: clean `z_sent` (K=32);
+      - 35% High-Band Spectral Coarsening: keep low bands k=0..5, attenuate k=6..31 by u in [0.0, 0.35] + noise;
+      - 35% Multi-Clause Cavity Mix: alpha * z_sent + (1 - alpha) * z_distractor_mean (alpha in [0.25, 0.70]).
+    Supervises the implied endpoint `x_1_hat` against clean `x_target_norm` with `loss_vel`, `loss_cos`,
+    32-D subspace `loss_slot32` (scaled by d_sub/D ~ 0.04 + slot transition diff loss), and frozen-Translator
+    token cross-entropy `loss_ce`.
     """
     B, L, D = x_target.shape
     device = x_target.device
+
+    if translator is not None and hasattr(unet, "bind_translator_codebook"):
+        if getattr(unet, "_char_codebook_norm", None) is None:
+            unet.bind_translator_codebook(translator)
 
     # 0. Adaptive Manifold Calibration & Normalization (maps raw valid Std~0.122 -> Std=1.0)
     with torch.no_grad():
@@ -35,16 +43,70 @@ def hippo_cfm_loss(
         x_target_norm = unet.normalize(x_target)
         x_prompt_norm = unet.normalize(x_prompt)
 
-        # 1. Oracle: Extract strictly 2D Sentence Vector bottleneck z_sent of shape (B, D)
-        z_sent = hippo_oracle(
+        # 1. Oracle: Extract strictly 2D Sentence Vector bottleneck z_sent_clean of shape (B, D)
+        z_sent_clean = hippo_oracle(
             x_target_norm,
             return_sequence=False,
             valid_mask=valid_mask,
             subspace_proj=unet.subspace_proj,
         )
-        assert z_sent.dim() == 2 and z_sent.shape == (B, D), (
-            f"Expected 2D sentence vector z_sent of shape {(B, D)}, got {z_sent.shape}"
+        assert z_sent_clean.dim() == 2 and z_sent_clean.shape == (B, D), (
+            f"Expected 2D sentence vector z_sent of shape {(B, D)}, got {z_sent_clean.shape}"
         )
+
+        if unet.training and hasattr(unet, "calibrate_cavity_stats"):
+            unet.calibrate_cavity_stats(z_sent_clean, seq_len=L)
+
+        # 1b. 3-Mode Cavity-Immunization Curriculum on z_sent (#050)
+        z_sent = z_sent_clean.clone()
+        if unet.training and corrupt_z_sent and float(cavity_prob) > 0.0:
+            p_cav = min(max(float(cavity_prob), 0.0), 1.0)
+            p_spec = 0.5 * p_cav  # 35% Spectral Coarsening + 35% Multi-Clause Cavity Mix when cavity_prob=0.70
+            u_mode = torch.rand((B,), device=device)
+            spec_mask = (u_mode >= (1.0 - p_cav)) & (u_mode < (1.0 - p_spec))
+            cav_mask = u_mode >= (1.0 - p_spec)
+
+            # Guarantee both corruption modes are represented when batch size B >= 3
+            if B >= 3 and p_cav >= 0.50:
+                if not spec_mask.any():
+                    spec_mask[0] = True
+                    cav_mask[0] = False
+                if not cav_mask.any():
+                    cav_mask[-1] = True
+                    spec_mask[-1] = False
+
+            K = getattr(unet, "num_subbands", 32)
+            d_sub = D // K
+
+            # Mode 2 (35%): High-Band Spectral Coarsening (keep k=0..5, attenuate k=6..31 by u in [0, 0.35] + noise)
+            if spec_mask.any():
+                n_s = int(spec_mask.sum().item())
+                z_sub_s = z_sent_clean[spec_mask].view(n_s, K, d_sub).clone()
+                u_att = torch.empty((n_s, 1, 1), device=device, dtype=z_sub_s.dtype).uniform_(0.0, 0.35)
+                # Zero out high bands completely on half of spectral-coarsened samples to cover exact k=0..5 truncation
+                u_att = torch.where(
+                    torch.rand((n_s, 1, 1), device=device) < 0.35,
+                    torch.zeros_like(u_att),
+                    u_att,
+                )
+                sig_n = torch.empty((n_s, 1, 1), device=device, dtype=z_sub_s.dtype).uniform_(0.0, 0.08) * u_att
+                z_sub_s[:, 6:, :] = u_att * z_sub_s[:, 6:, :] + sig_n * torch.randn_like(z_sub_s[:, 6:, :])
+                z_spec = z_sub_s.reshape(n_s, D)
+                z_spec = z_spec / z_spec.float().std(dim=-1, keepdim=True).clamp(min=1e-5).to(z_spec.dtype)
+                z_sent[spec_mask] = z_spec
+
+            # Mode 3 (35%): Multi-Clause Cavity Mix (alpha * z_sent + (1 - alpha) * mean of 4 random distractor clauses)
+            if cav_mask.any():
+                n_c = int(cav_mask.sum().item())
+                if B > 1:
+                    dist_idx = torch.randint(0, B, (n_c, 4), device=device)
+                    z_dist_mean = z_sent_clean[dist_idx].mean(dim=1)
+                else:
+                    z_dist_mean = torch.randn_like(z_sent_clean[cav_mask])
+                alpha = torch.empty((n_c, 1), device=device, dtype=z_sent.dtype).uniform_(0.25, 0.70)
+                z_mix = alpha * z_sent_clean[cav_mask] + (1.0 - alpha) * z_dist_mean
+                z_mix = z_mix / z_mix.float().std(dim=-1, keepdim=True).clamp(min=1e-5).to(z_mix.dtype)
+                z_sent[cav_mask] = z_mix
 
     # 2. Setup Symmetric Flow Matching Trajectory (Both X_1 and X_0 have Std = 1.0)
     # Sample t ~ Uniform(0, 0.95) so 1.0 - t >= 0.05 holds identically everywhere
@@ -60,8 +122,6 @@ def hippo_cfm_loss(
     v_pred = unet(x_t, t, h_potential=z_sent, k_attractors=k_attractors, k_mask=k_mask)
 
     # 4. Mask-Weighted Flow Matching Velocity MSE Loss
-    # Weight by denom^2 = (1 - t)^2 so (denom * (v_pred - v_target))^2 == (x_1_hat - x_target_norm)^2,
-    # eliminating 1/(1-t)^2 gradient explosion near t -> 1 while keeping exact OT-CFM velocity for Euler ODE.
     denom = (1.0 - t_expand).clamp(min=0.05)
     sq_err = (denom * (v_pred - v_target)) ** 2
     if valid_mask is not None:
@@ -83,13 +143,57 @@ def hippo_cfm_loss(
     else:
         loss_cos = 0.1 * cos_err.mean()
 
-    loss = loss_vel + loss_cos.to(dtype=loss_vel.dtype)
+    # 6. Dedicated 32-D Principal Subspace Slot Consistency & First-Order Transition Loss (#049 / #050)
+    P = unet.subspace_proj.to(device=x_1_hat.device, dtype=x_1_hat.dtype)
+    x1_32 = torch.matmul(x_1_hat, P).float()
+    xtgt_32 = torch.matmul(x_target_norm, P).float()
+    if valid_mask is not None and valid_mask.any():
+        vm_bool = valid_mask.bool()
+        mse_32 = F.mse_loss(x1_32[vm_bool], xtgt_32[vm_bool])
+        cos_32 = (1.0 - F.cosine_similarity(x1_32[vm_bool], xtgt_32[vm_bool], dim=-1, eps=1e-6)).mean()
+    else:
+        mse_32 = F.mse_loss(x1_32, xtgt_32)
+        cos_32 = (1.0 - F.cosine_similarity(x1_32, xtgt_32, dim=-1, eps=1e-6)).mean()
+
+    if L > 1:
+        dx1_32 = x1_32[:, 1:, :] - x1_32[:, :-1, :]
+        dxtgt_32 = xtgt_32[:, 1:, :] - xtgt_32[:, :-1, :]
+        if valid_mask is not None and (valid_mask[:, 1:] & valid_mask[:, :-1]).any():
+            pair_m = (valid_mask[:, 1:] & valid_mask[:, :-1]).bool()
+            slot_diff_loss = F.mse_loss(dx1_32[pair_m], dxtgt_32[pair_m])
+        else:
+            slot_diff_loss = F.mse_loss(dx1_32, dxtgt_32)
+    else:
+        slot_diff_loss = torch.zeros_like(mse_32)
+
+    loss_slot32 = 0.04 * (mse_32 + 0.35 * slot_diff_loss) + 0.05 * cos_32
+
+    # 7. Frozen-Translator Token Cross-Entropy Supervision on Denormalized Endpoint (#050)
+    if translator is not None and w_target is not None and float(ce_weight) > 0.0:
+        x_1_denorm = unet.denormalize(x_1_hat)
+        logits = translator(x_1_denorm.float())
+        if valid_mask is not None and valid_mask.any():
+            ce_raw = F.cross_entropy(logits[valid_mask.bool()], w_target[valid_mask.bool()].long())
+        else:
+            ce_raw = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), w_target.reshape(-1).long())
+        loss_ce = float(ce_weight) * ce_raw
+    else:
+        loss_ce = torch.zeros((), device=device, dtype=loss_vel.dtype)
+
+    loss = (
+        loss_vel
+        + loss_cos.to(dtype=loss_vel.dtype)
+        + loss_slot32.to(dtype=loss_vel.dtype)
+        + loss_ce.to(dtype=loss_vel.dtype)
+    )
 
     if return_metrics:
         metrics = {
             "loss_vel": loss_vel.detach(),
             "loss_valid_raw": loss_valid_raw.detach(),
             "loss_cos": loss_cos.detach(),
+            "loss_slot32": loss_slot32.detach(),
+            "loss_ce": loss_ce.detach(),
             "z_sent_std": z_sent.float().std().detach(),
         }
         return loss, metrics
