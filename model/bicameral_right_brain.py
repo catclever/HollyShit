@@ -772,6 +772,9 @@ class ThoughtFlowMatcher(nn.Module):
             s = z_valid.std().clamp(min=1e-3) if z_valid.numel() > 1 else torch.tensor(1.0, device=z_valid.device)
             batch_std = s.expand(self.hidden_dim).clone()
 
+        batch_mean = batch_mean.to(device=self.z_mean.device, dtype=self.z_mean.dtype)
+        batch_std = batch_std.to(device=self.z_std.device, dtype=self.z_std.dtype)
+
         if step == 0:
             self.z_mean.copy_(batch_mean)
             self.z_std.copy_(batch_std)
@@ -3632,6 +3635,9 @@ class KnowledgeSelector(nn.Module):
         else:
             s = z_valid.std().clamp(min=1e-3) if z_valid.numel() > 1 else torch.tensor(1.0, device=z_valid.device)
             batch_std = s.expand(self.hidden_dim).clone()
+        batch_mean = batch_mean.to(device=self.z_mean.device, dtype=self.z_mean.dtype)
+        batch_std = batch_std.to(device=self.z_std.device, dtype=self.z_std.dtype)
+
         if step == 0:
             self.z_mean.copy_(batch_mean)
             self.z_std.copy_(batch_std)

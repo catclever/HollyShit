@@ -288,35 +288,43 @@ class CavitySpectralSlotRefiner(nn.Module):
         if step >= max_calib_steps or z_clean.shape[0] < 2:
             return False
 
-        zf = z_clean.detach().float()
-        B = zf.shape[0]
-        batch_z_mu = zf.mean(dim=0, keepdim=True)
-        proj = (zf * batch_z_mu).sum(dim=-1, keepdim=True) / (batch_z_mu.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
-        fluct = zf - proj * batch_z_mu
-        batch_fluct_std = fluct.std(dim=-1).mean().clamp(min=0.20, max=0.995).view(1, 1)
+        device = z_clean.device
+        amp_dev = device.type if device.type in ("cuda", "cpu") else "cpu"
+        with torch.amp.autocast(device_type=amp_dev, enabled=False):
+            zf = z_clean.detach().float()
+            B = zf.shape[0]
+            batch_z_mu = zf.mean(dim=0, keepdim=True)
+            proj = (zf * batch_z_mu).sum(dim=-1, keepdim=True) / (batch_z_mu.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+            fluct = zf - proj * batch_z_mu
+            batch_fluct_std = fluct.std(dim=-1).mean().clamp(min=0.20, max=0.995).view(1, 1)
 
-        z_sub = zf.view(B, self.num_subbands, self.d_sub)
-        batch_band_rms = z_sub.pow(2).mean(dim=(0, 2)).sqrt().clamp(min=1e-5)
+            z_sub = zf.view(B, self.num_subbands, self.d_sub)
+            batch_band_rms = z_sub.pow(2).mean(dim=(0, 2)).sqrt().clamp(min=1e-5)
 
-        if basis.shape[1] == self.seq_len:
-            hw_32 = torch.einsum("bkd,kl->bld", z_sub, basis.float()) * math.sqrt(float(self.num_subbands))
-            batch_slot_mu = hw_32.mean(dim=0, keepdim=True)
-        else:
-            batch_slot_mu = self.slot_mu
+            if basis.shape[1] == self.seq_len:
+                hw_32 = torch.einsum("bkd,kl->bld", z_sub, basis.float()) * math.sqrt(float(self.num_subbands))
+                batch_slot_mu = hw_32.mean(dim=0, keepdim=True).float()
+            else:
+                batch_slot_mu = self.slot_mu.clone()
 
-        if step == 0:
-            self.z_mu.copy_(batch_z_mu)
-            self.target_fluct_std.copy_(batch_fluct_std)
-            self.band_rms.copy_(batch_band_rms)
-            self.slot_mu.copy_(batch_slot_mu)
-        else:
-            self.z_mu.lerp_(batch_z_mu, momentum)
-            self.target_fluct_std.lerp_(batch_fluct_std, momentum)
-            self.band_rms.lerp_(batch_band_rms, momentum)
-            self.slot_mu.lerp_(batch_slot_mu, momentum)
+            batch_z_mu = batch_z_mu.to(device=self.z_mu.device, dtype=self.z_mu.dtype)
+            batch_fluct_std = batch_fluct_std.to(device=self.target_fluct_std.device, dtype=self.target_fluct_std.dtype)
+            batch_band_rms = batch_band_rms.to(device=self.band_rms.device, dtype=self.band_rms.dtype)
+            batch_slot_mu = batch_slot_mu.to(device=self.slot_mu.device, dtype=self.slot_mu.dtype)
 
-        self.calib_steps.add_(1)
-        return True
+            if step == 0:
+                self.z_mu.copy_(batch_z_mu)
+                self.target_fluct_std.copy_(batch_fluct_std)
+                self.band_rms.copy_(batch_band_rms)
+                self.slot_mu.copy_(batch_slot_mu)
+            else:
+                self.z_mu.lerp_(batch_z_mu, momentum)
+                self.target_fluct_std.lerp_(batch_fluct_std, momentum)
+                self.band_rms.lerp_(batch_band_rms, momentum)
+                self.slot_mu.lerp_(batch_slot_mu, momentum)
+
+            self.calib_steps.add_(1)
+            return True
 
     def forward(
         self,
@@ -676,7 +684,7 @@ class FlowMatching1DUnet(nn.Module):
         max_calib_steps: int = 100,
         momentum: float = 0.05,
     ) -> bool:
-        basis = self._get_legendre_basis(seq_len, z_clean.device, z_clean.dtype)
+        basis = self._get_legendre_basis(seq_len, z_clean.device, torch.float32)
         return self.cavity_refiner.update_stats(
             z_clean,
             basis=basis,
@@ -794,8 +802,8 @@ class FlowMatching1DUnet(nn.Module):
             batch_std = x_float.std().clamp(min=1e-5)
 
         if step == 0:
-            self.manifold_mean.copy_(batch_mean)
-            self.manifold_std.copy_(batch_std)
+            self.manifold_mean.copy_(batch_mean.to(dtype=self.manifold_mean.dtype))
+            self.manifold_std.copy_(batch_std.to(dtype=self.manifold_std.dtype))
 
             v_tokens = valid_tokens if (valid_mask is not None and valid_mask.any()) else x_float.reshape(-1, self.hidden_dim)
             if v_tokens.shape[0] >= 2:
@@ -810,10 +818,10 @@ class FlowMatching1DUnet(nn.Module):
                 col_signs = torch.sign(torch.gather(top_vecs, 0, max_abs_idx))
                 col_signs = torch.where(col_signs == 0, torch.ones_like(col_signs), col_signs)
                 top_vecs = top_vecs * col_signs
-                self.subspace_proj.copy_(top_vecs)
+                self.subspace_proj.copy_(top_vecs.to(dtype=self.subspace_proj.dtype))
         else:
-            self.manifold_mean.lerp_(batch_mean, momentum)
-            self.manifold_std.lerp_(batch_std, momentum)
+            self.manifold_mean.lerp_(batch_mean.to(dtype=self.manifold_mean.dtype), momentum)
+            self.manifold_std.lerp_(batch_std.to(dtype=self.manifold_std.dtype), momentum)
 
         self.calib_steps.add_(1)
         return True
