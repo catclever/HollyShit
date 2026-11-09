@@ -59,6 +59,8 @@ def hippo_cfm_loss(
 
         # 1b. 3-Mode Cavity-Immunization Curriculum on z_sent (#050)
         z_sent = z_sent_clean.clone()
+        # Per-sample curriculum mode id (#053, logging only): 0 = exact, 1 = hiband, 2 = cavity
+        mode_id = torch.zeros((B,), device=device, dtype=torch.long)
         if unet.training and corrupt_z_sent and float(cavity_prob) > 0.0:
             p_cav = min(max(float(cavity_prob), 0.0), 1.0)
             p_spec = 0.5 * p_cav  # 35% Spectral Coarsening + 35% Multi-Clause Cavity Mix when cavity_prob=0.70
@@ -74,6 +76,9 @@ def hippo_cfm_loss(
                 if not cav_mask.any():
                     cav_mask[-1] = True
                     spec_mask[-1] = False
+
+            mode_id[spec_mask] = 1
+            mode_id[cav_mask] = 2
 
             K = getattr(unet, "num_subbands", 32)
             d_sub = D // K
@@ -196,6 +201,39 @@ def hippo_cfm_loss(
             "loss_ce": loss_ce.detach(),
             "z_sent_std": z_sent.float().std().detach(),
         }
+
+        # 8. Per-Curriculum-Mode Breakdown (#053): pure logging, computed on detached tensors (no grad / loss change).
+        #    Returned as 0-d float32 tensors (NaN when a mode has 0 samples) to avoid per-step GPU syncs.
+        with torch.no_grad():
+            n_modes = 3
+            sq_err_d = sq_err.detach().float()
+            if valid_mask is not None:
+                vm_f = valid_mask.to(dtype=torch.float32).unsqueeze(-1)  # (B, L, 1)
+                vel_ps = (sq_err_d * vm_f).sum(dim=(1, 2)) / (vm_f.sum(dim=(1, 2)) * D).clamp(min=1.0)
+            else:
+                vel_ps = sq_err_d.mean(dim=(1, 2))
+            mode_cnt = torch.bincount(mode_id, minlength=n_modes).float()
+            vel_sum = torch.zeros(n_modes, device=device, dtype=torch.float32).index_add_(0, mode_id, vel_ps)
+            vel_mode = vel_sum / mode_cnt  # 0 / 0 -> NaN for empty modes
+
+            ce_mode = torch.full((n_modes,), float("nan"), device=device, dtype=torch.float32)
+            if translator is not None and w_target is not None and float(ce_weight) > 0.0:
+                if valid_mask is not None and valid_mask.any():
+                    tok_sel = valid_mask.bool()
+                else:
+                    tok_sel = torch.ones((B, L), device=device, dtype=torch.bool)
+                ce_tok = F.cross_entropy(
+                    logits.detach()[tok_sel], w_target[tok_sel].long(), reduction="none"
+                ).float()
+                tok_mode = mode_id[:, None].expand(B, L)[tok_sel]
+                ce_sum = torch.zeros(n_modes, device=device, dtype=torch.float32).index_add_(0, tok_mode, ce_tok)
+                ce_cnt = torch.bincount(tok_mode, minlength=n_modes).float()
+                ce_mode = ce_sum / ce_cnt
+
+            for m_i, m_name in enumerate(("exact", "hiband", "cavity")):
+                metrics[f"vel_{m_name}"] = vel_mode[m_i]
+                metrics[f"ce_{m_name}"] = ce_mode[m_i]
+                metrics[f"n_{m_name}"] = mode_cnt[m_i]
         return loss, metrics
 
     return loss
