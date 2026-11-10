@@ -57,7 +57,7 @@ from training.core.char_tokenizer import CharTokenizer
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 
-from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
+from model.phase1_charencoder_cuda import TinyCharEncoderCUDA, load_mlx_safetensors_into_torch
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from model.hippo_oracle import HiPPOOracleCUDA
 from model.flow_unet_cuda import LeftBrainCrystallizer
@@ -78,6 +78,7 @@ from training.train_phase5_mamba_flow_cuda import (
     decode_clause_clean,
     encode_tokens,
     encode_clause_bank_to_2d,
+    encode_clause_bank_dual,
     _sigma_sem_syn,
 )
 
@@ -318,11 +319,21 @@ def resume_training(
 def load_frozen_modules(
     args, tokenizer: CharTokenizer, device: torch.device, need_translator: bool = True,
 ) -> Tuple[TinyCharEncoderCUDA, HiPPOOracleCUDA, LeftBrainCrystallizer, Optional[ContinuousToTextTranslatorCUDA]]:
-    """Frozen encoder / HiPPO / left brain (+ translator) with #029-compatible discovery and fallbacks."""
+    """Frozen encoder / HiPPO / left brain (+ translator) with #029/#059-compatible discovery and fallbacks."""
     encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
     if args.encoder_ckpt and os.path.exists(args.encoder_ckpt):
-        encoder.load_state_dict(torch.load(args.encoder_ckpt, map_location=device, weights_only=True))
-        print(f"✅ Loaded frozen TinyCharEncoderCUDA from {args.encoder_ckpt}")
+        if args.encoder_ckpt.endswith(".safetensors"):
+            load_mlx_safetensors_into_torch(encoder, args.encoder_ckpt)
+            encoder.to(device)
+            print(f"✅ Loaded frozen TinyCharEncoderCUDA (safetensors) from {args.encoder_ckpt}")
+        else:
+            raw_enc_sd = torch.load(args.encoder_ckpt, map_location=device, weights_only=True)
+            missing_k, unexpected_k = encoder.load_state_dict(raw_enc_sd, strict=False)
+            print(f"✅ Loaded frozen TinyCharEncoderCUDA from {args.encoder_ckpt}")
+            if missing_k:
+                print(f"   ℹ️ Legacy encoder checkpoint missing keys (initialized fresh): {missing_k}")
+            if unexpected_k:
+                print(f"   ℹ️ Encoder checkpoint unexpected keys (ignored): {unexpected_k}")
     else:
         print(f"⚠️ WARNING: Encoder checkpoint '{args.encoder_ckpt}' not found! Using random weights (testing only).")
     encoder.eval()
@@ -335,6 +346,7 @@ def load_frozen_modules(
     unet = LeftBrainCrystallizer(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=args.num_subbands).to(device)
     left_path = resolve_ckpt_file(args.left_brain_ckpt, "unet.pt")
     loaded = False
+    found = None
     if left_path:
         try:
             unet.load_state_dict(torch.load(left_path, map_location=device, weights_only=True), strict=True)
@@ -351,7 +363,11 @@ def load_frozen_modules(
         if found:
             print(f"✅ Auto-discovered frozen LeftBrainCrystallizer from {found}")
         else:
-            print("⚠️ WARNING: No compatible LeftBrainCrystallizer checkpoint; manifold will auto-calibrate on batch 0.")
+            locked_ok = unet.bind_encoder_subspace(encoder)
+            print(
+                f"⚠️ WARNING: No compatible LeftBrainCrystallizer checkpoint; "
+                f"bound encoder subspace_proj={locked_ok}, manifold mean/std will auto-calibrate on batch 0."
+            )
     unet.eval()
     for p in unet.parameters():
         p.requires_grad = False
@@ -516,7 +532,7 @@ def _ctx_last(ctx: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return {
         k: v[:, -1]
         for k, v in ctx.items()
-        if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
+        if k in ("h", "h_flow", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
     }
 
 
@@ -546,19 +562,15 @@ def evaluate_stage1(
     pad = tokenizer.pad_token_id
     nb_sem = int(right_brain.sem_bands)
     fm = right_brain.flow_matcher
+    planning_space = getattr(args, "planning_space", "z_clause")
+    dual_mode = planning_space in ("z_god", "s_pool")
     # =====================================================================================
-    # [Feature Addition & Bug Fix - Task #038: CausalContextLookback History & Auto Context Attractors]
+    # [Feature Addition & Bug Fix - Task #038 / #059: CausalContextLookback History & Dual-Space Rollout]
     # 1. Problem fixed:
-    #    - `evaluate_stage1` previously initialized `states = {"main": ctx["main_states"]}` without passing
-    #      `history_h` and `history_z` from `forward_context` into `right_brain.step(...)`.
-    #    - Without a trained `selector_ckpt`, `--eval_attractors` defaulted to `none`, leaving the Left Brain
-    #      without context attractors during Stage-1 evaluation.
-    # 2. Method used:
-    #    - Pass `history_h` and `history_z` in `states` so `right_brain.step` attends over the full context prefix.
-    #    - Support `--eval_attractors auto`: uses `selector.select_context_attractors` if `selector` is loaded,
-    #      otherwise falls back to Whitened Clause Cosine Top-M Attractor Selection (`0.6 * sim_sem + 0.4 * sim_full`).
-    # 3. Caveats for subsequent development:
-    #    - Keep `return_state=True` in `forward_context` before sequential `step` loops so `history_h`/`history_z` are populated.
+    #    - `evaluate_stage1` passes `history_h` and `history_z` (in whitened `Z_clause` space) from
+    #      `forward_context` into `right_brain.step(...)`, while stepping Mamba in `z_god`/`s_pool` space
+    #      when `dual_mode` is active!
+    #    - Keeps `pool_z` strictly in `Z_clause` space for `KnowledgeSelector` / whitened cosine lookback.
     # =====================================================================================
     use_sel_attr = args.eval_attractors in ("auto", "context") and selector is not None
     use_wht_attr = args.eval_attractors in ("auto", "context") and selector is None
@@ -569,7 +581,7 @@ def evaluate_stage1(
     else:
         attr_desc = "none"
     print("\n" + "=" * 96)
-    print(f"🧠 [Step {step}] Stage-1 single-stream rollout | attractors={attr_desc} | "
+    print(f"🧠 [Step {step}] Stage-1 single-stream rollout | space={planning_space} | attractors={attr_desc} | "
           f"RightODE={args.right_ode_steps} LeftODE={args.left_ode_steps} T={args.temperature} "
           f"MaxClauses={args.num_rollout_clauses} StopThr={args.stop_threshold} "
           f"ClosedLoop={args.closed_loop_reencode}")
@@ -582,10 +594,16 @@ def evaluate_stage1(
         w = item["w_main"].unsqueeze(0).to(device)
         mv = item["main_valid"].unsqueeze(0).to(device).bool()
         tm = item["target_mask"].unsqueeze(0).to(device).bool() & mv
-        z = encode_clause_bank_to_2d(encoder, unet, hippo, w, mv, pad).float()
+        if dual_mode:
+            z, s = encode_clause_bank_dual(encoder, unet, hippo, w, mv, pad, semantic_source=planning_space)
+            z = z.float()
+            s = s.float()
+        else:
+            z = encode_clause_bank_to_2d(encoder, unet, hippo, w, mv, pad).float()
+            s = None
         n_valid = int(mv[0].sum().item())
         first_t = int(torch.nonzero(tm[0], as_tuple=False)[0].item()) if bool(tm.any()) else n_valid
-        return w, mv, tm, z, n_valid, first_t
+        return w, mv, tm, z, s, n_valid, first_t
 
     def crystallize(z_th: torch.Tensor, pool_z: List[torch.Tensor], pool_w: List[torch.Tensor]):
         x_attr, k_mask, use_attr, info = None, None, None, None
@@ -629,20 +647,27 @@ def evaluate_stage1(
             )
         return x_gen.float(), info
 
-    if int(fm.calib_steps.item()) == 0 and bench:
-        calib_rows = []
+    need_z_calib = int(fm.calib_steps.item()) == 0
+    need_s_calib = dual_mode and int(right_brain.s_calib_steps.item()) == 0
+    if (need_z_calib or need_s_calib) and bench:
+        calib_z_rows = []
+        calib_s_rows = []
         for _, b_item in bench:
-            _, b_mv, _, b_z, b_n_valid, _ = prepare(b_item)
+            _, b_mv, _, b_z, b_s, b_n_valid, _ = prepare(b_item)
             if b_n_valid > 0:
-                calib_rows.append(b_z[0, :b_n_valid])
-        if calib_rows:
-            fm.calibrate_z(torch.cat(calib_rows, dim=0))
+                calib_z_rows.append(b_z[0, :b_n_valid])
+                if dual_mode and b_s is not None:
+                    calib_s_rows.append(b_s[0, :b_n_valid])
+        if need_z_calib and calib_z_rows:
+            fm.calibrate_z(torch.cat(calib_z_rows, dim=0))
+        if need_s_calib and calib_s_rows:
+            right_brain.calibrate_s(torch.cat(calib_s_rows, dim=0))
 
     first_of: Dict[int, Tuple[str, Dict[str, Any]]] = {}
     for tag, item in bench:
         src = _scalar(item.get("source_id"), 0)
         first_of.setdefault(src, (tag, item))
-        w, mv, tm, z, n_valid, first_t = prepare(item)
+        w, mv, tm, z, s, n_valid, first_t = prepare(item)
         ctx_len = max(1, first_t)
         gt_rows = list(range(first_t, n_valid))
         gt_strs = [decode_clause_clean(tokenizer, w[0, r].tolist()) for r in gt_rows[: args.num_rollout_clauses]]
@@ -653,7 +678,12 @@ def evaluate_stage1(
         print(f"   [GT]:      {_short(' | '.join(gt_strs), 220)}")
 
         with autocast():
-            ctx = right_brain.forward_context(z[:, :ctx_len], return_state=True)
+            ctx = right_brain.forward_context(
+                z[:, :ctx_len],
+                s_main_seq=(s[:, :ctx_len] if dual_mode and s is not None else None),
+                z_lookback_seq=z[:, :ctx_len],
+                return_state=True,
+            )
         states = {"main": ctx["main_states"], "history_h": ctx.get("history_h"), "history_z": ctx.get("history_z")}
         last = _ctx_last(ctx)
         pool_z = [z[0, r] for r in range(ctx_len)]
@@ -663,9 +693,20 @@ def evaluate_stage1(
         stopped = None
         for c in range(1, args.num_rollout_clauses + 1):
             with autocast():
-                mu, sig = right_brain.predict_prior(last)
+                if dual_mode and s is not None:
+                    mu_sem, sig_sem = right_brain.predict_semantic_prior(last)
+                    s_hat_norm = right_brain.sample_semantic_from_prior(
+                        mu_sem, sig_sem, temperature=args.temperature
+                    )
+                    mu, sig = right_brain.predict_prior(last, s_cond_norm=s_hat_norm)
+                    h_cond = last["h_flow"]
+                    s_hat_phys = right_brain.denormalize_s(s_hat_norm).float()
+                else:
+                    mu, sig = right_brain.predict_prior(last)
+                    h_cond = last["h"]
+                    s_hat_phys = None
                 stop_p = float(torch.sigmoid(right_brain.stop_head(last["h"]).float()).reshape(-1)[0].item())
-                z_th = fm.sample(last["h"], mu=mu, sigma_band=sig, steps=args.right_ode_steps,
+                z_th = fm.sample(h_cond, mu=mu, sigma_band=sig, steps=args.right_ode_steps,
                                  temperature=args.temperature).float()
             x_gen, info = crystallize(z_th, pool_z, pool_w)
             texts, ids, gvalid = decode_x(x_gen, translator, tokenizer)
@@ -676,6 +717,12 @@ def evaluate_stage1(
                 F.cosine_similarity(fm.normalize(z_th.float()), fm.normalize(z[:, gt_r].float()), dim=-1).item()
                 if gt_r < n_valid else float("nan")
             )
+            sem_cos_s = ""
+            if dual_mode and s is not None and s_hat_phys is not None and gt_r < n_valid:
+                sem_wht = F.cosine_similarity(
+                    right_brain.normalize_s(s_hat_phys), right_brain.normalize_s(s[:, gt_r].float()), dim=-1
+                ).item()
+                sem_cos_s = f" sem_wht={sem_wht:.3f}"
             attr_s = ""
             if info is not None:
                 if "max_cos" in info:
@@ -685,19 +732,30 @@ def evaluate_stage1(
                               f"(sink={float(info['sink_prob'][0]):.2f})")
             lines.append(
                 f"      c{c}: stop={stop_p:.3f} σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} "
-                f"cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f}{attr_s} | {texts[0]}"
+                f"cos(GT)={cos_gt:.3f} wht_cos={wht_cos:.3f}{sem_cos_s}{attr_s} | {texts[0]}"
             )
             gen_strs.append(texts[0])
             if args.closed_loop_reencode:
                 z_next = hippo(unet.normalize(x_gen), return_sequence=False, valid_mask=gvalid,
                                subspace_proj=unet.subspace_proj).float()
+                if dual_mode and s is not None:
+                    w_re = ids_to_clause_tokens(ids[0], tokenizer, args.seq_len, device).unsqueeze(0)
+                    re_valid = w_re != pad
+                    if bool(re_valid.any()):
+                        dual_re = encoder.encode_dual(w_re, re_valid.float(), return_hidden=False)
+                        s_next = (dual_re["z_god"] if planning_space == "z_god" else dual_re["s_pool"]).float()
+                    else:
+                        s_next = s_hat_phys
+                else:
+                    s_next = None
             else:
                 z_next = z_th
+                s_next = s_hat_phys if dual_mode else None
             if stop_p > float(args.stop_threshold):
                 stopped = c
                 break
             with autocast():
-                last, states = right_brain.step(z_next, states)
+                last, states = right_brain.step(z_next, states, s_t=s_next)
         stop_desc = f"stop@c{stopped}" if stopped is not None else f"max {args.num_rollout_clauses}"
         print(f"   [Rollout] ({stop_desc}): {_short(' | '.join(gen_strs), 220)}")
         for ln in lines:
@@ -712,21 +770,18 @@ def evaluate_stage1(
             if src not in first_of:
                 continue
             tag, item = first_of[src]
-            w, mv, tm, z, n_valid, first_t = prepare(item)
+            w, mv, tm, z, s, n_valid, first_t = prepare(item)
             ctx_len = max(1, first_t)
             gt = decode_clause_clean(tokenizer, w[0, first_t].tolist()) if first_t < n_valid else ""
             with autocast():
-                ctx = right_brain.forward_context(z[:, :ctx_len])
-                last = _ctx_last(ctx)
-                mu, sig = right_brain.predict_prior(last)
-                z_cands, cand_scores = fm.sample_candidates(
-                    last["h"],
-                    mu=mu,
-                    sigma_band=sig,
+                z_cands, cand_scores, cand_info = right_brain.sample_candidate_clauses(
+                    z[:, :ctx_len],
                     steps=args.right_ode_steps,
                     temperature=args.temperature,
                     num_candidates=n_cands,
+                    s_discourse_seq=(s[:, :ctx_len] if dual_mode and s is not None else None),
                 )
+            sig = cand_info["sigma_band"]
             s_sem, s_syn = _sigma_sem_syn(sig[0], nb_sem)
             print(
                 f"🎲 Explicit Multi-Candidate [{tag}] next clause K={n_cands} "
@@ -785,26 +840,47 @@ def evaluate_stage1(
     if ks and cont_items:
         print(f"📉 σ vs context length (k = rows given; predicting row k) — expect σ_sem to DECREASE with k")
         for tag, item in cont_items:
-            w, mv, tm, z, n_valid, first_t = prepare(item)
+            w, mv, tm, z, s, n_valid, first_t = prepare(item)
             rows = []
             for k in ks:
                 if k < 1 or k >= n_valid:
                     rows.append(f"k={k}: n/a")
                     continue
                 with autocast():
-                    ctx = right_brain.forward_context(z[:, :k])
+                    ctx = right_brain.forward_context(
+                        z[:, :k],
+                        s_main_seq=(s[:, :k] if dual_mode and s is not None else None),
+                        z_lookback_seq=z[:, :k],
+                    )
                     last = _ctx_last(ctx)
-                    mu, sig = right_brain.predict_prior(last)
+                    if dual_mode and s is not None:
+                        mu_sem, sig_sem = right_brain.predict_semantic_prior(last)
+                        mu, sig = right_brain.predict_prior(last, s_cond_norm=mu_sem)
+                    else:
+                        mu_sem, sig_sem = None, None
+                        mu, sig = right_brain.predict_prior(last)
                 s_sem, s_syn = _sigma_sem_syn(sig[0], nb_sem)
                 z1n = fm.normalize(z[:, k].float())
                 nll = float(band_gaussian_nll(z1n, mu.float(), sig.float(), right_brain.num_bands).item())
                 mu_unit = mu.float() / mu.float().std(dim=-1, keepdim=True).clamp(min=1e-5)
                 cos_mu = F.cosine_similarity(fm.denormalize(mu_unit), z[:, k].float(), dim=-1).item()
                 wht_cos_mu = F.cosine_similarity(mu.float(), z1n, dim=-1).item()
-                rows.append(
-                    f"k={k}: σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} nll={nll:.3f} "
-                    f"cos(μ,GT)={cos_mu:.3f} wht_cos(μ,GT)={wht_cos_mu:.3f}"
-                )
+                if dual_mode and s is not None and mu_sem is not None and sig_sem is not None:
+                    s1n = right_brain.normalize_s(s[:, k].float())
+                    sem_nll_k = float(
+                        band_gaussian_nll(s1n, mu_sem.float(), sig_sem.float(), right_brain.num_bands).item()
+                    )
+                    sem_cos_k = F.cosine_similarity(mu_sem.float(), s1n, dim=-1).item()
+                    sig_god = float(sig_sem[0].mean().item())
+                    rows.append(
+                        f"k={k}: σ_god={sig_god:.3f} sem_nll={sem_nll_k:.3f} sem_cos={sem_cos_k:.3f} "
+                        f"σ_sem={s_sem:.3f} wht_cos(μ,GT)={wht_cos_mu:.3f}"
+                    )
+                else:
+                    rows.append(
+                        f"k={k}: σ_sem={s_sem:.3f} σ_syn={s_syn:.3f} nll={nll:.3f} "
+                        f"cos(μ,GT)={cos_mu:.3f} wht_cos(μ,GT)={wht_cos_mu:.3f}"
+                    )
             print(f"   [{tag}] " + " | ".join(rows))
     print("=" * 96 + "\n")
 
@@ -891,6 +967,19 @@ def build_parser():
     parser.add_argument("--p_self_max", type=float, default=0.25, help="Max scheduled self-feeding probability")
     parser.add_argument("--self_feed_start", type=int, default=2000, help="Step where the self-feed ramp starts")
     parser.add_argument("--self_feed_ramp", type=int, default=8000, help="Steps to ramp p_self to --p_self_max")
+    parser.add_argument(
+        "--planning_space",
+        type=str,
+        default="z_god",
+        choices=["z_god", "s_pool", "z_clause"],
+        help="Right-Brain Mamba planning space: 'z_god' (default), 's_pool', or legacy 'z_clause'",
+    )
+    parser.add_argument(
+        "--sem_self_cond_prob",
+        type=float,
+        default=0.35,
+        help="Probability of conditioning Z_clause bridge on predicted semantic sample instead of noisy GT",
+    )
     # eval
     parser.add_argument("--eval_interval", type=int, default=500, help="Eval every N steps (0 = off)")
     parser.add_argument("--eval_at_start", action="store_true", help="Run one eval before training")
@@ -957,13 +1046,14 @@ def train():
     global_step = resume_training(args, checkpointer, {"right_brain": right_brain}, scheduler, device)
     right_brain.bind_left_brain_manifold(encoder, unet, translator)
 
+    dual_mode = args.planning_space in ("z_god", "s_pool")
     n_params = sum(p.numel() for p in trainable)
-    print(f"🚀 Stage-1 single-stream Right-Brain v4 (#051) | trainable {n_params / 1e6:.1f}M | d_mamba={args.d_mamba} "
-          f"main_layers={args.n_layers_main} | T={args.max_clauses} cont_ratio={args.cont_ratio}")
+    print(f"🚀 Stage-1 single-stream Right-Brain v5 (#059) | space={args.planning_space} | trainable {n_params / 1e6:.1f}M "
+          f"| d_mamba={args.d_mamba} main_layers={args.n_layers_main} | T={args.max_clauses} cont_ratio={args.cont_ratio}")
     print(f"   Flow: K={args.num_branches} x {args.train_ode_steps} ODE, win={args.win_weight} | Prior: sem_bands="
-          f"{args.sem_bands} σ∈[{args.sigma_min},{args.sigma_max}] w={args.prior_weight} | Stop w={args.stop_weight} | "
-          f"Jitter p={args.p_band_jitter} | SelfFeed p_max={args.p_self_max} start={args.self_feed_start} "
-          f"ramp={args.self_feed_ramp} | ckpt_prefix={args.ckpt_prefix}")
+          f"{args.sem_bands} σ∈[{args.sigma_min},{args.sigma_max}] w={args.prior_weight} | SemSelfCond={args.sem_self_cond_prob} "
+          f"| Stop w={args.stop_weight} | Jitter p={args.p_band_jitter} | SelfFeed p_max={args.p_self_max} "
+          f"start={args.self_feed_start} ramp={args.self_feed_ramp} | ckpt_prefix={args.ckpt_prefix}")
 
     prof = Profiler(args.profile, device)
 
@@ -1002,26 +1092,56 @@ def train():
             prof.mark("data")
 
             with torch.no_grad():
-                z_main = encode_clause_bank_to_2d(encoder, unet, hippo, w_main, main_valid, pad_id)  # (B, T, D)
+                if dual_mode:
+                    z_main, s_main = encode_clause_bank_dual(
+                        encoder, unet, hippo, w_main, main_valid, pad_id, semantic_source=args.planning_space
+                    )  # (B, T, D), (B, T, D)
+                else:
+                    z_main = encode_clause_bank_to_2d(encoder, unet, hippo, w_main, main_valid, pad_id)  # (B, T, D)
+                    s_main = None
                 prof.mark("encode")
                 target_valid = target_mask[:, 1:] & main_valid[:, 1:]  # (B, T-1)
                 if int(right_brain.flow_matcher.calib_steps.item()) == 0 and bool(main_valid.any()):
                     right_brain.flow_matcher.calibrate_z(z_main[main_valid])
+                if dual_mode and s_main is not None and int(right_brain.s_calib_steps.item()) == 0 and bool(main_valid.any()):
+                    right_brain.calibrate_s(s_main[main_valid])
                 z_in = right_brain.jitter_high_bands(
                     z_main[:, :-1].clone(), p=args.p_band_jitter,
                     sem_bands=right_brain.sem_bands, num_bands=right_brain.num_bands,
                 )
+                s_in = s_main[:, :-1].clone() if dual_mode and s_main is not None else None
                 p_self = compute_p_self(global_step, args.self_feed_start, args.self_feed_ramp, args.p_self_max)
                 n_fed = 0
-                if p_self > 0.0 and int(right_brain.flow_matcher.calib_steps.item()) > 0 and z_in.shape[1] >= 2:
-                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        samples = right_brain.sample_next_clauses(
-                            z_main[:, :-1], temperature=1.0, ode_steps=args.train_ode_steps,
-                        )  # samples[:, j] = predicted row j+1
+                calibrated = int(right_brain.flow_matcher.calib_steps.item()) > 0
+                if dual_mode:
+                    calibrated = calibrated and int(right_brain.s_calib_steps.item()) > 0
+                if p_self > 0.0 and calibrated and z_in.shape[1] >= 2:
                     # z_in[:, t] (t >= 1) is row t; only TARGET rows are replaced (context stays ground truth).
                     tgt_rows = (target_mask[:, 1:-1] & main_valid[:, 1:-1])
                     replace = (torch.rand(tgt_rows.shape, device=device) < p_self) & tgt_rows
-                    z_in[:, 1:] = torch.where(replace.unsqueeze(-1), samples[:, :-1].to(dtype=z_in.dtype), z_in[:, 1:])
+                    if dual_mode and s_main is not None and s_in is not None:
+                        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            z_samples, s_samples = right_brain.sample_next_clauses(
+                                z_main[:, :-1],
+                                temperature=1.0,
+                                ode_steps=args.train_ode_steps,
+                                s_in=s_main[:, :-1],
+                                return_dual=True,
+                            )  # predicted row j+1 in both z_clause and semantic spaces
+                        z_in[:, 1:] = torch.where(
+                            replace.unsqueeze(-1), z_samples[:, :-1].to(dtype=z_in.dtype), z_in[:, 1:]
+                        )
+                        s_in[:, 1:] = torch.where(
+                            replace.unsqueeze(-1), s_samples[:, :-1].to(dtype=s_in.dtype), s_in[:, 1:]
+                        )
+                    else:
+                        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            samples = right_brain.sample_next_clauses(
+                                z_main[:, :-1], temperature=1.0, ode_steps=args.train_ode_steps,
+                            )  # samples[:, j] = predicted row j+1
+                        z_in[:, 1:] = torch.where(
+                            replace.unsqueeze(-1), samples[:, :-1].to(dtype=z_in.dtype), z_in[:, 1:]
+                        )
                     n_fed = int(replace.sum().item())
                 prof.mark("self_feed")
 
@@ -1033,6 +1153,9 @@ def train():
                     stop_labels=stop_labels[:, 1:],
                     stop_valid_mask=stop_valid[:, 1:],
                     z_in_override=z_in,
+                    s_discourse_seq=s_main,
+                    s_in_override=s_in,
+                    sem_self_cond_prob=args.sem_self_cond_prob,
                     w_target=w_main[:, 1:],
                     left_brain_unet=unet,
                     translator=translator,
@@ -1073,10 +1196,10 @@ def train():
                 print(
                     f"Epoch {epoch + 1} | Step {global_step} | LR {optimizer.param_groups[0]['lr']:.2e} | {sps:.2f}s/step | "
                     f"Total {m['total_loss']:.4f} | Flow {m['flow_loss']:.4f} (win {m['win_loss']:.4f}, slot {m.get('slot_loss', 0.0):.4f}, "
-                    f"other {m['other_loss']:.4f}) | PriorNLL {m['prior_nll']:.4f} | InfoNCE {m.get('infonce_loss', 0.0):.4f} | "
-                    f"Bridge {m.get('bridge_loss', 0.0):.4f} | Stop {m['stop_loss']:.4f} "
+                    f"other {m['other_loss']:.4f}) | PriorNLL {m['prior_nll']:.4f} | SemNLL {m.get('sem_nll', 0.0):.4f} "
+                    f"| InfoNCE {m.get('infonce_loss', 0.0):.4f} | Bridge {m.get('bridge_loss', 0.0):.4f} | Stop {m['stop_loss']:.4f} "
                     f"(acc {_fmt_opt(m.get('stop_acc'))}, rec {_fmt_opt(m.get('stop_recall'))}, rows {m.get('n_stop_rows', 0)}) | "
-                    f"ThoughtCos {m['thought_cos']:.4f}"
+                    f"SemCos {m.get('sem_cos', 0.0):.4f} | ThoughtCos {m['thought_cos']:.4f}"
                 )
                 print(
                     f"    σ_sem {m['sigma_sem']:.3f} σ_syn {m['sigma_syn']:.3f} | σ_sem[qa/cont] "
@@ -1085,9 +1208,13 @@ def train():
                     f"| target rows qa/cont {m.get('n_rows_qa', 0)}/{m.get('n_rows_cont', 0)}"
                 )
                 z_std_t = right_brain.flow_matcher.z_std
+                s_std_desc = ""
+                if dual_mode:
+                    s_std_t = right_brain.s_std
+                    s_std_desc = f" | s_std[min/mean/max] {s_std_t.min().item():.3f}/{s_std_t.mean().item():.3f}/{s_std_t.max().item():.3f}"
                 print(
                     f"    BranchDiv {m['branch_diversity']:.4f} | Winners {m['winner_hist']} | p_self {p_self:.3f} "
-                    f"(fed {n_fed}) | z_std[min/mean/max] {z_std_t.min().item():.3f}/{z_std_t.mean().item():.3f}/{z_std_t.max().item():.3f}"
+                    f"(fed {n_fed}) | z_std[min/mean/max] {z_std_t.min().item():.3f}/{z_std_t.mean().item():.3f}/{z_std_t.max().item():.3f}{s_std_desc}"
                 )
                 check_low_band_saturation(m.get("sigma_band", []), right_brain.sem_bands, args.sigma_max, tag="train")
                 if is_eval:

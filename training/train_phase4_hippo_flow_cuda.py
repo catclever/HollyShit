@@ -22,11 +22,14 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 from training.core.char_tokenizer import CharTokenizer
 
 from model.hippo_oracle import HiPPOOracleCUDA
-from model.flow_unet_cuda import FlowMatching1DUnet, LeftBrainCrystallizer
+from model.flow_unet_cuda import (
+    FlowMatching1DUnet,
+    LeftBrainCrystallizer,
+)
 from model.loss_hippo_cfm import hippo_cfm_loss
 from training.data.dialogue_dataset import GenericPairDataset
 
-from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
+from model.phase1_charencoder_cuda import TinyCharEncoderCUDA, load_mlx_safetensors_into_torch
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
@@ -200,10 +203,8 @@ def decode_with_eos_marker(tokenizer, token_ids):
 
 @torch.no_grad()
 def encode_tokens(encoder, token_ids: torch.Tensor) -> torch.Tensor:
-    h = encoder.get_normalized_embeddings(token_ids)
-    for layer in encoder.layers:
-        h = layer(h, None)
-    return encoder.final_ln(h)
+    """Encodes token IDs `(B, L)` via `encoder.encode_tokens` with mandatory `<PAD>` mask & zeroing."""
+    return encoder.encode_tokens(token_ids)
 
 
 @torch.no_grad()
@@ -590,6 +591,24 @@ class QuantRedFlagDetector:
         return flags
 
 
+def load_frozen_encoder_checkpoint(encoder: TinyCharEncoderCUDA, ckpt_path: str, device: torch.device) -> None:
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        print(f"⚠️ WARNING: Encoder checkpoint {ckpt_path} not found! Using random weights (for testing only).")
+        return
+
+    if ckpt_path.endswith(".safetensors"):
+        load_mlx_safetensors_into_torch(encoder, ckpt_path)
+        print(f"✅ Loaded frozen encoder (.safetensors) from {ckpt_path}")
+    else:
+        sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+        incompatible = encoder.load_state_dict(sd, strict=False)
+        if incompatible.missing_keys:
+            print(f"ℹ️ Legacy encoder checkpoint missing v2 keys (using defaults): {incompatible.missing_keys}")
+        if incompatible.unexpected_keys:
+            print(f"ℹ️ Ignoring unexpected keys in encoder checkpoint: {incompatible.unexpected_keys}")
+        print(f"✅ Loaded frozen encoder from {ckpt_path}")
+
+
 def train():
     default_data_path = (
         "/content/omni_knowledge_corpus.jsonl"
@@ -696,12 +715,8 @@ def train():
     print(f"📌 Fixed Cross-Domain Benchmark Samples ({len(eval_benchmark_samples)} domains): {bench_domains_str}")
 
     # 2. Phase 1 Encoder (Frozen Continuous Geometric Mapper)
-    encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
-    if os.path.exists(args.encoder_ckpt):
-        encoder.load_state_dict(torch.load(args.encoder_ckpt, map_location=device, weights_only=True))
-        print(f"✅ Loaded frozen encoder from {args.encoder_ckpt}")
-    else:
-        print(f"⚠️ WARNING: Encoder checkpoint {args.encoder_ckpt} not found! Using random weights (for testing only).")
+    encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size, pad_token_id=tokenizer.pad_token_id).to(device)
+    load_frozen_encoder_checkpoint(encoder, args.encoder_ckpt, device)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
@@ -731,8 +746,11 @@ def train():
     hippo_oracle = HiPPOOracleCUDA(hidden_dim=1024, N=64, num_subbands=args.num_subbands).to(device)
     hippo_oracle.eval()
 
-    # 5. Stateless Universal Left Brain Crystallizer v2 (`LeftBrainCrystallizer` / `FlowMatching1DUnet` #025 / #050)
+    # 5. Stateless Universal Left Brain Crystallizer v2 (`LeftBrainCrystallizer` / `FlowMatching1DUnet` #025 / #050 / #059)
     unet = LeftBrainCrystallizer(hidden_dim=1024, cond_dim=1024, num_layers=6, num_subbands=args.num_subbands).to(device)
+    # Lock fresh runs onto `encoder.char_subspace_proj` before checkpoint resume (resumed runs overwrite with saved `subspace_proj`)
+    if unet.bind_encoder_subspace(encoder):
+        print("✅ Bound LeftBrainCrystallizer subspace_proj directly to Phase 1 v2 encoder.char_subspace_proj")
     if translator is not None:
         unet.bind_translator_codebook(translator)
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)

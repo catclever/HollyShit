@@ -12,11 +12,12 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 
 from training.core.char_tokenizer import CharTokenizer
 from training.data.dialogue_dataset import GenericPairDataset
-from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
+from model.phase1_charencoder_cuda import TinyCharEncoderCUDA, load_mlx_safetensors_into_torch
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 from torch.utils.data import DataLoader
+
 
 def decode_with_eos_marker(tokenizer, token_ids):
     if tokenizer.eos_token_id in token_ids:
@@ -58,6 +59,24 @@ def synthesize_degraded_manifold_curve(x_target: torch.Tensor, valid_mask: torch
     return x_blur + noise
 
 
+def load_frozen_encoder_checkpoint(encoder: TinyCharEncoderCUDA, ckpt_path: str, device: torch.device) -> None:
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        print(f"WARNING: Encoder checkpoint {ckpt_path} not found. Using random weights (for testing only).")
+        return
+
+    if ckpt_path.endswith(".safetensors"):
+        load_mlx_safetensors_into_torch(encoder, ckpt_path)
+        print(f"Loaded frozen encoder (.safetensors) from {ckpt_path}")
+    else:
+        sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+        incompatible = encoder.load_state_dict(sd, strict=False)
+        if incompatible.missing_keys:
+            print(f"ℹ️ Legacy encoder checkpoint missing v2 keys (using defaults): {incompatible.missing_keys}")
+        if incompatible.unexpected_keys:
+            print(f"ℹ️ Ignoring unexpected keys in encoder checkpoint: {incompatible.unexpected_keys}")
+        print(f"Loaded frozen encoder from {ckpt_path}")
+
+
 def train_translator():
     parser = get_training_parser("Phase 4 Sharpening & Denoising CNN Translator Training (Pure Text Manifold)")
     parser.add_argument("--data_path", type=str, default="data/Basic_ZH/moss_dialogues.jsonl", help="Path to pure dialogue/text dataset (no knowledge required)")
@@ -79,10 +98,10 @@ def train_translator():
     args = parser.parse_args()
     if not args.ckpt_prefix:
         args.ckpt_prefix = "translator_moss_s32_clean"
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
     tokenizer = CharTokenizer()
     # 纯文本声码器训练（默认 MOSS 对话语料，无需任何知识库输入，仅对齐 seq_len=32 标点短分句长度）
     dataset = GenericPairDataset(
@@ -98,59 +117,51 @@ def train_translator():
         min_clause_chars=args.min_target_len,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
+
     # 1. 挂载并彻底冻结 Phase 1 Encoder
-    encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
-    ckpt_path = args.encoder_ckpt
-    if os.path.exists(ckpt_path):
-        encoder.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-        print(f"Loaded frozen encoder from {ckpt_path}")
-    else:
-        print(f"WARNING: Encoder checkpoint {ckpt_path} not found. Using random weights (for testing only).")
-    
+    encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size, pad_token_id=tokenizer.pad_token_id).to(device)
+    load_frozen_encoder_checkpoint(encoder, args.encoder_ckpt, device)
+
     encoder.eval()
-    for p in encoder.parameters(): 
+    for p in encoder.parameters():
         p.requires_grad = False
-        
+
     # 2. 初始化 Translator (LM Head)
     translator = ContinuousToTextTranslatorCUDA(d_model=1024, vocab_size=tokenizer.vocab_size).to(device)
-    
+
     optimizer = optim.AdamW(translator.parameters(), lr=1e-3)
     # 对 <PAD> 赋予 0.25 权重，确保 seq_len=32 下 <EOS> 之后的空白流形稳定收敛回 <PAD> (ID=0)，彻底消除尾部乱码
     class_weights = torch.ones(tokenizer.vocab_size, device=device)
     class_weights[tokenizer.pad_token_id] = 0.25
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    
+
     checkpointer = Checkpointer(out_dir=args.out_dir, prefix=args.ckpt_prefix, keep_last_k=3)
     checkpointer.register_model("translator", translator)
     checkpointer.register_optimizer("opt", optimizer)
-    
+
     global_step = checkpointer.load_latest() if args.auto_resume else 0
     start_epoch = global_step // len(dataloader) if len(dataloader) > 0 else 0
-    
+
     print(
         f"Starting Sharpening & Denoising Translator Training "
         f"(seq_len={args.seq_len}, deblur_weight={args.deblur_weight:.2f})..."
     )
-    
+
     for epoch in range(start_epoch, args.epochs):
         resumed_loader = checkpointer.wrap_dataloader(dataloader, epoch, global_step)
         translator.train()
-        
+
         for batch_idx, batch_data in enumerate(resumed_loader):
             w_tgt = batch_data[-1].to(device)  # (B, L) - ground truth discrete tokens
             valid_mask = (w_tgt != tokenizer.pad_token_id)
-            
+
             w_deb = float(args.deblur_weight)
 
-            # Step 1: Forward through frozen encoder to get Ground Truth Continuous Curve
+            # Step 1: Forward through frozen encoder with mandatory <PAD> attention_mask & zeroing
             with torch.no_grad():
-                h_tgt = encoder.get_normalized_embeddings(w_tgt)
-                for layer in encoder.layers: 
-                    h_tgt = layer(h_tgt, None)
-                x_target = encoder.final_ln(h_tgt)  # (B, L, 1024)
+                x_target = encoder.encode_tokens(w_tgt, valid_mask.float())  # (B, L, 1024)
                 x_degraded = synthesize_degraded_manifold_curve(x_target, valid_mask) if w_deb > 0.0 else None
-            
+
             # Step 2: Predict logits from the continuous curve
             optimizer.zero_grad()
             logits_clean = translator(x_target)
@@ -163,10 +174,10 @@ def train_translator():
             else:
                 loss_deg = loss_clean
                 loss = loss_clean
-            
+
             loss.backward()
             optimizer.step()
-            
+
             global_step += 1
             if global_step % 50 == 0:
                 if w_deb > 0.0:
@@ -176,7 +187,7 @@ def train_translator():
                     )
                 else:
                     print(f"Epoch {epoch+1} | Step {global_step} | Translator Clean Loss: {loss_clean.item():.4f}")
-                
+
             if global_step == 50 or global_step % 200 == 0:
                 translator.eval()
                 with torch.no_grad():
@@ -197,8 +208,9 @@ def train_translator():
                 print(f"✅ Reached max_steps={args.max_steps}. Saving final translator checkpoint...")
                 checkpointer.save(global_step)
                 return
-                
+
         checkpointer.save(global_step)
+
 
 if __name__ == "__main__":
     train_translator()

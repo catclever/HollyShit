@@ -658,7 +658,7 @@ class ThoughtFlowMatcher(nn.Module):
         self.register_buffer("z_mean", torch.zeros(hidden_dim, dtype=torch.float32))
         self.register_buffer("z_std", torch.ones(hidden_dim, dtype=torch.float32))
         self.register_buffer("calib_steps", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("flow_version", torch.tensor(4, dtype=torch.long))
+        self.register_buffer("flow_version", torch.tensor(5, dtype=torch.long))
         self.register_buffer(
             "legendre_basis",
             _build_discrete_legendre_basis(self.num_bands, self.num_bands),
@@ -701,13 +701,26 @@ class ThoughtFlowMatcher(nn.Module):
         V = int(encoder.tok_emb.weight.shape[0])
         # Combine spherical token embeddings with 1-char encoder contextualized prototypes in 32-D subspace
         raw_tok = F.normalize(encoder.tok_emb.weight.detach().float().to(dev), p=2, dim=-1)  # (V, 1024)
-        if hasattr(encoder, "layers") and hasattr(encoder, "final_ln"):
+        if hasattr(encoder, "encode_tokens"):
             ctx_chunks = []
             ids_all = torch.arange(V, device=dev, dtype=torch.long).unsqueeze(1)  # (V, 1)
             for i in range(0, V, 512):
-                h_c = encoder.get_normalized_embeddings(ids_all[i : i + 512])
+                ids_chunk = ids_all[i : i + 512]
+                mask_chunk = torch.ones_like(ids_chunk, dtype=torch.float32)
+                h_c = encoder.encode_tokens(ids_chunk, mask_chunk).squeeze(1).float()
+                if hasattr(unet, "normalize"):
+                    h_c = unet.normalize(h_c)
+                ctx_chunks.append(h_c)
+            x_v = 0.5 * torch.cat(ctx_chunks, dim=0) + 0.5 * raw_tok
+        elif hasattr(encoder, "layers") and hasattr(encoder, "final_ln"):
+            ctx_chunks = []
+            ids_all = torch.arange(V, device=dev, dtype=torch.long).unsqueeze(1)  # (V, 1)
+            for i in range(0, V, 512):
+                ids_chunk = ids_all[i : i + 512]
+                mask_chunk = torch.ones_like(ids_chunk, dtype=torch.float32)
+                h_c = encoder.get_normalized_embeddings(ids_chunk)
                 for layer in encoder.layers:
-                    h_c = layer(h_c, None)
+                    h_c = layer(h_c, mask_chunk)
                 h_c = encoder.final_ln(h_c).squeeze(1).float()
                 if hasattr(unet, "normalize"):
                     h_c = unet.normalize(h_c)
@@ -727,7 +740,7 @@ class ThoughtFlowMatcher(nn.Module):
                 state_dict[k] = state_dict[k].reshape(-1).expand(self.hidden_dim).clone()
         fv_key = prefix + "flow_version"
         if fv_key in state_dict:
-            state_dict[fv_key] = torch.tensor(4, dtype=torch.long, device=state_dict[fv_key].device)
+            state_dict[fv_key] = torch.tensor(5, dtype=torch.long, device=state_dict[fv_key].device)
         own_sd = None
         for name, _ in self.named_parameters():
             k = prefix + name
@@ -2420,6 +2433,41 @@ class MultiStreamRightBrain(nn.Module):
             nn.init.zeros_(self.infonce_proj.bias)
         self.infonce_logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
 
+        # [Task #059 v5] Dual-Space Semantic Planning (z_god) + Conditional Z_clause Flow Bridge
+        # 1024-D Per-Dimension Semantic Whitening Buffers (#035 & #052 safe)
+        self.register_buffer("s_mean", torch.zeros(self.d_clause, dtype=torch.float32))
+        self.register_buffer("s_std", torch.ones(self.d_clause, dtype=torch.float32))
+        self.register_buffer("s_calib_steps", torch.tensor(0, dtype=torch.long))
+
+        # Semantic Nebula Head predicting (mu_sem, sigma_sem) in whitened 1024-D z_god space
+        self.sem_prior_head = PriorHead(
+            d_clause=self.d_clause,
+            num_bands=self.num_bands,
+            hidden_dim=prior_hidden,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            sigma_init=sigma_init,
+            zero_init_aux=zero_init_aux,
+        )
+        # Bridge conditioning projection injecting whitened semantic target/sample s_cond_norm into h0 / h
+        self.sem_bridge_proj = nn.Sequential(
+            nn.LayerNorm(self.d_clause),
+            nn.Linear(self.d_clause, self.d_clause),
+            nn.SiLU(),
+            nn.Linear(self.d_clause, self.d_clause),
+        )
+        with torch.no_grad():
+            nn.init.normal_(self.sem_bridge_proj[-1].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.sem_bridge_proj[-1].bias)
+        # Optional fallback estimator from whitened Z_clause to whitened z_god when stepping without token re-encoding
+        self.z_to_s_bridge = nn.Sequential(
+            nn.LayerNorm(self.d_clause),
+            nn.Linear(self.d_clause, self.d_clause),
+        )
+        with torch.no_grad():
+            nn.init.normal_(self.z_to_s_bridge[-1].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.z_to_s_bridge[-1].bias)
+
         # Non-module references to frozen Left-Brain manifold components (prevents state_dict bloat)
         self.__dict__["_left_brain_encoder"] = None
         self.__dict__["_left_brain_unet"] = None
@@ -2449,11 +2497,17 @@ class MultiStreamRightBrain(nn.Module):
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
         """
-        #038 / #051 v4 backward compatibility: populates any missing parameters/buffers (such as
-        `context_lookback.*`, `infonce_proj.*`, `infonce_logit_scale`, and v4 `flow_matcher.*` mode
-        queries / slot phase-locker / learned codebook) from `self.state_dict()` when loading an older
-        Stage-1 / v2 / v3 checkpoint so `strict=True` succeeds cleanly.
+        #038 / #051 / #059 v5 backward compatibility: populates any missing parameters/buffers (such as
+        `context_lookback.*`, `infonce_proj.*`, `infonce_logit_scale`, v4 `flow_matcher.*`, and v5
+        `s_mean`, `s_std`, `s_calib_steps`, `sem_prior_head.*`, `sem_bridge_proj.*`, `z_to_s_bridge.*`)
+        from `self.state_dict()` when loading an older Stage-1 / v2 / v3 / v4 checkpoint so `strict=True`
+        succeeds cleanly without touching non-persistent buffers (#045).
         """
+        for name in ("s_mean", "s_std"):
+            k = f"{prefix}{name}"
+            if k in state_dict and state_dict[k].shape != (self.d_clause,):
+                state_dict[k] = state_dict[k].reshape(-1).expand(self.d_clause).clone()
+
         pre_keys = set()
         for name, _ in self.named_parameters():
             if f"{prefix}{name}" in state_dict:
@@ -2482,12 +2536,12 @@ class MultiStreamRightBrain(nn.Module):
                 state_dict[key] = own_sd[name].detach().clone()
                 filled += 1
         fv_key = f"{prefix}flow_matcher.flow_version"
-        if fv_key in state_dict and int(state_dict[fv_key].item()) < 4:
-            state_dict[fv_key] = torch.tensor(4, dtype=state_dict[fv_key].dtype, device=state_dict[fv_key].device)
+        if fv_key in state_dict and int(state_dict[fv_key].item()) < 5:
+            state_dict[fv_key] = torch.tensor(5, dtype=state_dict[fv_key].dtype, device=state_dict[fv_key].device)
         self._upgraded_context_lookback = filled > 0
         if filled > 0:
             print(
-                f"ℹ️ MultiStreamRightBrain: upgraded checkpoint to v4 ({filled} new parameters/buffers initialized)."
+                f"ℹ️ MultiStreamRightBrain: upgraded checkpoint to v5 ({filled} new parameters/buffers initialized)."
             )
 
     # ------------------------------------------------------------------ legacy aliases
@@ -2567,6 +2621,65 @@ class MultiStreamRightBrain(nn.Module):
         nonzero = z.abs().sum(dim=-1, keepdim=True) > 1e-6
         z_norm = self.flow_matcher.normalize(z.float()).to(dtype=z.dtype)
         return torch.where(nonzero, z_norm, z)
+
+    @torch.no_grad()
+    def calibrate_s(
+        self,
+        s_sample: torch.Tensor,
+        max_calib_steps: int = 50,
+        momentum: float = 0.05,
+    ) -> bool:
+        """
+        Online EMA Per-Dimension Auto-Calibration for 1024-D semantic `z_god` / `s_pool` clause vectors
+        over the first `max_calib_steps` steps (#035 & #052 safe: detaches, casts to float32, and
+        explicitly matches buffer device/dtype before `copy_` / `lerp_`).
+        """
+        step = int(self.s_calib_steps.item())
+        if step >= max_calib_steps:
+            return False
+
+        s_float = s_sample.detach().float().reshape(-1, self.d_clause)
+        valid = s_float.abs().sum(dim=-1) > 1e-6
+        s_valid = s_float[valid]
+        if s_valid.numel() == 0:
+            return False
+
+        batch_mean = s_valid.mean(dim=0)
+        if s_valid.shape[0] >= 2:
+            batch_std = s_valid.std(dim=0, unbiased=False).clamp(min=1e-3)
+        else:
+            st = s_valid.std().clamp(min=1e-3) if s_valid.numel() > 1 else torch.tensor(1.0, device=s_valid.device)
+            batch_std = st.expand(self.d_clause).clone()
+
+        batch_mean = batch_mean.to(device=self.s_mean.device, dtype=self.s_mean.dtype)
+        batch_std = batch_std.to(device=self.s_std.device, dtype=self.s_std.dtype)
+
+        if step == 0:
+            self.s_mean.copy_(batch_mean)
+            self.s_std.copy_(batch_std)
+        else:
+            self.s_mean.lerp_(batch_mean, float(momentum))
+            self.s_std.lerp_(batch_std, float(momentum))
+
+        self.s_calib_steps.add_(1)
+        return True
+
+    def normalize_s(self, s: torch.Tensor) -> torch.Tensor:
+        """
+        Whitens 1024-D semantic clause vectors `s (..., D)` from `N(s_mean, diag(s_std^2))` to `N(0, I_D)`,
+        strictly preserving all-zero padding rows at 0.0.
+        """
+        nonzero = s.abs().sum(dim=-1, keepdim=True) > 1e-6
+        mean = self.s_mean.to(device=s.device, dtype=s.dtype)
+        std = self.s_std.to(device=s.device, dtype=s.dtype).clamp(min=1e-3)
+        s_norm = (s - mean) / std
+        return torch.where(nonzero, s_norm, torch.zeros_like(s))
+
+    def denormalize_s(self, s: torch.Tensor) -> torch.Tensor:
+        """Denormalizes whitened semantic vectors `s (..., D)` back to physical `z_god` / `s_pool` space."""
+        mean = self.s_mean.to(device=s.device, dtype=s.dtype)
+        std = self.s_std.to(device=s.device, dtype=s.dtype).clamp(min=1e-3)
+        return s * std + mean
 
     @torch.no_grad()
     def _jitter_high_bands_impl(
@@ -2670,30 +2783,42 @@ class MultiStreamRightBrain(nn.Module):
         self,
         aux: Optional[torch.Tensor],
         aux_valid: Optional[torch.Tensor] = None,
+        *,
+        s_aux: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Encodes companion streams `aux: (B, N, S, D)` with the shared `aux_stream` batched as (B*N, S, D)
-        and gathers the state at each stream's LAST VALID position.
+        Encodes companion streams `aux: (B, N, S, D)` (or semantic `s_aux: (B, N, S, D)` when provided)
+        with the shared `aux_stream` batched as `(B*N, S, D)` and gathers the state at each stream's
+        LAST VALID position.
         Returns `h_aux: (B, N, D)` (zeros for invalid streams) and `stream_valid: (B, N)` bool,
-        or `(None, None)` if `aux` is None or N == 0.
+        or `(None, None)` if neither `s_aux` nor `aux` is provided or N == 0.
         """
-        if aux is None or aux.shape[1] == 0 or aux.shape[2] == 0:
+        use_semantic = s_aux is not None
+        src = s_aux if use_semantic else aux
+        if src is None:
             return None, None
-        B, N, S, D = aux.shape
+        if src.dim() == 3:
+            src = src.unsqueeze(2)
+            if aux_valid is not None and aux_valid.dim() == 2:
+                aux_valid = aux_valid.unsqueeze(2)
+        if src.shape[1] == 0 or src.shape[2] == 0:
+            return None, None
+        B, N, S, D = src.shape
         if aux_valid is None:
-            aux_valid = aux.abs().sum(dim=-1) > 0
+            aux_valid = src.abs().sum(dim=-1) > 0
         valid = aux_valid.reshape(B * N, S).bool()
-        pos = torch.arange(S, device=aux.device).unsqueeze(0).expand(B * N, S)
+        pos = torch.arange(S, device=src.device).unsqueeze(0).expand(B * N, S)
         last_idx = torch.where(valid, pos, torch.full_like(pos, -1)).max(dim=-1).values  # (B*N,)
         stream_valid = last_idx >= 0
         if not bool(stream_valid.any()):
             return (
-                torch.zeros((B, N, D), device=aux.device, dtype=aux.dtype),
+                torch.zeros((B, N, D), device=src.device, dtype=src.dtype),
                 stream_valid.reshape(B, N),
             )
         # Trim trailing all-padding positions (no stream needs them) before the sequential scan.
         S_eff = int(last_idx.max().item()) + 1
-        flat = self._normalize_clause_input(aux.reshape(B * N, S, D)[:, :S_eff])
+        raw_flat = src.reshape(B * N, S, D)[:, :S_eff]
+        flat = self.normalize_s(raw_flat) if use_semantic else self._normalize_clause_input(raw_flat)
         h_seq = self.aux_stream(flat)  # (B*N, S_eff, D)
         gidx = last_idx.clamp(min=0).view(B * N, 1, 1).expand(B * N, 1, h_seq.shape[-1])
         h_last = torch.gather(h_seq, dim=1, index=gidx).squeeze(1)  # (B*N, D)
@@ -2741,6 +2866,8 @@ class MultiStreamRightBrain(nn.Module):
         aux: Optional[torch.Tensor] = None,
         aux_valid: Optional[torch.Tensor] = None,
         *,
+        s_main_seq: Optional[torch.Tensor] = None,
+        s_aux: Optional[torch.Tensor] = None,
         z_lookback_seq: Optional[torch.Tensor] = None,
         active_streams: Optional[Sequence[str]] = None,
         h_aux: Optional[torch.Tensor] = None,
@@ -2758,17 +2885,21 @@ class MultiStreamRightBrain(nn.Module):
         goal_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
-        Runs `main_stream` over `z_main_seq: (B, T, D)`, applies `context_lookback`, and fuses companion streams.
+        Runs `main_stream` over `s_main_seq: (B, T, D)` (v5 Dual-Space mode) or `z_main_seq: (B, T, D)`
+        (single-space legacy mode), applies `context_lookback` in whitened `Z_clause` space so lexical
+        slot borrowing (#040/#041) stays 100% intact, and fuses companion streams.
         Pre-encoded `h_aux` / `stream_valid` may be passed to skip `encode_aux`.
         Returns dict: h (B,T,D), h0 (B,T,D), F_aux (B,T,D), gates (B,T,N), gate_max (B,T),
         gate_sum (B,T), h_aux, stream_valid (+ `main_states`, `history_h`, `history_z` if return_state).
         """
         if z_main_seq is None:
             z_main_seq = discourse_seq
-        if z_main_seq is None:
-            raise ValueError("forward_context requires `z_main_seq`.")
-        if z_main_seq.dim() == 2:
+        if z_main_seq is None and s_main_seq is None:
+            raise ValueError("forward_context requires either `z_main_seq` or `s_main_seq`.")
+        if z_main_seq is not None and z_main_seq.dim() == 2:
             z_main_seq = z_main_seq.unsqueeze(1)
+        if s_main_seq is not None and s_main_seq.dim() == 2:
+            s_main_seq = s_main_seq.unsqueeze(1)
         if z_lookback_seq is not None and z_lookback_seq.dim() == 2:
             z_lookback_seq = z_lookback_seq.unsqueeze(1)
         if z_knowledge_seq is None:
@@ -2777,16 +2908,32 @@ class MultiStreamRightBrain(nn.Module):
             z_goal_seq = goal_seq
 
         if h_aux is None:
-            aux_r, aux_valid_r = self._resolve_aux(
-                aux, aux_valid, active_streams, z_knowledge_seq, z_goal_seq, knowledge_valid, goal_valid
-            )
-            h_aux, stream_valid = self.encode_aux(aux_r, aux_valid_r)
+            if s_aux is not None:
+                if self._use_aux(active_streams):
+                    h_aux, stream_valid = self.encode_aux(None, aux_valid, s_aux=s_aux)
+                else:
+                    h_aux, stream_valid = None, None
+            else:
+                aux_r, aux_valid_r = self._resolve_aux(
+                    aux, aux_valid, active_streams, z_knowledge_seq, z_goal_seq, knowledge_valid, goal_valid
+                )
+                h_aux, stream_valid = self.encode_aux(aux_r, aux_valid_r)
         elif not self._use_aux(active_streams):
             h_aux, stream_valid = None, None
 
-        z_main_in = self._normalize_clause_input(z_main_seq)
-        z_lb_in = self._normalize_clause_input(z_lookback_seq) if z_lookback_seq is not None else z_main_in
-        h0_raw, new_main = self.main_stream(z_main_in, states=main_states, return_state=True)
+        if s_main_seq is not None:
+            main_in = self.normalize_s(s_main_seq)
+            if z_lookback_seq is not None:
+                z_lb_in = self._normalize_clause_input(z_lookback_seq)
+            elif z_main_seq is not None:
+                z_lb_in = self._normalize_clause_input(z_main_seq)
+            else:
+                z_lb_in = torch.zeros_like(main_in)
+        else:
+            main_in = self._normalize_clause_input(z_main_seq)
+            z_lb_in = self._normalize_clause_input(z_lookback_seq) if z_lookback_seq is not None else main_in
+
+        h0_raw, new_main = self.main_stream(main_in, states=main_states, return_state=True)
         if history_h is not None and history_z is not None:
             full_h = torch.cat([history_h.to(dtype=h0_raw.dtype), h0_raw], dim=1)
             full_z = torch.cat([history_z.to(dtype=z_lb_in.dtype), z_lb_in], dim=1)
@@ -2830,6 +2977,7 @@ class MultiStreamRightBrain(nn.Module):
             ctx_clauses = getattr(self.context_lookback, "_last_ctx_clauses", None)
             ctx_weights = getattr(self.context_lookback, "_last_ctx_weights", None)
         out = self._fuse(h0, h_aux, stream_valid)
+        out["h_flow"] = out["h"]
         out["z_lookback"] = z_lookback
         out["gate_lb"] = gate_lb
         out["peak_logit"] = peak_logit
@@ -2844,9 +2992,62 @@ class MultiStreamRightBrain(nn.Module):
             out["history_z"] = full_z.detach()
         return out
 
-    def predict_prior(self, ctx: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies `prior_head` + decoupled Channel-0 / Lexical polar-band pointer-generator `z_lookback` interpolation -> (mu (…,D), sigma_band (…,nb)), float32."""
-        mu_head, sigma = self.prior_head(ctx["h0"], ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"])
+    def predict_semantic_prior(
+        self,
+        ctx: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predicts `(mu_sem, sigma_sem)` in whitened 1024-D `z_god` / `s_pool` space (`(…, D)` and `(…, num_bands)`)
+        from `(ctx['h0'], ctx['F_aux'], ctx['gate_max'], ctx['gate_sum'])`.
+        """
+        mu_sem, sigma_sem = self.sem_prior_head(
+            ctx["h0"], ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"]
+        )
+        ctx["mu_sem"] = mu_sem
+        ctx["sigma_sem_band"] = sigma_sem
+        return mu_sem, sigma_sem
+
+    def sample_semantic_from_prior(
+        self,
+        mu_sem: torch.Tensor,
+        sigma_sem: torch.Tensor,
+        temperature: float = 0.75,
+        prior_noise_scale: float = 0.35,
+    ) -> torch.Tensor:
+        """
+        Samples a whitened semantic target vector `s_hat_norm` in `z_god` space:
+          `s_hat_norm = mu_sem + (temperature * prior_noise_scale) * expand_sigma(sigma_sem) * randn_like(mu_sem)`
+        Returns `mu_sem` deterministically when `temperature <= 0`.
+        """
+        mu_f = mu_sem.float()
+        if float(temperature) <= 0.0:
+            return mu_f
+        sig_full = self.flow_matcher.expand_sigma(sigma_sem.float())
+        scale = float(temperature) * float(prior_noise_scale)
+        return mu_f + scale * sig_full * torch.randn_like(mu_f)
+
+    def predict_prior(
+        self,
+        ctx: Dict[str, torch.Tensor],
+        s_cond_norm: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Applies `prior_head` + decoupled Channel-0 / Lexical polar-band pointer-generator `z_lookback`
+        interpolation -> `(mu (…,D), sigma_band (…,nb))`, float32.
+        When `s_cond_norm` (whitened semantic target/sample) is provided, injects `sem_bridge_proj(s_cond_norm)`
+        into both `h0_cond` (for `prior_head`) and `ctx['h_flow']` (for `ThoughtFlowMatcher`).
+        When `s_cond_norm is None`, behaves 100% identically to v4 (`ctx['h_flow'] = ctx['h']`).
+        """
+        if s_cond_norm is not None:
+            delta_h0 = self.sem_bridge_proj(s_cond_norm.to(dtype=ctx["h0"].dtype))
+            h0_cond = ctx["h0"] + delta_h0
+            h_cond = ctx["h"] + delta_h0.to(dtype=ctx["h"].dtype)
+            ctx["h_flow"] = h_cond
+        else:
+            h0_cond = ctx["h0"]
+            ctx["h_flow"] = ctx["h"]
+
+        mu_head, sigma = self.prior_head(h0_cond, ctx["F_aux"], ctx["gate_max"], ctx["gate_sum"])
         ctx["mu_head"] = mu_head
         z_lb = ctx.get("z_lookback")
         g_lb = ctx.get("gate_lb")
@@ -2928,6 +3129,11 @@ class MultiStreamRightBrain(nn.Module):
         sample_group: Optional[torch.Tensor] = None,
         return_metrics: bool = True,
         *,
+        s_discourse_seq: Optional[torch.Tensor] = None,
+        s_in_override: Optional[torch.Tensor] = None,
+        s_target: Optional[torch.Tensor] = None,
+        s_aux: Optional[torch.Tensor] = None,
+        sem_self_cond_prob: float = 0.35,
         active_streams: Optional[Sequence[str]] = None,
         z_knowledge_seq: Optional[torch.Tensor] = None,
         z_goal_seq: Optional[torch.Tensor] = None,
@@ -2946,10 +3152,10 @@ class MultiStreamRightBrain(nn.Module):
         profile_cb: Optional[Any] = None,
     ):
         """
-        Right-Brain v4 training loss (#051):
-          - Liberated PriorHead Gaussian NLL + directional cosine alignment (no unit-norm/anti-stagnation inflation on mu)
-          - K=4 Explicit Mode Queries + OT-Coupled CFM + In-Flow 32-Slot Lattice Phase-Locker
-          - Mamba Next-Clause Contrastive InfoNCE loss (#046 / #051)
+        Right-Brain v5 Dual-Space training loss (#059, 100% backward-compatible with v4 when `s_discourse_seq is None`):
+          - Semantic Nebula Head (`sem_prior_head`) predicting `(mu_sem, sigma_sem)` in whitened 1024-D `z_god` space
+          - Next-Clause Contrastive InfoNCE loss in semantic `z_god` space (or `Z_clause` in legacy mode)
+          - Scheduled Semantic Bridge Conditioning (`sem_self_cond_prob`) into `PriorHead` + K=4 OT-Coupled CFM
           - Optional 1-Step Left-Brain Joint Bridge loss (`left_brain_unet` + `translator` + `w_target`)
         """
         if z_discourse_seq is None:
@@ -2961,6 +3167,7 @@ class MultiStreamRightBrain(nn.Module):
         if z_goal_seq is None:
             z_goal_seq = goal_seq
 
+        dual_space_active = s_discourse_seq is not None
         ctx_kwargs = dict(
             active_streams=active_streams, z_knowledge_seq=z_knowledge_seq, z_goal_seq=z_goal_seq,
             knowledge_valid=knowledge_valid, goal_valid=goal_valid,
@@ -2992,32 +3199,104 @@ class MultiStreamRightBrain(nn.Module):
         if self.training and not empty_valid and int(fm.calib_steps.item()) < 50:
             fm.calibrate_z(z1_v)
 
+        s_in: Optional[torch.Tensor] = None
+        s1_v: Optional[torch.Tensor] = None
+        if dual_space_active:
+            if z_target is not None:
+                s_in = s_in_override if s_in_override is not None else s_discourse_seq
+                if s_target is not None:
+                    s1 = s_target.reshape(B, 1, D)
+                else:
+                    s1 = s_discourse_seq[:, -1:, :]
+            else:
+                s_in = s_in_override if s_in_override is not None else s_discourse_seq[:, :-1, :]
+                s1 = s_target.reshape(B, 1, D) if s_target is not None else s_discourse_seq[:, 1:, :]
+            s1_v = s1.reshape(-1, D)[sel]
+            if self.training and not empty_valid and int(self.s_calib_steps.item()) < 50:
+                self.calibrate_s(s1_v)
+
         if z_target is not None:
-            ctx = self.forward_context(z_discourse_seq, aux, aux_valid, **ctx_kwargs)
+            ctx = self.forward_context(
+                z_discourse_seq,
+                aux,
+                aux_valid,
+                s_main_seq=s_in,
+                s_aux=s_aux,
+                z_lookback_seq=z_discourse_seq,
+                **ctx_kwargs,
+            )
             ctx = {
                 k: (
                     v[:, -1:]
                     if (
                         torch.is_tensor(v)
-                        and k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "peak_logit", "ctx_clauses", "ctx_weights")
+                        and k in ("h", "h_flow", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "peak_logit", "ctx_clauses", "ctx_weights")
                     )
                     else v
                 )
                 for k, v in ctx.items()
             }
         else:
-            ctx = self.forward_context(z_in, aux, aux_valid, z_lookback_seq=z_discourse_seq[:, :-1, :], **ctx_kwargs)
+            ctx = self.forward_context(
+                z_in,
+                aux,
+                aux_valid,
+                s_main_seq=s_in,
+                s_aux=s_aux,
+                z_lookback_seq=z_discourse_seq[:, :-1, :],
+                **ctx_kwargs,
+            )
 
-        mu, sigma = self.predict_prior(ctx)  # (B, Tp, D), (B, Tp, nb) float32
         h = ctx["h"]
         stop_logits = self.stop_head(h).squeeze(-1).float()  # (B, Tp)
+        h_v = h.reshape(-1, D)[sel]
+        z1n = fm.normalize(z1_v.float())
+
+        sem_nll = h_v.sum() * 0.0
+        sem_cos_val = 0.0
+        sigma_sem_god_val = 0.0
+        s_cond_norm: Optional[torch.Tensor] = None
+
+        if dual_space_active and s1_v is not None:
+            mu_sem, sig_sem = self.predict_semantic_prior(ctx)  # (B, Tp, D), (B, Tp, nb)
+            mu_sem_v = mu_sem.reshape(-1, D)[sel]
+            sig_sem_v = sig_sem.reshape(-1, nb)[sel]
+            s1n = self.normalize_s(s1_v.float())
+
+            sem_nll_raw = band_gaussian_nll(s1n, mu_sem_v.float(), sig_sem_v, nb).mean()
+            sem_cos_vec = F.cosine_similarity(mu_sem_v.float(), s1n.float(), dim=-1, eps=1e-6)
+            sem_nll = sem_nll_raw + 0.50 * (1.0 - sem_cos_vec).mean()
+            sem_cos_val = float(sem_cos_vec.mean().detach().item())
+            sigma_sem_god_val = float(sig_sem_v.detach().mean().item())
+
+            # Scheduled semantic bridge condition s_cond_norm for PriorHead + ThoughtFlowMatcher
+            with torch.no_grad():
+                n_v = s1n.shape[0]
+                s_pred_sample_v = (
+                    mu_sem_v.detach().float()
+                    + 0.25 * fm.expand_sigma(sig_sem_v.detach().float()) * torch.randn_like(mu_sem_v.float())
+                )
+                s_gt_noisy_v = s1n.detach().float() + 0.10 * torch.randn_like(s1n.float())
+                if float(sem_self_cond_prob) > 0.0:
+                    use_self = torch.rand((n_v, 1), device=s1n.device) < float(sem_self_cond_prob)
+                    s_cond_v = torch.where(use_self, s_pred_sample_v, s_gt_noisy_v)
+                else:
+                    s_cond_v = s_gt_noisy_v
+                s_cond_full = torch.zeros((B * Tp, D), device=z1.device, dtype=torch.float32)
+                s_cond_full[sel] = s_cond_v
+                s_cond_norm = s_cond_full.reshape(B, Tp, D)
+
+            k_nce_target = s1n
+        else:
+            k_nce_target = z1n
+
+        mu, sigma = self.predict_prior(ctx, s_cond_norm=s_cond_norm)  # (B, Tp, D), (B, Tp, nb) float32
         if profile_cb is not None:
             profile_cb("mamba_prior")
 
-        h_v = h.reshape(-1, D)[sel]
+        h_flow_v = ctx["h_flow"].reshape(-1, D)[sel]
         mu_v = mu.reshape(-1, D)[sel]
         sig_v = sigma.reshape(-1, nb)[sel]
-        z1n = fm.normalize(z1_v.float())
 
         z_lb_v = ctx["z_lookback"].reshape(-1, D)[sel] if ctx.get("z_lookback") is not None else None
         gate_lb_v = ctx["gate_lb"].reshape(-1, 1)[sel] if ctx.get("gate_lb") is not None else None
@@ -3039,9 +3318,9 @@ class MultiStreamRightBrain(nn.Module):
             head_cos_loss = (1.0 - F.cosine_similarity(mu_head_v.float(), z1n.float(), dim=-1, eps=1e-6)).mean()
             prior_nll = prior_nll + 0.15 * head_cos_loss
 
-        # [Task #051 v4] Mamba Next-Clause Contrastive InfoNCE Loss (#046 / #051)
+        # [Task #051 / #059 v5] Mamba Next-Clause Contrastive InfoNCE Loss (in z_god space when dual_space_active)
         q_nce = F.normalize(self.infonce_proj(h_v).float(), dim=-1, eps=1e-6)
-        k_nce = F.normalize(z1n.detach().float(), dim=-1, eps=1e-6)
+        k_nce = F.normalize(k_nce_target.detach().float(), dim=-1, eps=1e-6)
         logit_scale = self.infonce_logit_scale.float().exp().clamp(min=1.0, max=50.0)
         if q_nce.shape[0] >= 2:
             logits_nce = (q_nce @ k_nce.T) * logit_scale  # (N_v, N_v)
@@ -3125,10 +3404,10 @@ class MultiStreamRightBrain(nn.Module):
             gate_lb_loss = (gate_bce * valid_t1).sum() / valid_t1.sum().clamp(min=1.0)
             prior_nll = prior_nll + 0.40 * gate_lb_loss
 
-        # K-branch OT-coupled flow loss (mu / sigma detached inside).
+        # K-branch OT-coupled flow loss conditioned on h_flow_v (mu / sigma detached inside).
         flow_loss, fstats = fm.compute_branch_loss(
             z1n,
-            h_v,
+            h_flow_v,
             mu_v,
             sig_v,
             z_lookback=z_lb_v,
@@ -3224,6 +3503,7 @@ class MultiStreamRightBrain(nn.Module):
         total = (
             flow_loss
             + self.prior_weight * prior_nll
+            + 0.50 * sem_nll
             + self.stop_weight * stop_loss
             + 0.15 * infonce_loss
             + 0.20 * bridge_loss
@@ -3255,6 +3535,10 @@ class MultiStreamRightBrain(nn.Module):
                 "win_loss": float(fstats["win_loss"].item()),
                 "other_loss": float(fstats["other_loss"].item()),
                 "prior_nll": float(prior_nll.detach().item()),
+                "sem_nll": float(sem_nll.detach().item()),
+                "sem_cos": float(sem_cos_val),
+                "sigma_sem_god": float(sigma_sem_god_val),
+                "dual_space_active": bool(dual_space_active),
                 "infonce_loss": float(infonce_loss.detach().item()),
                 "bridge_loss": float(bridge_loss.detach().item()),
                 "gate_lb_loss": float(gate_lb_loss.detach().item()),
@@ -3303,43 +3587,87 @@ class MultiStreamRightBrain(nn.Module):
         temperature: float = 1.0,
         ode_steps: int = 10,
         *,
+        s_in: Optional[torch.Tensor] = None,
+        s_aux: Optional[torch.Tensor] = None,
+        return_dual: bool = False,
         active_streams: Optional[Sequence[str]] = None,
         z_knowledge_seq: Optional[torch.Tensor] = None,
         z_goal_seq: Optional[torch.Tensor] = None,
         renorm: bool = True,
-    ) -> torch.Tensor:
+    ):
         """
         Teacher-forced one-step-ahead sampling for scheduled self-feeding:
         `z_in: (B, T', D)` -> `z_hat: (B, T', D)` in z_clause (DENORMALIZED) space, where
         z_hat[:, t] is a sample of the clause following z_in[:, :t+1].
+        When `s_in` is provided (v5 Dual-Space mode):
+          1) Runs `forward_context` with `s_main_seq=s_in` and `z_lookback_seq=z_in`;
+          2) Predicts `(mu_sem, sig_sem) = predict_semantic_prior(ctx)` and samples `s_hat_norm`;
+          3) Conditions `predict_prior(ctx, s_cond_norm=s_hat_norm)` and `flow_matcher.sample(ctx['h_flow'], ...)`.
+          4) If `return_dual=True`, returns `(z_hat, s_hat_phys)` so scheduled self-feeding updates BOTH `z_in` and `s_in`.
         """
+        eff_temp = min(float(temperature), 0.35)
+        if s_in is not None:
+            ctx = self.forward_context(
+                z_in,
+                aux,
+                aux_valid,
+                s_main_seq=s_in,
+                s_aux=s_aux,
+                z_lookback_seq=z_in,
+                active_streams=active_streams,
+                z_knowledge_seq=z_knowledge_seq,
+                z_goal_seq=z_goal_seq,
+            )
+            mu_sem, sig_sem = self.predict_semantic_prior(ctx)
+            s_hat_norm = self.sample_semantic_from_prior(mu_sem, sig_sem, temperature=eff_temp)
+            mu, sigma = self.predict_prior(ctx, s_cond_norm=s_hat_norm)
+            z_hat = self.flow_matcher.sample(
+                ctx["h_flow"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=eff_temp, renorm=renorm,
+            ).to(dtype=z_in.dtype)
+            if return_dual:
+                s_hat_phys = self.denormalize_s(s_hat_norm).to(dtype=s_in.dtype)
+                return z_hat, s_hat_phys
+            return z_hat
+
         ctx = self.forward_context(
             z_in, aux, aux_valid, active_streams=active_streams,
             z_knowledge_seq=z_knowledge_seq, z_goal_seq=z_goal_seq,
         )
         mu, sigma = self.predict_prior(ctx)
-        eff_temp = min(float(temperature), 0.35)
         z_hat = self.flow_matcher.sample(
-            ctx["h"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=eff_temp, renorm=renorm,
-        )
-        return z_hat.to(dtype=z_in.dtype)
+            ctx["h_flow"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=eff_temp, renorm=renorm,
+        ).to(dtype=z_in.dtype)
+        if return_dual:
+            s_hat_est = self.z_to_s_bridge(self.flow_matcher.normalize(z_hat.float()))
+            return z_hat, self.denormalize_s(s_hat_est).to(dtype=z_in.dtype)
+        return z_hat
 
     def step(
         self,
-        z_t: torch.Tensor,
+        z_t: Optional[torch.Tensor] = None,
         states: Optional[Dict[str, Any]] = None,
         h_aux: Optional[torch.Tensor] = None,
         stream_valid: Optional[torch.Tensor] = None,
+        *,
+        s_t: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
         """
-        Advances the main stream by ONE clause `z_t: (B, D)`, applies `context_lookback.step`
-        over the accumulated clause history, and fuses pre-encoded companions.
-        Returns `(ctx, new_states)` where ctx has h/h0/F_aux/gates/gate_max/gate_sum of shape (B, ·).
+        Advances the main stream by ONE clause (`s_t: (B, D)` in v5 Dual-Space mode, or `z_t: (B, D)`
+        in single-space legacy mode), applies `context_lookback.step` over the accumulated `Z_clause`
+        history, and fuses pre-encoded companions.
+        Returns `(ctx, new_states)` where ctx has h/h_flow/h0/F_aux/gates/gate_max/gate_sum of shape (B, ·).
         """
+        if z_t is None and s_t is None:
+            raise ValueError("MultiStreamRightBrain.step requires either `z_t` or `s_t`.")
         states = {} if states is None else states
         new_states: Dict[str, Any] = dict(states)
-        z_t_in = self._normalize_clause_input(z_t)
-        h0_raw_t, new_states["main"] = self.main_stream.step(z_t_in, states.get("main"))
+        if s_t is not None:
+            main_t_in = self.normalize_s(s_t)
+            z_t_in = self._normalize_clause_input(z_t) if z_t is not None else torch.zeros_like(main_t_in)
+        else:
+            main_t_in = self._normalize_clause_input(z_t)
+            z_t_in = main_t_in
+        h0_raw_t, new_states["main"] = self.main_stream.step(main_t_in, states.get("main"))
         prev_h = states.get("history_h")
         prev_z = states.get("history_z")
         if prev_h is not None and prev_z is not None:
@@ -3362,6 +3690,7 @@ class MultiStreamRightBrain(nn.Module):
         )
         ctx = self._fuse(h0_t.unsqueeze(1), h_aux, stream_valid)
         ctx = {k: v.squeeze(1) for k, v in ctx.items()}
+        ctx["h_flow"] = ctx["h"]
         ctx["z_lookback"] = z_lb_t
         ctx["gate_lb"] = gate_lb_t
         last_cc = getattr(self.context_lookback, "_last_ctx_clauses", None)
@@ -3373,7 +3702,7 @@ class MultiStreamRightBrain(nn.Module):
     @torch.no_grad()
     def step_clause(
         self,
-        z_curr: torch.Tensor,
+        z_curr: Optional[torch.Tensor] = None,
         states: Optional[Dict[str, Any]] = None,
         aux: Optional[torch.Tensor] = None,
         aux_valid: Optional[torch.Tensor] = None,
@@ -3381,6 +3710,8 @@ class MultiStreamRightBrain(nn.Module):
         temperature: float = 0.8,
         return_all: bool = False,
         *,
+        s_curr: Optional[torch.Tensor] = None,
+        s_aux: Optional[torch.Tensor] = None,
         active_streams: Optional[Sequence[str]] = None,
         refresh_aux: bool = False,
         z_knowledge: Optional[torch.Tensor] = None,
@@ -3393,32 +3724,65 @@ class MultiStreamRightBrain(nn.Module):
         Autoregressive single-clause step for rollout:
           1. Encodes companions ONCE (cached as states['h_aux'] / states['stream_valid']; pass
              `refresh_aux=True` to re-encode, e.g. when per-clause selection changes the pool).
-          2. Steps `main_stream` with `z_curr: (B, D)` (or last clause of (B, T, D)).
-          3. Prior head -> (mu, sigma_band); samples `z_thought` from the adaptive cone.
+          2. Steps `main_stream` with `s_curr` (v5 Dual-Space mode) or `z_curr` (legacy mode).
+          3. In Dual-Space mode, predicts `(mu_sem, sig_sem)` -> samples `s_hat_norm` -> conditions
+             `predict_prior(..., s_cond_norm=s_hat_norm)` and `flow_matcher.sample(ctx['h_flow'], ...)`.
         Returns `(z_thought, new_states)` or, with `return_all`, `(z_thought, h_t, new_states, info)` where
-        info = {stop_prob (B,), sigma_band (B, nb), gates (B, N), mu (B, D) normalized}.
+        info includes `s_pred`, `mu_sem`, `sigma_sem_band` when `s_curr` is provided.
         """
+        if z_curr is None and s_curr is None:
+            raise ValueError("step_clause requires either `z_curr` or `s_curr`.")
         states = {} if states is None else states
         new_states: Dict[str, Any] = dict(states)
-        z_t = z_curr[:, -1, :] if z_curr.dim() == 3 else z_curr
+        z_t = (z_curr[:, -1, :] if z_curr.dim() == 3 else z_curr) if z_curr is not None else None
+        s_t = (s_curr[:, -1, :] if s_curr.dim() == 3 else s_curr) if s_curr is not None else None
+        out_dtype = z_t.dtype if z_t is not None else s_t.dtype
 
         if refresh_aux or not states.get("aux_encoded", False):
-            aux_r, aux_valid_r = self._resolve_aux(
-                aux, aux_valid, active_streams, z_knowledge, z_goal, knowledge_valid, goal_valid
-            )
-            h_aux, stream_valid = self.encode_aux(aux_r, aux_valid_r)
+            if s_aux is not None:
+                if self._use_aux(active_streams):
+                    h_aux, stream_valid = self.encode_aux(None, aux_valid, s_aux=s_aux)
+                else:
+                    h_aux, stream_valid = None, None
+            else:
+                aux_r, aux_valid_r = self._resolve_aux(
+                    aux, aux_valid, active_streams, z_knowledge, z_goal, knowledge_valid, goal_valid
+                )
+                h_aux, stream_valid = self.encode_aux(aux_r, aux_valid_r)
             new_states["h_aux"] = h_aux
             new_states["stream_valid"] = stream_valid
             new_states["aux_encoded"] = True
         h_aux = new_states.get("h_aux")
         stream_valid = new_states.get("stream_valid")
 
-        ctx, new_states = self.step(z_t, new_states, h_aux, stream_valid)
-        mu, sigma = self.predict_prior(ctx)
+        ctx, new_states = self.step(z_t, new_states, h_aux, stream_valid, s_t=s_t)
         h_t = ctx["h"]
+
+        if s_t is not None:
+            mu_sem, sig_sem = self.predict_semantic_prior(ctx)
+            s_hat_norm = self.sample_semantic_from_prior(mu_sem, sig_sem, temperature=temperature)
+            mu, sigma = self.predict_prior(ctx, s_cond_norm=s_hat_norm)
+            z_thought = self.flow_matcher.sample(
+                ctx["h_flow"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=temperature, renorm=renorm,
+            ).to(dtype=out_dtype)
+            if return_all:
+                s_hat_phys = self.denormalize_s(s_hat_norm).to(dtype=s_t.dtype)
+                info = {
+                    "stop_prob": torch.sigmoid(self.stop_head(h_t).float()).squeeze(-1),
+                    "sigma_band": sigma,
+                    "gates": ctx["gates"],
+                    "mu": mu,
+                    "s_pred": s_hat_phys,
+                    "mu_sem": mu_sem,
+                    "sigma_sem_band": sig_sem,
+                }
+                return z_thought, h_t, new_states, info
+            return z_thought, new_states
+
+        mu, sigma = self.predict_prior(ctx)
         z_thought = self.flow_matcher.sample(
-            h_t, mu=mu, sigma_band=sigma, steps=ode_steps, temperature=temperature, renorm=renorm,
-        ).to(dtype=z_t.dtype)
+            ctx["h_flow"], mu=mu, sigma_band=sigma, steps=ode_steps, temperature=temperature, renorm=renorm,
+        ).to(dtype=out_dtype)
         if return_all:
             info = {
                 "stop_prob": torch.sigmoid(self.stop_head(h_t).float()).squeeze(-1),
@@ -3432,35 +3796,58 @@ class MultiStreamRightBrain(nn.Module):
     @torch.no_grad()
     def sample_candidate_clauses(
         self,
-        discourse_seq: torch.Tensor,
+        discourse_seq: Optional[torch.Tensor] = None,
         aux: Optional[torch.Tensor] = None,
         aux_valid: Optional[torch.Tensor] = None,
         steps: int = 4,
         temperature: float = 0.75,
         num_candidates: int = 4,
         *,
+        s_discourse_seq: Optional[torch.Tensor] = None,
+        s_aux: Optional[torch.Tensor] = None,
         active_streams: Optional[Sequence[str]] = None,
         knowledge_seq: Optional[torch.Tensor] = None,
         goal_seq: Optional[torch.Tensor] = None,
         renorm: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
-        [Task #051 v4] Samples `K = num_candidates` explicit candidate clauses following `discourse_seq: (B, T, D)`
+        [Task #051 v4 / #059 v5] Samples `K = num_candidates` explicit candidate clauses following
+        `discourse_seq: (B, T, D)` (and optional `s_discourse_seq: (B, T, D)` in Dual-Space mode)
         using K=4 orthogonal mode queries and same-position bimodal peak forking.
         Returns `(z_cands: (B, K, D), cand_scores: (B, K), info_dict)`.
         """
+        if discourse_seq is None and s_discourse_seq is None:
+            raise ValueError("sample_candidate_clauses requires `discourse_seq` or `s_discourse_seq`.")
+        ref_seq = discourse_seq if discourse_seq is not None else s_discourse_seq
         ctx = self.forward_context(
-            discourse_seq, aux, aux_valid, active_streams=active_streams,
-            z_knowledge_seq=knowledge_seq, z_goal_seq=goal_seq,
+            discourse_seq,
+            aux,
+            aux_valid,
+            s_main_seq=s_discourse_seq,
+            s_aux=s_aux,
+            z_lookback_seq=discourse_seq,
+            active_streams=active_streams,
+            z_knowledge_seq=knowledge_seq,
+            z_goal_seq=goal_seq,
         )
         last = {
             k: v[:, -1]
             for k, v in ctx.items()
-            if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
+            if k in ("h", "h_flow", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
         }
-        mu, sigma = self.predict_prior(last)
+        s_hat_phys: Optional[torch.Tensor] = None
+        mu_sem: Optional[torch.Tensor] = None
+        sig_sem: Optional[torch.Tensor] = None
+        if s_discourse_seq is not None:
+            mu_sem, sig_sem = self.predict_semantic_prior(last)
+            s_hat_norm = self.sample_semantic_from_prior(mu_sem, sig_sem, temperature=temperature)
+            mu, sigma = self.predict_prior(last, s_cond_norm=s_hat_norm)
+            s_hat_phys = self.denormalize_s(s_hat_norm).to(dtype=s_discourse_seq.dtype)
+        else:
+            mu, sigma = self.predict_prior(last)
+
         z_cands, cand_scores = self.flow_matcher.sample_candidates(
-            last["h"],
+            last["h_flow"],
             mu=mu,
             sigma_band=sigma,
             steps=steps,
@@ -3468,40 +3855,77 @@ class MultiStreamRightBrain(nn.Module):
             num_candidates=num_candidates,
             renorm=renorm,
         )
-        info = {
+        info: Dict[str, Any] = {
             "h": last["h"],
+            "h_flow": last["h_flow"],
             "mu": mu,
             "sigma_band": sigma,
             "stop_prob": torch.sigmoid(self.stop_head(last["h"]).float()).squeeze(-1),
             "gate_lb": last.get("gate_lb"),
         }
-        return z_cands.to(dtype=discourse_seq.dtype), cand_scores, info
+        if s_hat_phys is not None:
+            info["s_pred"] = s_hat_phys
+            info["mu_sem"] = mu_sem
+            info["sigma_sem_band"] = sig_sem
+        return z_cands.to(dtype=ref_seq.dtype), cand_scores, info
 
     @torch.no_grad()
     def sample_thought(
         self,
-        discourse_seq: torch.Tensor,
+        discourse_seq: Optional[torch.Tensor] = None,
         aux: Optional[torch.Tensor] = None,
         aux_valid: Optional[torch.Tensor] = None,
         steps: int = 10,
         temperature: float = 1.0,
         *,
+        s_discourse_seq: Optional[torch.Tensor] = None,
+        s_aux: Optional[torch.Tensor] = None,
+        return_dual: bool = False,
         active_streams: Optional[Sequence[str]] = None,
         knowledge_seq: Optional[torch.Tensor] = None,
         goal_seq: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Samples the clause following `discourse_seq: (B, T, D)`. Returns `(z_thought (B, D), h_T (B, D))`."""
+    ):
+        """
+        Samples the clause following `discourse_seq: (B, T, D)` (and optional `s_discourse_seq` in v5 Dual-Space mode).
+        Returns `(z_thought (B, D), h_T (B, D))`, or `(z_thought, s_hat_phys, h_T)` when `return_dual=True`.
+        """
+        if discourse_seq is None and s_discourse_seq is None:
+            raise ValueError("sample_thought requires `discourse_seq` or `s_discourse_seq`.")
         ctx = self.forward_context(
-            discourse_seq, aux, aux_valid, active_streams=active_streams,
-            z_knowledge_seq=knowledge_seq, z_goal_seq=goal_seq,
+            discourse_seq,
+            aux,
+            aux_valid,
+            s_main_seq=s_discourse_seq,
+            s_aux=s_aux,
+            z_lookback_seq=discourse_seq,
+            active_streams=active_streams,
+            z_knowledge_seq=knowledge_seq,
+            z_goal_seq=goal_seq,
         )
         last = {
             k: v[:, -1]
             for k, v in ctx.items()
-            if k in ("h", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
+            if k in ("h", "h_flow", "h0", "F_aux", "gates", "gate_max", "gate_sum", "z_lookback", "gate_lb", "ctx_clauses", "ctx_weights") and v is not None
         }
+        if s_discourse_seq is not None:
+            mu_sem, sig_sem = self.predict_semantic_prior(last)
+            s_hat_norm = self.sample_semantic_from_prior(mu_sem, sig_sem, temperature=temperature)
+            mu, sigma = self.predict_prior(last, s_cond_norm=s_hat_norm)
+            z_thought = self.flow_matcher.sample(
+                last["h_flow"], mu=mu, sigma_band=sigma, steps=steps, temperature=temperature
+            )
+            if return_dual:
+                s_hat_phys = self.denormalize_s(s_hat_norm).to(dtype=s_discourse_seq.dtype)
+                return z_thought, s_hat_phys, last["h"]
+            return z_thought, last["h"]
+
         mu, sigma = self.predict_prior(last)
-        z_thought = self.flow_matcher.sample(last["h"], mu=mu, sigma_band=sigma, steps=steps, temperature=temperature)
+        z_thought = self.flow_matcher.sample(
+            last["h_flow"], mu=mu, sigma_band=sigma, steps=steps, temperature=temperature
+        )
+        if return_dual:
+            s_hat_est = self.z_to_s_bridge(self.flow_matcher.normalize(z_thought.float()))
+            return z_thought, self.denormalize_s(s_hat_est), last["h"]
         return z_thought, last["h"]
 
 

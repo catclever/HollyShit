@@ -63,14 +63,16 @@ from training.core.char_tokenizer import CharTokenizer
 from training.core.args import get_training_parser
 from training.core.checkpoint import Checkpointer
 
-from model.phase1_charencoder_cuda import TinyCharEncoderCUDA
+from model.phase1_charencoder_cuda import TinyCharEncoderCUDA, load_mlx_safetensors_into_torch
 from model.continuous_translator_cuda import ContinuousToTextTranslatorCUDA
 from model.hippo_oracle import HiPPOOracleCUDA
 from model.flow_unet_cuda import LeftBrainCrystallizer
 
-# #029: final module names only (no `_027` fallbacks) — v2 API (`pack_aux_streams`, `step_clause(return_all)`,
-# `compute_clause_selection_loss`, `discourse_stop_mask` / `cand_clause_rel`) is required.
-from model.bicameral_right_brain import MultiStreamRightBrain, KnowledgeSelector
+# #029 / #059: draft module names during verification (merger restores canonical imports).
+from model.bicameral_right_brain import (
+    MultiStreamRightBrain,
+    KnowledgeSelector,
+)
 from training.data.knowledge_dataset import (
     BicameralClauseChainDataset,
     create_clause_chain_dataloader,
@@ -362,11 +364,11 @@ def decode_clause_clean(tokenizer: CharTokenizer, token_ids: List[int]) -> str:
 
 @torch.no_grad()
 def encode_tokens(encoder: TinyCharEncoderCUDA, token_ids: torch.Tensor) -> torch.Tensor:
-    """Encodes token IDs `(N, L)` through the frozen Phase 1 `TinyCharEncoderCUDA` into `(N, L, 1024)`."""
-    h = encoder.get_normalized_embeddings(token_ids)
-    for layer in encoder.layers:
-        h = layer(h, None)
-    return encoder.final_ln(h)
+    """
+    Encodes token IDs `(N, L)` through the frozen Phase 1 v2 `TinyCharEncoderCUDA` into `(N, L, 1024)`
+    with mandatory `<PAD>` attention masking and strict zeroing of padded positions.
+    """
+    return encoder.encode_tokens(token_ids)
 
 
 @torch.no_grad()
@@ -397,8 +399,8 @@ def encode_clause_bank_to_2d(
     flat_tok_valid = tok_valid.reshape(B * M, L)
     active_idx = torch.nonzero(active_clause_mask.reshape(B * M), as_tuple=False).squeeze(-1)
 
-    x_active = encode_tokens(encoder, flat_w[active_idx])  # (N_active, L, D)
     active_tok_mask = flat_tok_valid[active_idx]
+    x_active = encoder.encode_tokens(flat_w[active_idx], active_tok_mask.float())  # (N_active, L, D)
 
     if int(unet.calib_steps.item()) == 0:
         unet.calibrate_manifold(x_active, valid_mask=active_tok_mask)
@@ -416,6 +418,77 @@ def encode_clause_bank_to_2d(
     z_bank = z_flat.reshape(B, M, D)
     z_bank = z_bank * clause_valid_mask.unsqueeze(-1).to(dtype=z_bank.dtype)
     return z_bank
+
+
+@torch.no_grad()
+def encode_clause_bank_dual(
+    encoder: TinyCharEncoderCUDA,
+    unet: LeftBrainCrystallizer,
+    hippo_oracle: HiPPOOracleCUDA,
+    w_bank: torch.Tensor,
+    clause_valid_mask: torch.Tensor,
+    pad_token_id: int,
+    semantic_source: str = "z_god",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    [Task #059] Encodes a 3D clause token bank `w_bank: (B, M, L)` into BOTH:
+      1) `z_bank: (B, M, 1024)` — 2D HiPPO Legendre character-waveform vector (`Z_clause`)
+      2) `s_bank: (B, M, 1024)` — 1024-D clause semantic planning vector (`z_god` or `s_pool`)
+    in a SINGLE masked Transformer forward pass (`encoder.encode_dual(..., return_hidden=True)`).
+    Invalid/padded clause rows (`clause_valid_mask == False`) are strictly zeroed out in both outputs.
+    """
+    if semantic_source not in ("z_god", "s_pool"):
+        raise ValueError(f"Unsupported semantic_source='{semantic_source}'; expected 'z_god' or 's_pool'.")
+
+    B, M, L = w_bank.shape
+    device = w_bank.device
+    D = unet.hidden_dim
+    D_sem = encoder.z_dim if semantic_source == "z_god" else encoder.d_model
+
+    tok_valid = (w_bank != pad_token_id) & clause_valid_mask.bool().unsqueeze(-1)
+    active_clause_mask = tok_valid.any(dim=-1)  # (B, M)
+
+    if not active_clause_mask.any():
+        return (
+            torch.zeros((B, M, D), device=device, dtype=torch.float32),
+            torch.zeros((B, M, D_sem), device=device, dtype=torch.float32),
+        )
+
+    flat_w = w_bank.reshape(B * M, L)
+    flat_tok_valid = tok_valid.reshape(B * M, L)
+    active_idx = torch.nonzero(active_clause_mask.reshape(B * M), as_tuple=False).squeeze(-1)
+    active_tok_mask = flat_tok_valid[active_idx]
+
+    dual = encoder.encode_dual(
+        flat_w[active_idx],
+        active_tok_mask.float(),
+        return_hidden=True,
+    )
+    s_active = dual["z_god"] if semantic_source == "z_god" else dual["s_pool"]
+    x_active = dual["h_tokens"]  # (N_active, L, D)
+
+    if int(unet.calib_steps.item()) == 0:
+        unet.calibrate_manifold(x_active, valid_mask=active_tok_mask)
+
+    x_active_norm = unet.normalize(x_active)
+    z_active = hippo_oracle(
+        x_active_norm,
+        return_sequence=False,
+        valid_mask=active_tok_mask,
+        subspace_proj=unet.subspace_proj,
+    )  # (N_active, D)
+
+    z_flat = torch.zeros((B * M, D), device=device, dtype=z_active.dtype)
+    z_flat[active_idx] = z_active
+    z_bank = z_flat.reshape(B, M, D)
+    z_bank = z_bank * clause_valid_mask.unsqueeze(-1).to(dtype=z_bank.dtype)
+
+    s_flat = torch.zeros((B * M, D_sem), device=device, dtype=s_active.dtype)
+    s_flat[active_idx] = s_active
+    s_bank = s_flat.reshape(B, M, D_sem)
+    s_bank = s_bank * clause_valid_mask.unsqueeze(-1).to(dtype=s_bank.dtype)
+
+    return z_bank, s_bank
 
 
 @torch.no_grad()
@@ -584,6 +657,7 @@ def evaluate_dual_brain_rollout(
     print("=" * 92)
 
     first_sample_cache: Optional[Dict[str, Any]] = None
+    dual_mode = getattr(args, "planning_space", "z_clause") in ("z_god", "s_pool")
 
     for dom_name, sample_idx in benchmark_samples:
         item = dataset[sample_idx]
@@ -595,9 +669,23 @@ def evaluate_dual_brain_rollout(
         w_disc = item["w_discourse"].unsqueeze(0).to(device)             # (1, T, L)
         disc_valid = item["discourse_valid_mask"].unsqueeze(0).to(device)  # (1, T)
 
-        z_goal = encode_clause_bank_to_2d(encoder, unet, hippo_oracle, w_goal, goal_valid, pad_id)
-        z_cand = encode_clause_bank_to_2d(encoder, unet, hippo_oracle, w_cand, cand_valid, pad_id)
-        z_disc = encode_clause_bank_to_2d(encoder, unet, hippo_oracle, w_disc, disc_valid, pad_id)
+        if dual_mode:
+            z_goal, s_goal = encode_clause_bank_dual(
+                encoder, unet, hippo_oracle, w_goal, goal_valid, pad_id, semantic_source=args.planning_space
+            )
+            z_cand, s_cand = encode_clause_bank_dual(
+                encoder, unet, hippo_oracle, w_cand, cand_valid, pad_id, semantic_source=args.planning_space
+            )
+            z_disc, s_disc = encode_clause_bank_dual(
+                encoder, unet, hippo_oracle, w_disc, disc_valid, pad_id, semantic_source=args.planning_space
+            )
+            s_aux_full, _ = right_brain.pack_aux_streams(s_goal, goal_valid, s_cand, cand_valid)
+        else:
+            z_goal = encode_clause_bank_to_2d(encoder, unet, hippo_oracle, w_goal, goal_valid, pad_id)
+            z_cand = encode_clause_bank_to_2d(encoder, unet, hippo_oracle, w_cand, cand_valid, pad_id)
+            z_disc = encode_clause_bank_to_2d(encoder, unet, hippo_oracle, w_disc, disc_valid, pad_id)
+            s_disc = None
+            s_aux_full = None
 
         aux_full, aux_valid_full = right_brain.pack_aux_streams(z_goal, goal_valid, z_cand, cand_valid)
 
@@ -645,6 +733,7 @@ def evaluate_dual_brain_rollout(
 
             rb_states: Optional[Dict[str, Any]] = None
             z_curr = z_disc[:, 0, :]  # Clause 0: lead question departure clause
+            s_curr = s_disc[:, 0, :] if dual_mode and s_disc is not None else None
             rollout_strs: List[str] = []
             step_lines: List[str] = []
             clause1_cos = 0.0
@@ -663,6 +752,8 @@ def evaluate_dual_brain_rollout(
                         ode_steps=args.right_ode_steps,
                         temperature=args.temperature,
                         return_all=True,
+                        s_curr=s_curr,
+                        s_aux=s_aux_full,
                     )
                 z_thought_c = z_thought_c.float()
                 x_clause_gen, top_scores = select_and_crystallize_clause(
@@ -710,8 +801,23 @@ def evaluate_dual_brain_rollout(
                         subspace_proj=unet.subspace_proj,
                     )
                     z_curr = z_reencoded.to(dtype=z_disc.dtype)
+                    if dual_mode and s_disc is not None:
+                        if translator is not None:
+                            w_re = torch.argmax(translator(x_clause_gen.float()), dim=-1)
+                            w_re = torch.where(gen_valid_mask.bool(), w_re, torch.full_like(w_re, pad_id))
+                            if gen_valid_mask.any():
+                                dual_re = encoder.encode_dual(w_re, gen_valid_mask.float(), return_hidden=False)
+                                s_curr = (
+                                    dual_re["z_god"] if args.planning_space == "z_god" else dual_re["s_pool"]
+                                ).to(dtype=s_disc.dtype)
+                            else:
+                                s_curr = info["s_pred"].to(dtype=s_disc.dtype)
+                        else:
+                            s_curr = info["s_pred"].to(dtype=s_disc.dtype)
                 else:
                     z_curr = z_thought_c.to(dtype=z_disc.dtype)
+                    if dual_mode and s_disc is not None:
+                        s_curr = info["s_pred"].to(dtype=s_disc.dtype)
 
                 if stop_prob > float(args.stop_threshold):
                     stopped_at = c_step
@@ -734,8 +840,9 @@ def evaluate_dual_brain_rollout(
 
         if first_sample_cache is None:
             first_sample_cache = dict(
-                dom_name=dom_name, sample_idx=sample_idx, z_disc=z_disc, z_cand=z_cand, w_cand=w_cand,
-                w_goal=w_goal, cand_valid=cand_valid, aux_full=aux_full, aux_valid_full=aux_valid_full,
+                dom_name=dom_name, sample_idx=sample_idx, z_disc=z_disc, s_disc=s_disc, z_cand=z_cand, w_cand=w_cand,
+                w_goal=w_goal, cand_valid=cand_valid, aux_full=aux_full, s_aux_full=s_aux_full,
+                aux_valid_full=aux_valid_full,
                 gt1=gt_clause_strs[0] if gt_clause_strs else "",
                 has_gt1=num_valid_disc >= 2,
             )
@@ -764,6 +871,8 @@ def evaluate_dual_brain_rollout(
                         ode_steps=args.right_ode_steps,
                         temperature=args.temperature,
                         return_all=True,
+                        s_curr=fc["s_disc"][:, 0, :] if dual_mode and fc["s_disc"] is not None else None,
+                        s_aux=fc["s_aux_full"] if dual_mode else None,
                     )
                 z_s = z_s.float()
                 z_samples.append(z_s[0])
@@ -890,6 +999,19 @@ def train():
     parser.add_argument("--rel_overlap_threshold", type=float, default=0.15, help="Min bigram overlap for cand_clause_rel pseudo-labels")
     parser.add_argument("--eval_conditions", type=str, default="full,none", help="Comma-separated rollout conditions: full,goal_only,none")
     parser.add_argument("--eval_num_samples", type=int, default=3, help="Clause-1 samples per condition in the diversity demo (0=off)")
+    parser.add_argument(
+        "--planning_space",
+        type=str,
+        default="z_god",
+        choices=["z_god", "s_pool", "z_clause"],
+        help="Right-Brain Mamba planning space: 'z_god' (default), 's_pool', or legacy 'z_clause'",
+    )
+    parser.add_argument(
+        "--sem_self_cond_prob",
+        type=float,
+        default=0.35,
+        help="Probability of conditioning Z_clause bridge on predicted semantic sample instead of noisy GT",
+    )
     parser.add_argument(
         "--auto_resume", dest="auto_resume", action="store_true",
         help="Alias of --continue: resume from the latest compatible checkpoint with the current --ckpt_prefix",
@@ -1022,8 +1144,18 @@ def train():
     # 2. Frozen Left-Brain & Perception Modules
     encoder = TinyCharEncoderCUDA(vocab_size=tokenizer.vocab_size).to(device)
     if os.path.exists(args.encoder_ckpt):
-        encoder.load_state_dict(torch.load(args.encoder_ckpt, map_location=device, weights_only=True))
-        print(f"✅ Loaded frozen TinyCharEncoderCUDA from {args.encoder_ckpt}")
+        if args.encoder_ckpt.endswith(".safetensors"):
+            load_mlx_safetensors_into_torch(encoder, args.encoder_ckpt)
+            encoder.to(device)
+            print(f"✅ Loaded frozen TinyCharEncoderCUDA (safetensors) from {args.encoder_ckpt}")
+        else:
+            raw_enc_sd = torch.load(args.encoder_ckpt, map_location=device, weights_only=True)
+            missing_k, unexpected_k = encoder.load_state_dict(raw_enc_sd, strict=False)
+            print(f"✅ Loaded frozen TinyCharEncoderCUDA from {args.encoder_ckpt}")
+            if missing_k:
+                print(f"   ℹ️ Legacy encoder checkpoint missing keys (initialized fresh): {missing_k}")
+            if unexpected_k:
+                print(f"   ℹ️ Encoder checkpoint unexpected keys (ignored): {unexpected_k}")
     else:
         print(f"⚠️ WARNING: Encoder checkpoint '{args.encoder_ckpt}' not found! Using random weights (for testing only).")
     encoder.eval()
@@ -1048,6 +1180,7 @@ def train():
         left_ckpt_path = os.path.join(left_ckpt_path, "unet.pt")
 
     loaded_left_ok = False
+    discovered_left = None
     if left_ckpt_path and os.path.exists(left_ckpt_path):
         try:
             unet.load_state_dict(torch.load(left_ckpt_path, map_location=device, weights_only=True), strict=True)
@@ -1074,7 +1207,11 @@ def train():
                 f"(Mean={unet.manifold_mean.item():.4f}, Std={unet.manifold_std.item():.4f})"
             )
         else:
-            print("⚠️ WARNING: No compatible LeftBrainCrystallizer checkpoint found; manifold will auto-calibrate on Batch 0.")
+            locked_ok = unet.bind_encoder_subspace(encoder)
+            print(
+                f"⚠️ WARNING: No compatible LeftBrainCrystallizer checkpoint found; "
+                f"bound encoder subspace_proj={locked_ok}, manifold mean/std will auto-calibrate on Batch 0."
+            )
     unet.eval()
     for p in unet.parameters():
         p.requires_grad = False
@@ -1194,6 +1331,7 @@ def train():
         f"probe_noise={args.probe_noise_std} | ckpt_prefix={args.ckpt_prefix}"
     )
 
+    dual_mode = args.planning_space in ("z_god", "s_pool")
     optimizer.zero_grad(set_to_none=True)
     last_log_time = time.time()
     last_log_step = global_step
@@ -1226,15 +1364,32 @@ def train():
 
             B_cur = w_discourse.shape[0]
             with torch.no_grad():
-                z_discourse = encode_clause_bank_to_2d(
-                    encoder, unet, hippo_oracle, w_discourse, discourse_valid_mask, pad_id
-                )  # (B, T, 1024)
-                z_goal = encode_clause_bank_to_2d(
-                    encoder, unet, hippo_oracle, w_goal, goal_valid_mask, pad_id
-                )  # (B, G, 1024)
-                z_cand = encode_clause_bank_to_2d(
-                    encoder, unet, hippo_oracle, w_cand, cand_valid_mask, pad_id
-                )  # (B, C, 1024)
+                if dual_mode:
+                    z_discourse, s_discourse = encode_clause_bank_dual(
+                        encoder, unet, hippo_oracle, w_discourse, discourse_valid_mask, pad_id,
+                        semantic_source=args.planning_space,
+                    )
+                    z_goal, s_goal = encode_clause_bank_dual(
+                        encoder, unet, hippo_oracle, w_goal, goal_valid_mask, pad_id,
+                        semantic_source=args.planning_space,
+                    )
+                    z_cand, s_cand = encode_clause_bank_dual(
+                        encoder, unet, hippo_oracle, w_cand, cand_valid_mask, pad_id,
+                        semantic_source=args.planning_space,
+                    )
+                    s_aux, _ = right_brain.pack_aux_streams(s_goal, goal_valid_mask, s_cand, cand_valid_mask)
+                else:
+                    z_discourse = encode_clause_bank_to_2d(
+                        encoder, unet, hippo_oracle, w_discourse, discourse_valid_mask, pad_id
+                    )  # (B, T, 1024)
+                    z_goal = encode_clause_bank_to_2d(
+                        encoder, unet, hippo_oracle, w_goal, goal_valid_mask, pad_id
+                    )  # (B, G, 1024)
+                    z_cand = encode_clause_bank_to_2d(
+                        encoder, unet, hippo_oracle, w_cand, cand_valid_mask, pad_id
+                    )  # (B, C, 1024)
+                    s_discourse = None
+                    s_aux = None
 
                 # Masked mean of z_goal and lead question clause z_discourse[:, 0] (sample-level selector probe)
                 goal_f = goal_valid_mask.unsqueeze(-1).to(dtype=z_goal.dtype)
@@ -1255,24 +1410,45 @@ def train():
                     sem_bands=right_brain.sem_bands,
                     num_bands=right_brain.num_bands,
                 )
+                s_in = s_discourse[:, :-1, :].clone() if dual_mode and s_discourse is not None else None
                 p_self = compute_p_self(global_step, args.self_feed_start, args.self_feed_ramp, args.p_self_max)
                 n_self_fed = 0
                 calibrated = int(right_brain.flow_matcher.calib_steps.item()) > 0
+                if dual_mode:
+                    calibrated = calibrated and int(right_brain.s_calib_steps.item()) > 0
                 if p_self > 0.0 and calibrated and z_in.shape[1] >= 2:
-                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        samples = right_brain.sample_next_clauses(
-                            z_discourse[:, :-1, :],
-                            aux,
-                            aux_valid,
-                            temperature=1.0,
-                            ode_steps=args.train_ode_steps,
-                        )  # samples[:, j] = predicted clause j+1 (denormalized z_clause space)
-                    # z_in[:, t] (t >= 1) is clause t -> replace with samples[:, t-1] where clause t is valid.
                     clause_valid = discourse_valid_mask[:, 1:-1].bool()  # clauses 1..T-2
                     replace = (torch.rand(clause_valid.shape, device=device) < p_self) & clause_valid
-                    z_in[:, 1:, :] = torch.where(
-                        replace.unsqueeze(-1), samples[:, :-1, :].to(dtype=z_in.dtype), z_in[:, 1:, :]
-                    )
+                    if dual_mode and s_discourse is not None and s_in is not None:
+                        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            z_samples, s_samples = right_brain.sample_next_clauses(
+                                z_discourse[:, :-1, :],
+                                aux,
+                                aux_valid,
+                                temperature=1.0,
+                                ode_steps=args.train_ode_steps,
+                                s_in=s_discourse[:, :-1, :],
+                                s_aux=s_aux,
+                                return_dual=True,
+                            )
+                        z_in[:, 1:, :] = torch.where(
+                            replace.unsqueeze(-1), z_samples[:, :-1, :].to(dtype=z_in.dtype), z_in[:, 1:, :]
+                        )
+                        s_in[:, 1:, :] = torch.where(
+                            replace.unsqueeze(-1), s_samples[:, :-1, :].to(dtype=s_in.dtype), s_in[:, 1:, :]
+                        )
+                    else:
+                        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            samples = right_brain.sample_next_clauses(
+                                z_discourse[:, :-1, :],
+                                aux,
+                                aux_valid,
+                                temperature=1.0,
+                                ode_steps=args.train_ode_steps,
+                            )  # samples[:, j] = predicted clause j+1 (denormalized z_clause space)
+                        z_in[:, 1:, :] = torch.where(
+                            replace.unsqueeze(-1), samples[:, :-1, :].to(dtype=z_in.dtype), z_in[:, 1:, :]
+                        )
                     n_self_fed = int(replace.sum().item())
 
                 # Per-clause selector probes: GT target clause + relative Gaussian noise (x per-row std).
@@ -1290,6 +1466,10 @@ def train():
                     z_in_override=z_in,
                     sample_group=group,
                     return_metrics=True,
+                    s_discourse_seq=s_discourse,
+                    s_in_override=s_in,
+                    s_aux=s_aux,
+                    sem_self_cond_prob=args.sem_self_cond_prob,
                 )
                 if cand_clause_rel is not None:
                     row_valid = discourse_valid_mask[:, 1:].bool()

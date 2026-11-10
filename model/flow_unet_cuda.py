@@ -482,10 +482,13 @@ class SubspaceSlotGeneratorHead(nn.Module):
 
 class FlowMatching1DUnet(nn.Module):
     """
-    Stateless Universal Left-Brain Crystallizer v2 (`LeftBrainCrystallizer` / `FlowMatching1DUnet` #025 / #050):
+    Stateless Universal Left-Brain Crystallizer v2 (`LeftBrainCrystallizer` / `FlowMatching1DUnet` #025 / #050 / #059):
     - Unpacks a 2D Punctuation-Clause Vector `h_potential: (B, 1024)` into a full-spectrum
       32-mode Legendre trajectory `h_wave_ref: (B, L, 1024)` over the 32-D principal manifold subspace
       via `CavitySpectralSlotRefiner` (mean-field cavity debiasing + high-band mode completion + 32-D slot deblur).
+    - Supports direct binding of Phase 1 v2's native orthogonal `encoder.char_subspace_proj` (`bind_encoder_subspace`)
+      so `subspace_proj` is locked to the isotropic 32-D character anchor subspace (`subspace_locked == 1`)
+      without scalar-mean PC1 bias, while preserving backward compatibility with already-calibrated checkpoints.
     - Removes the legacy `x_1_hat = h_wave + ...` hard skip cheat and restores `x_t` with full `1.0` weight
       as the primary ODE trajectory: `x = x_t + sigmoid(wave_in_gate) * h_wave_ref + 0.1 * pos_x`.
     - Enforces the 992-D Nullspace Isolation Rule (#049):
@@ -516,6 +519,7 @@ class FlowMatching1DUnet(nn.Module):
         ortho_mix = build_deterministic_ortho_mix(hidden_dim, seed=42)
         self.register_buffer("ortho_mix", ortho_mix)
         self.register_buffer("subspace_proj", ortho_mix[:, : self.d_sub].contiguous())
+        self.register_buffer("subspace_locked", torch.tensor(0, dtype=torch.long))
 
         # Cavity-Tolerant Spectral & 32-D Slot Refiner (#050)
         self.cavity_refiner = CavitySpectralSlotRefiner(
@@ -572,19 +576,33 @@ class FlowMatching1DUnet(nn.Module):
 
     def upgrade_legacy_state_dict(self, state_dict: dict, prefix: str = "") -> dict:
         """
-        Upgrades a legacy Phase-4 v1 `unet.pt` state_dict in-place so `load_state_dict(..., strict=True)`
+        Upgrades a legacy Phase-4 v1/v2 `unet.pt` state_dict in-place so `load_state_dict(..., strict=True)`
         succeeds seamlessly:
-          1. Pre-fills any missing v2 parameters/buffers (`cavity_refiner.*`, `slot_subspace_head.*`,
-             `wave_in_gate`, `alpha_skip_32`, `snap_temp`, `snap_step`) from current model defaults.
-          2. Wakes up dormant legacy `struct_gate` (< 0.13 -> 0.15) and `attractor_gate` (< 0.13 -> 0.25)
+          1. Pre-fills any missing v2/#059 parameters/buffers (`cavity_refiner.*`, `slot_subspace_head.*`,
+             `wave_in_gate`, `alpha_skip_32`, `snap_temp`, `snap_step`, `subspace_locked`) from current model defaults.
+          2. If an older checkpoint lacked `subspace_locked` and already has `calib_steps > 0`, marks
+             `subspace_locked = 1` so its loaded `subspace_proj` is preserved across resumed runs.
+          3. Wakes up dormant legacy `struct_gate` (< 0.13 -> 0.15) and `attractor_gate` (< 0.13 -> 0.25)
              across all 6 blocks while preserving already-active gates (such as block 0's 0.981 attractor_gate).
         """
         is_legacy = f"{prefix}alpha_skip_32" not in state_dict
+        had_subspace_locked = f"{prefix}subspace_locked" in state_dict
         own_state = self.state_dict()
         for k, v in own_state.items():
             full_k = f"{prefix}{k}"
             if full_k not in state_dict:
                 state_dict[full_k] = v.detach().clone()
+
+        if not had_subspace_locked:
+            cs_key = f"{prefix}calib_steps"
+            sl_key = f"{prefix}subspace_locked"
+            cs_val = int(state_dict[cs_key].item()) if cs_key in state_dict else 0
+            lock_val = 1 if cs_val > 0 else 0
+            state_dict[sl_key] = torch.tensor(
+                lock_val,
+                dtype=torch.long,
+                device=state_dict[sl_key].device,
+            )
 
         if is_legacy:
             for i in range(len(self.blocks)):
@@ -622,6 +640,37 @@ class FlowMatching1DUnet(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+
+    @torch.no_grad()
+    def bind_encoder_subspace(self, encoder: nn.Module, force: bool = False) -> bool:
+        """
+        Locks `self.subspace_proj` (`(hidden_dim, d_sub)`) onto Phase 1 v2's native orthogonal
+        `encoder.char_subspace_proj.weight` (`(d_sub, hidden_dim)`), orthonormalized via QR in float32
+        with positive diagonal sign convention.
+        If `self.calib_steps > 0` and `not force`, preserves the already-calibrated `self.subspace_proj`
+        and returns False.
+        """
+        if int(self.calib_steps.item()) > 0 and not force:
+            return False
+
+        if (
+            encoder is not None
+            and hasattr(encoder, "char_subspace_proj")
+            and hasattr(encoder.char_subspace_proj, "weight")
+            and tuple(encoder.char_subspace_proj.weight.shape) == (self.d_sub, self.hidden_dim)
+        ):
+            w_t = encoder.char_subspace_proj.weight.detach().float().T.contiguous()  # (D, d_sub)
+            q, r = torch.linalg.qr(w_t.cpu())
+            diag_r = torch.diagonal(r)
+            diag_sign = torch.where(torch.sign(diag_r) == 0, torch.ones_like(diag_r), torch.sign(diag_r))
+            q = q * diag_sign.unsqueeze(0)
+            self.subspace_proj.copy_(
+                q.to(device=self.subspace_proj.device, dtype=self.subspace_proj.dtype)
+            )
+            self.subspace_locked.fill_(1)
+            return True
+
+        return False
 
     def bind_translator_codebook(self, translator: nn.Module = None) -> None:
         """
@@ -736,9 +785,9 @@ class FlowMatching1DUnet(nn.Module):
 
     def unpack_sentence_vector(self, z_sent: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        Unpacks a 2D Clause Vector `z_sent` of shape `(B, D)` into a full-spectrum 16-mode Legendre
-        temporal wave `h_wave` of shape `(B, seq_len, D)` over the 64-D principal subspace.
-        Scaled by sqrt(K) so total Parseval energy matches the K=16 orthonormal modes on the valid span.
+        Unpacks a 2D Clause Vector `z_sent` of shape `(B, D)` into a full-spectrum Legendre
+        temporal wave `h_wave` of shape `(B, seq_len, D)` over the 32-D principal subspace.
+        Scaled by sqrt(K) so total Parseval energy matches the K orthonormal modes on the valid span.
         """
         B, D = z_sent.shape
         K = self.num_subbands
@@ -782,8 +831,9 @@ class FlowMatching1DUnet(nn.Module):
         Online EMA Auto-Calibration for target manifold scale + Step-0 Principal Subspace Calibration:
         - Strictly computes mean and std over valid (non-PAD) tokens when valid_mask is provided,
           preventing high-padding short sequences from shrinking manifold_std.
-        - Step 0: Initializes manifold_mean, manifold_std, and calibrates the 64-D principal subspace
-          `self.subspace_proj` via eigendecomposition of the normalized valid token covariance.
+        - Step 0: Initializes manifold_mean, manifold_std, and ONLY if `self.subspace_locked == 0`,
+          calibrates the 32-D principal subspace `self.subspace_proj` via per-feature centered
+          covariance eigendecomposition (avoiding scalar-mean PC1 bias).
         - Steps 1 .. max_calib_steps-1: Smooths manifold_mean and manifold_std via EMA.
         - Step >= max_calib_steps: Locks coordinate scale permanently for stable flow training.
         """
@@ -801,27 +851,34 @@ class FlowMatching1DUnet(nn.Module):
             batch_mean = x_float.mean()
             batch_std = x_float.std().clamp(min=1e-5)
 
-        if step == 0:
-            self.manifold_mean.copy_(batch_mean.to(dtype=self.manifold_mean.dtype))
-            self.manifold_std.copy_(batch_std.to(dtype=self.manifold_std.dtype))
+        batch_mean_cast = batch_mean.to(device=self.manifold_mean.device, dtype=self.manifold_mean.dtype)
+        batch_std_cast = batch_std.to(device=self.manifold_std.device, dtype=self.manifold_std.dtype)
 
-            v_tokens = valid_tokens if (valid_mask is not None and valid_mask.any()) else x_float.reshape(-1, self.hidden_dim)
-            if v_tokens.shape[0] >= 2:
-                v_centered = (v_tokens - batch_mean) / batch_std
-                cov = torch.matmul(v_centered.T, v_centered) / float(max(v_centered.shape[0], 1))
-                # Add tiny diagonal jitter for numerical stability before eigh (on CPU for universal device support)
-                cov_cpu = cov.cpu() + 1e-6 * torch.eye(self.hidden_dim, dtype=cov.dtype)
-                _, eigvecs_cpu = torch.linalg.eigh(cov_cpu)
-                top_vecs = eigvecs_cpu[:, -self.d_sub:].flip(-1).contiguous().to(device=cov.device, dtype=cov.dtype)
-                # Deterministic column sign convention
-                max_abs_idx = top_vecs.abs().argmax(dim=0, keepdim=True)
-                col_signs = torch.sign(torch.gather(top_vecs, 0, max_abs_idx))
-                col_signs = torch.where(col_signs == 0, torch.ones_like(col_signs), col_signs)
-                top_vecs = top_vecs * col_signs
-                self.subspace_proj.copy_(top_vecs.to(dtype=self.subspace_proj.dtype))
+        if step == 0:
+            self.manifold_mean.copy_(batch_mean_cast)
+            self.manifold_std.copy_(batch_std_cast)
+
+            if int(self.subspace_locked.item()) == 0:
+                v_tokens = valid_tokens if (valid_mask is not None and valid_mask.any()) else x_float.reshape(-1, self.hidden_dim)
+                if v_tokens.shape[0] >= 2:
+                    tok_mean_vec = v_tokens.mean(dim=0, keepdim=True)
+                    v_centered = (v_tokens - tok_mean_vec) / batch_std
+                    cov = torch.matmul(v_centered.T, v_centered) / float(max(v_centered.shape[0], 1))
+                    # Add tiny diagonal jitter for numerical stability before eigh (on CPU for universal device support)
+                    cov_cpu = cov.cpu().float() + 1e-6 * torch.eye(self.hidden_dim, dtype=torch.float32)
+                    _, eigvecs_cpu = torch.linalg.eigh(cov_cpu)
+                    top_vecs = eigvecs_cpu[:, -self.d_sub:].flip(-1).contiguous().to(device=cov.device, dtype=torch.float32)
+                    # Deterministic column sign convention
+                    max_abs_idx = top_vecs.abs().argmax(dim=0, keepdim=True)
+                    col_signs = torch.sign(torch.gather(top_vecs, 0, max_abs_idx))
+                    col_signs = torch.where(col_signs == 0, torch.ones_like(col_signs), col_signs)
+                    top_vecs = top_vecs * col_signs
+                    self.subspace_proj.copy_(
+                        top_vecs.to(device=self.subspace_proj.device, dtype=self.subspace_proj.dtype)
+                    )
         else:
-            self.manifold_mean.lerp_(batch_mean.to(dtype=self.manifold_mean.dtype), momentum)
-            self.manifold_std.lerp_(batch_std.to(dtype=self.manifold_std.dtype), momentum)
+            self.manifold_mean.lerp_(batch_mean_cast, float(momentum))
+            self.manifold_std.lerp_(batch_std_cast, float(momentum))
 
         self.calib_steps.add_(1)
         return True
