@@ -40,6 +40,7 @@ class ManifoldFIFOQueue:
     Detached cross-batch FIFO queue of recent z_god vectors (e.g. max_size=2048 >= 2 * z_dim).
     Breaks the single-batch rank ceiling (min(B - 1, D)) during VICReg covariance whitening
     and hyperspherical uniformity regularization when mini-batch size B < z_dim.
+    Stored in float32 so cross-batch covariance accumulation never loses precision under AMP.
     """
 
     def __init__(self, max_size: int = 2048):
@@ -56,15 +57,38 @@ class ManifoldFIFOQueue:
     def enqueue(self, z: torch.Tensor):
         if self.max_size <= 0 or z.numel() == 0:
             return
-        z_det = z.detach()
+        z_det = z.detach().float()
         if self._buffer is None:
             self._buffer = z_det[-self.max_size :].clone()
         else:
-            buf = self._buffer.to(device=z_det.device, dtype=z_det.dtype)
+            buf = self._buffer.to(device=z_det.device, dtype=torch.float32)
             combined = torch.cat([buf, z_det], dim=0)
             if combined.shape[0] > self.max_size:
                 combined = combined[-self.max_size :]
             self._buffer = combined.clone()
+
+
+def _mps_safe_teacher_embs(
+    embs: Sequence[torch.Tensor],
+    fuser: nn.Module,
+) -> Sequence[torch.Tensor]:
+    """
+    Workaround for PyTorch 2.10 Apple MPS `native_layer_norm_backward` bug:
+    when `input.requires_grad == False`, MPS leaves `LayerNorm.weight.grad` and
+    `LayerNorm.bias.grad` filled with uninitialized Metal memory (`inf` / garbage),
+    corrupting `clip_grad_norm_` and stalling adapter convergence.
+    Attaching a local leaf `requires_grad_(True)` view on MPS forces the full backward
+    kernel path so adapter LayerNorm parameter gradients match CPU/CUDA to ~1e-6.
+    Zero overhead on CUDA and CPU.
+    """
+    if (
+        len(embs) == 0
+        or embs[0].device.type != "mps"
+        or not torch.is_grad_enabled()
+        or not any(p.requires_grad for p in fuser.parameters())
+    ):
+        return embs
+    return [e if e.requires_grad else e.detach().requires_grad_(True) for e in embs]
 
 
 def compute_teacher_consensus_matrix(
@@ -75,7 +99,7 @@ def compute_teacher_consensus_matrix(
     """
     Centers and L2-normalizes each teacher's batch embeddings to form per-teacher
     whitened cosine similarity matrices S^{(m)} in R^{B x B}, and averages them into
-    the consensus similarity matrix S_bar.
+    the consensus similarity matrix S_bar (always in float32 for AMP safety).
     """
     n_teachers = len(teacher_embs)
     if n_teachers == 0:
@@ -92,12 +116,14 @@ def compute_teacher_consensus_matrix(
     per_teacher_s: List[torch.Tensor] = []
     s_consensus: Optional[torch.Tensor] = None
 
-    for weight, emb in zip(w, teacher_embs):
-        e_centered = emb - emb.mean(dim=0, keepdim=True)
-        e_norm = F.normalize(e_centered, p=2, dim=-1, eps=eps)
-        s_m = e_norm @ e_norm.T
-        per_teacher_s.append(s_m)
-        s_consensus = s_m * weight if s_consensus is None else (s_consensus + s_m * weight)
+    with torch.autocast(device_type=teacher_embs[0].device.type, enabled=False):
+        for weight, emb in zip(w, teacher_embs):
+            emb_f = emb.float()
+            e_centered = emb_f - emb_f.mean(dim=0, keepdim=True)
+            e_norm = F.normalize(e_centered, p=2, dim=-1, eps=eps)
+            s_m = e_norm @ e_norm.T
+            per_teacher_s.append(s_m)
+            s_consensus = s_m * weight if s_consensus is None else (s_consensus + s_m * weight)
 
     assert s_consensus is not None
     return s_consensus, per_teacher_s
@@ -114,33 +140,36 @@ def compute_single_view_recon_loss(
     Computes Multi-View Teacher Reconstruction loss:
       mean_{m=1..M} [ (1 - cos(D_m(z), e_m)) + mse_weight * MSE(L2Norm(D_m(z)), L2Norm(e_m)) ]
     Returns:
-        loss: scalar tensor
+        loss: scalar tensor (float32)
         per_teacher_cos: list of mean cosine similarities per teacher
     """
     preds = recon_heads(z)
     if len(preds) != len(teacher_embs):
         raise ValueError(f"recon_heads produced {len(preds)} outputs, expected {len(teacher_embs)}")
 
-    total_loss = z.new_zeros(())
+    total_loss = torch.zeros((), device=z.device, dtype=torch.float32)
     per_teacher_cos: List[float] = []
 
-    for pred_m, target_m in zip(preds, teacher_embs):
-        pred_norm = F.normalize(pred_m, p=2, dim=-1, eps=eps)
-        targ_norm = F.normalize(target_m, p=2, dim=-1, eps=eps)
-        cos_sim = (pred_norm * targ_norm).sum(dim=-1)
-        cos_loss = (1.0 - cos_sim).mean()
-        mse_loss = (pred_norm - targ_norm).pow(2).sum(dim=-1).mean()
-        total_loss = total_loss + cos_loss + mse_weight * mse_loss
-        per_teacher_cos.append(float(cos_sim.detach().mean().item()))
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        for pred_m, target_m in zip(preds, teacher_embs):
+            pred_norm = F.normalize(pred_m.float(), p=2, dim=-1, eps=eps)
+            targ_norm = F.normalize(target_m.float(), p=2, dim=-1, eps=eps)
+            cos_sim = (pred_norm * targ_norm).sum(dim=-1)
+            cos_loss = (1.0 - cos_sim).mean()
+            mse_loss = (pred_norm - targ_norm).pow(2).sum(dim=-1).mean()
+            total_loss = total_loss + cos_loss + mse_weight * mse_loss
+            per_teacher_cos.append(float(cos_sim.detach().mean().item()))
 
     total_loss = total_loss / float(len(teacher_embs))
     return total_loss, per_teacher_cos
 
 
 def compute_centered_cosine_matrix(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    z_centered = z - z.mean(dim=0, keepdim=True)
-    z_norm = F.normalize(z_centered, p=2, dim=-1, eps=eps)
-    return z_norm @ z_norm.T
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        z_f = z.float()
+        z_centered = z_f - z_f.mean(dim=0, keepdim=True)
+        z_norm = F.normalize(z_centered, p=2, dim=-1, eps=eps)
+        return z_norm @ z_norm.T
 
 
 def compute_relational_distill_loss(
@@ -157,19 +186,22 @@ def compute_relational_distill_loss(
     """
     bsz = z.shape[0]
     s_god = compute_centered_cosine_matrix(z, eps=eps)
-    if bsz <= 2:
-        return F.mse_loss(s_god, s_consensus.detach()), s_god
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        s_cons_f = s_consensus.detach().float()
+        if bsz <= 2:
+            return F.mse_loss(s_god, s_cons_f), s_god
 
-    off_mask = ~torch.eye(bsz, dtype=torch.bool, device=z.device)
-    s_god_off = s_god[off_mask].view(bsz, bsz - 1)
-    s_cons_off = s_consensus.detach()[off_mask].view(bsz, bsz - 1)
+        off_mask = ~torch.eye(bsz, dtype=torch.bool, device=z.device)
+        s_god_off = s_god[off_mask].view(bsz, bsz - 1)
+        s_cons_off = s_cons_f[off_mask].view(bsz, bsz - 1)
 
-    log_q = F.log_softmax(s_god_off / tau, dim=-1)
-    p = F.softmax(s_cons_off / tau, dim=-1)
-    loss_kl = F.kl_div(log_q, p, reduction="batchmean") * (tau * 10.0)
-    loss_frob = (s_god_off - s_cons_off).pow(2).sum(dim=-1).mean()
+        log_q = F.log_softmax(s_god_off / tau, dim=-1)
+        p = F.softmax(s_cons_off / tau, dim=-1)
+        loss_kl = F.kl_div(log_q, p, reduction="batchmean") * (tau * 10.0)
+        loss_frob = (s_god_off - s_cons_off).pow(2).sum(dim=-1).mean()
+        loss_rel = loss_kl + frob_weight * loss_frob
 
-    return loss_kl + frob_weight * loss_frob, s_god
+    return loss_rel, s_god
 
 
 def compute_vicreg_and_uniformity_loss(
@@ -179,7 +211,7 @@ def compute_vicreg_and_uniformity_loss(
     eps: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Computes:
+    Computes (strictly in float32 so 1024x1024 covariance Frobenius norms & logsumexp never overflow FP16):
       1) loss_iso: VICReg variance hinge + orthogonally-invariant full-spectrum covariance
          whitening (1/D) * ||C_mix - I_D||_F^2 where C_mix = 0.5 * C_batch + 0.5 * C_queue
          (with batch and queue centered separately so mean drift never injects a rank-1 spike).
@@ -188,35 +220,39 @@ def compute_vicreg_and_uniformity_loss(
     """
     bsz, dim = z.shape
     if bsz <= 1:
-        zero = z.new_zeros(())
+        zero = torch.zeros((), device=z.device, dtype=torch.float32)
         return zero, zero
 
-    z_c = z - z.mean(dim=0, keepdim=True)
-    var_batch = z_c.pow(2).sum(dim=0) / float(bsz - 1)
-    std_batch = torch.sqrt(var_batch + eps)
-    loss_var = F.relu(gamma - std_batch).mean()
-    loss_center = z.mean(dim=0).pow(2).mean() * 0.1
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        z_f = z.float()
+        z_c = z_f - z_f.mean(dim=0, keepdim=True)
+        var_batch = z_c.pow(2).sum(dim=0) / float(bsz - 1)
+        std_batch = torch.sqrt(var_batch + eps)
+        loss_var = F.relu(gamma - std_batch).mean()
+        loss_center = z_f.mean(dim=0).pow(2).mean() * 0.1
 
-    cov_batch = (z_c.T @ z_c) / float(bsz - 1)
-    if z_queue is not None and z_queue.shape[0] > 2:
-        z_q = z_queue.detach().to(device=z.device, dtype=z.dtype)
-        z_q_c = z_q - z_q.mean(dim=0, keepdim=True)
-        cov_q = (z_q_c.T @ z_q_c) / float(z_q.shape[0] - 1)
-        cov_mix = 0.5 * cov_batch + 0.5 * cov_q
-    else:
-        cov_mix = cov_batch
+        cov_batch = (z_c.T @ z_c) / float(bsz - 1)
+        if z_queue is not None and z_queue.shape[0] > 2:
+            z_q = z_queue.detach().to(device=z.device, dtype=torch.float32)
+            z_q_c = z_q - z_q.mean(dim=0, keepdim=True)
+            cov_q = (z_q_c.T @ z_q_c) / float(z_q.shape[0] - 1)
+            cov_mix = 0.5 * cov_batch + 0.5 * cov_q
+        else:
+            cov_mix = cov_batch
 
-    # Orthogonally-invariant full spectrum whitening: (1/D) * ||C_mix - I_D||_F^2 == (1/D) * sum_k (lambda_k - 1)^2
-    eye_d = torch.eye(dim, device=z.device, dtype=z.dtype)
-    loss_cov_full = (cov_mix - eye_d).pow(2).sum() / float(dim)
-    loss_iso = loss_var + loss_center + 0.35 * loss_cov_full
+        # Orthogonally-invariant full spectrum whitening: (1/D) * ||C_mix - I_D||_F^2 == (1/D) * sum_k (lambda_k - 1)^2
+        eye_d = torch.eye(dim, device=z.device, dtype=torch.float32)
+        loss_cov_full = (cov_mix - eye_d).pow(2).sum() / float(dim)
+        loss_iso = loss_var + loss_center + 0.35 * loss_cov_full
 
-    # Hyperspherical radial uniformity within current batch only
-    z_unit = F.normalize(z, p=2, dim=-1, eps=1e-8)
-    sq_pdist = (2.0 - 2.0 * (z_unit @ z_unit.T)).clamp(min=0.0)
-    off_mask = ~torch.eye(bsz, dtype=torch.bool, device=z.device)
-    off_pdist = sq_pdist[off_mask]
-    loss_unif = torch.logsumexp(-2.0 * off_pdist, dim=0) - math.log(float(max(off_pdist.numel(), 1)))
+        # Hyperspherical radial uniformity within current batch only
+        z_unit = F.normalize(z_f, p=2, dim=-1, eps=1e-8)
+        sq_pdist = (2.0 - 2.0 * (z_unit @ z_unit.T)).clamp(min=0.0)
+        off_mask = ~torch.eye(bsz, dtype=torch.bool, device=z.device)
+        off_pdist = sq_pdist[off_mask]
+        loss_unif = torch.logsumexp(-2.0 * off_pdist, dim=0) - math.log(
+            float(max(off_pdist.numel(), 1))
+        )
 
     return loss_iso, loss_unif
 
@@ -257,42 +293,52 @@ def compute_cloud_and_mixup_loss(
          interpolated teacher embeddings and agree with each other (eliminating cavities).
     """
     bsz = z_mean.shape[0]
-    z_a_norm = F.normalize(z_view_a, p=2, dim=-1, eps=eps)
-    z_b_norm = F.normalize(z_view_b, p=2, dim=-1, eps=eps)
-    z_m_norm = F.normalize(z_mean, p=2, dim=-1, eps=eps)
+    with torch.autocast(device_type=z_mean.device.type, enabled=False):
+        z_a_norm = F.normalize(z_view_a.float(), p=2, dim=-1, eps=eps)
+        z_b_norm = F.normalize(z_view_b.float(), p=2, dim=-1, eps=eps)
+        z_m_norm = F.normalize(z_mean.float(), p=2, dim=-1, eps=eps)
 
-    loss_align = (
-        (1.0 - (z_a_norm * z_b_norm).sum(dim=-1)).mean()
-        + 0.5 * (1.0 - (z_a_norm * z_m_norm).sum(dim=-1)).mean()
-        + 0.5 * (1.0 - (z_b_norm * z_m_norm).sum(dim=-1)).mean()
-    )
+        loss_align = (
+            (1.0 - (z_a_norm * z_b_norm).sum(dim=-1)).mean()
+            + 0.5 * (1.0 - (z_a_norm * z_m_norm).sum(dim=-1)).mean()
+            + 0.5 * (1.0 - (z_b_norm * z_m_norm).sum(dim=-1)).mean()
+        )
 
-    if bsz > 1:
-        logits_ab = (z_a_norm @ z_b_norm.T) / cloud_tau
-        labels = torch.arange(bsz, device=z_mean.device)
-        loss_nce = 0.5 * (F.cross_entropy(logits_ab, labels) + F.cross_entropy(logits_ab.T, labels))
-    else:
-        loss_nce = z_mean.new_zeros(())
+        if bsz > 1:
+            logits_ab = (z_a_norm @ z_b_norm.T) / cloud_tau
+            labels = torch.arange(bsz, device=z_mean.device)
+            loss_nce = 0.5 * (
+                F.cross_entropy(logits_ab, labels) + F.cross_entropy(logits_ab.T, labels)
+            )
+        else:
+            loss_nce = torch.zeros((), device=z_mean.device, dtype=torch.float32)
 
     if bsz <= 1:
         return loss_align + 0.2 * loss_nce
 
-    # Find top-1 semantic neighbor pi(i) under S_bar
-    s_masked = s_consensus.detach().clone()
-    s_masked.fill_diagonal_(-1e9)
+    # Find top-1 semantic neighbor pi(i) under S_bar (AMP-safe float32 + -inf diagonal)
+    s_masked = s_consensus.detach().float().clone()
+    s_masked.fill_diagonal_(float("-inf"))
     nn_idx = s_masked.argmax(dim=-1)
 
-    lam = _sample_beta_weights(bsz, mixup_beta, device=z_mean.device, dtype=z_mean.dtype)
-    f_mix = lam * f_mean + (1.0 - lam) * f_mean[nn_idx]
+    lam_f32 = _sample_beta_weights(bsz, mixup_beta, device=z_mean.device, dtype=torch.float32)
+    lam_f = lam_f32.to(dtype=f_mean.dtype)
+    f_mix = lam_f * f_mean + (1.0 - lam_f) * f_mean[nn_idx]
     z_mix = god_encoder(f_mix)
 
-    # Spherical interpolation in latent space
-    z_interp_dir = F.normalize(lam * z_m_norm + (1.0 - lam) * z_m_norm[nn_idx], p=2, dim=-1, eps=eps)
-    z_interp = z_interp_dir * math.sqrt(float(z_mean.shape[-1]))
+    # Spherical interpolation in latent space (float32)
+    with torch.autocast(device_type=z_mean.device.type, enabled=False):
+        z_interp_dir = F.normalize(
+            lam_f32 * z_m_norm + (1.0 - lam_f32) * z_m_norm[nn_idx], p=2, dim=-1, eps=eps
+        )
+        z_interp = z_interp_dir * math.sqrt(float(z_mean.shape[-1]))
+        loss_geodesic = (
+            1.0 - (F.normalize(z_mix.float(), p=2, dim=-1, eps=eps) * z_interp_dir).sum(dim=-1)
+        ).mean()
+        mixed_teacher_embs = [
+            lam_f32 * emb.float() + (1.0 - lam_f32) * emb[nn_idx].float() for emb in teacher_embs
+        ]
 
-    loss_geodesic = (1.0 - (F.normalize(z_mix, p=2, dim=-1, eps=eps) * z_interp_dir).sum(dim=-1)).mean()
-
-    mixed_teacher_embs = [lam * emb + (1.0 - lam) * emb[nn_idx] for emb in teacher_embs]
     loss_mix_recon_enc, _ = compute_single_view_recon_loss(
         z_mix, mixed_teacher_embs, recon_heads, eps=eps
     )
@@ -323,65 +369,74 @@ def compute_momentum_and_next_clause_loss(
     z_prev, z_curr, z_next = triplet_z
     n_trip = z_curr.shape[0]
     if n_trip == 0:
-        zero = z_curr.new_zeros(())
+        zero = torch.zeros((), device=z_curr.device, dtype=torch.float32)
         return zero, zero
 
-    if triplet_teacher_embs is not None:
-        embs_prev, embs_curr, embs_next = triplet_teacher_embs
-        cos_01_list = []
-        cos_12_list = []
-        for e0, e1, e2 in zip(embs_prev, embs_curr, embs_next):
-            e0_n = F.normalize(e0, p=2, dim=-1, eps=eps)
-            e1_n = F.normalize(e1, p=2, dim=-1, eps=eps)
-            e2_n = F.normalize(e2, p=2, dim=-1, eps=eps)
-            cos_01_list.append((e0_n * e1_n).sum(dim=-1))
-            cos_12_list.append((e1_n * e2_n).sum(dim=-1))
-        mean_cos_01 = torch.stack(cos_01_list, dim=0).mean(dim=0)
-        mean_cos_12 = torch.stack(cos_12_list, dim=0).mean(dim=0)
-        gate_01 = torch.sigmoid((mean_cos_01 - 0.15) / 0.10).detach()
-        gate_12 = torch.sigmoid((mean_cos_12 - 0.15) / 0.10).detach()
-        gate_trip = (gate_01 * gate_12).clamp(min=0.05)
-    else:
-        gate_01 = torch.ones(n_trip, device=z_curr.device, dtype=z_curr.dtype)
-        gate_12 = torch.ones(n_trip, device=z_curr.device, dtype=z_curr.dtype)
-        gate_trip = torch.ones(n_trip, device=z_curr.device, dtype=z_curr.dtype)
+    with torch.autocast(device_type=z_curr.device.type, enabled=False):
+        if triplet_teacher_embs is not None:
+            embs_prev, embs_curr, embs_next = triplet_teacher_embs
+            cos_01_list = []
+            cos_12_list = []
+            for e0, e1, e2 in zip(embs_prev, embs_curr, embs_next):
+                e0_n = F.normalize(e0.float(), p=2, dim=-1, eps=eps)
+                e1_n = F.normalize(e1.float(), p=2, dim=-1, eps=eps)
+                e2_n = F.normalize(e2.float(), p=2, dim=-1, eps=eps)
+                cos_01_list.append((e0_n * e1_n).sum(dim=-1))
+                cos_12_list.append((e1_n * e2_n).sum(dim=-1))
+            mean_cos_01 = torch.stack(cos_01_list, dim=0).mean(dim=0)
+            mean_cos_12 = torch.stack(cos_12_list, dim=0).mean(dim=0)
+            gate_01 = torch.sigmoid((mean_cos_01 - 0.15) / 0.10).detach()
+            gate_12 = torch.sigmoid((mean_cos_12 - 0.15) / 0.10).detach()
+            gate_trip = (gate_01 * gate_12).clamp(min=0.05)
+        else:
+            gate_01 = torch.ones(n_trip, device=z_curr.device, dtype=torch.float32)
+            gate_12 = torch.ones(n_trip, device=z_curr.device, dtype=torch.float32)
+            gate_trip = torch.ones(n_trip, device=z_curr.device, dtype=torch.float32)
 
-    delta_1 = z_curr - z_prev
-    delta_2 = z_next - z_curr
-    cos_mom = F.cosine_similarity(delta_2, delta_1, dim=-1, eps=eps)
-    loss_momentum = ((1.0 - cos_mom) * gate_trip).sum() / gate_trip.sum().clamp(min=eps)
+        z_prev_f = z_prev.float()
+        z_curr_f = z_curr.float()
+        z_next_f = z_next.float()
+        delta_1 = z_curr_f - z_prev_f
+        delta_2 = z_next_f - z_curr_f
+        cos_mom = F.cosine_similarity(delta_2, delta_1, dim=-1, eps=eps)
+        loss_momentum = ((1.0 - cos_mom) * gate_trip).sum() / gate_trip.sum().clamp(min=eps)
 
     if next_clause_head is None:
-        return loss_momentum, z_curr.new_zeros(())
+        return loss_momentum, torch.zeros((), device=z_curr.device, dtype=torch.float32)
 
-    pred_curr = F.normalize(next_clause_head(z_prev), p=2, dim=-1, eps=eps)
-    pred_next = F.normalize(next_clause_head(z_curr), p=2, dim=-1, eps=eps)
-    targ_curr = F.normalize(z_curr, p=2, dim=-1, eps=eps)
-    targ_next = F.normalize(z_next, p=2, dim=-1, eps=eps)
+    raw_pred_curr = next_clause_head(z_prev)
+    raw_pred_next = next_clause_head(z_curr)
+    with torch.autocast(device_type=z_curr.device.type, enabled=False):
+        pred_curr = F.normalize(raw_pred_curr.float(), p=2, dim=-1, eps=eps)
+        pred_next = F.normalize(raw_pred_next.float(), p=2, dim=-1, eps=eps)
+        targ_curr = F.normalize(z_curr_f, p=2, dim=-1, eps=eps)
+        targ_next = F.normalize(z_next_f, p=2, dim=-1, eps=eps)
 
-    if batch_z_negatives is not None and batch_z_negatives.shape[0] > 0:
-        neg_pool = F.normalize(batch_z_negatives.detach(), p=2, dim=-1, eps=eps)
-        pool_curr = torch.cat([targ_curr, neg_pool], dim=0)
-        pool_next = torch.cat([targ_next, neg_pool], dim=0)
-    else:
-        pool_curr = targ_curr
-        pool_next = targ_next
+        if batch_z_negatives is not None and batch_z_negatives.shape[0] > 0:
+            neg_pool = F.normalize(batch_z_negatives.detach().float(), p=2, dim=-1, eps=eps)
+            pool_curr = torch.cat([targ_curr, neg_pool], dim=0)
+            pool_next = torch.cat([targ_next, neg_pool], dim=0)
+        else:
+            pool_curr = targ_curr
+            pool_next = targ_next
 
-    logits_01 = (pred_curr @ pool_curr.T) / next_tau
-    logits_12 = (pred_next @ pool_next.T) / next_tau
-    targets = torch.arange(n_trip, device=z_curr.device)
+        logits_01 = (pred_curr @ pool_curr.T) / next_tau
+        logits_12 = (pred_next @ pool_next.T) / next_tau
+        targets = torch.arange(n_trip, device=z_curr.device)
 
-    ce_01 = F.cross_entropy(logits_01, targets, reduction="none")
-    ce_12 = F.cross_entropy(logits_12, targets, reduction="none")
-    loss_nce = 0.5 * (
-        (ce_01 * gate_01).sum() / gate_01.sum().clamp(min=eps)
-        + (ce_12 * gate_12).sum() / gate_12.sum().clamp(min=eps)
-    )
-    loss_dir_cos = 0.5 * (
-        ((1.0 - (pred_curr * targ_curr).sum(dim=-1)) * gate_01).sum() / gate_01.sum().clamp(min=eps)
-        + ((1.0 - (pred_next * targ_next).sum(dim=-1)) * gate_12).sum() / gate_12.sum().clamp(min=eps)
-    )
-    loss_next = 0.15 * loss_nce + loss_dir_cos
+        ce_01 = F.cross_entropy(logits_01, targets, reduction="none")
+        ce_12 = F.cross_entropy(logits_12, targets, reduction="none")
+        loss_nce = 0.5 * (
+            (ce_01 * gate_01).sum() / gate_01.sum().clamp(min=eps)
+            + (ce_12 * gate_12).sum() / gate_12.sum().clamp(min=eps)
+        )
+        loss_dir_cos = 0.5 * (
+            ((1.0 - (pred_curr * targ_curr).sum(dim=-1)) * gate_01).sum()
+            / gate_01.sum().clamp(min=eps)
+            + ((1.0 - (pred_next * targ_next).sum(dim=-1)) * gate_12).sum()
+            / gate_12.sum().clamp(min=eps)
+        )
+        loss_next = 0.15 * loss_nce + loss_dir_cos
 
     return loss_momentum, loss_next
 
@@ -407,7 +462,7 @@ def compute_god_manifold_loss(
     bsz = teacher_embs[0].shape[0]
 
     # 1. Encode all 5 teacher views once and form centroid + 2 stochastic Dirichlet simplex views
-    f_stack = fuser.encode_views(teacher_embs)
+    f_stack = fuser.encode_views(_mps_safe_teacher_embs(teacher_embs, fuser))
     f_mean = fuser.fuse_encoded_views(f_stack, weights=None)
 
     w_a = fuser.sample_dirichlet_weights(
@@ -416,16 +471,16 @@ def compute_god_manifold_loss(
         drop_prob=cfg.modality_drop_prob,
         min_active=cfg.min_active_views,
         device=f_stack.device,
-        dtype=f_stack.dtype,
-    )
+        dtype=torch.float32,
+    ).to(dtype=f_stack.dtype)
     w_b = fuser.sample_dirichlet_weights(
         batch_size=bsz,
         alpha=cfg.dirichlet_alpha,
         drop_prob=cfg.modality_drop_prob,
         min_active=cfg.min_active_views,
         device=f_stack.device,
-        dtype=f_stack.dtype,
-    )
+        dtype=torch.float32,
+    ).to(dtype=f_stack.dtype)
     f_view_a = fuser.fuse_encoded_views(f_stack, weights=w_a)
     f_view_b = fuser.fuse_encoded_views(f_stack, weights=w_b)
 
@@ -476,9 +531,9 @@ def compute_god_manifold_loss(
     # 6. Contiguous-Clause Trajectory Momentum & Asymmetric Next-Clause InfoNCE
     if triplet_teacher_embs is not None:
         embs_prev, embs_curr, embs_next = triplet_teacher_embs
-        z_prev = god_encoder(fuser(embs_prev))
-        z_curr = god_encoder(fuser(embs_curr))
-        z_next = god_encoder(fuser(embs_next))
+        z_prev = god_encoder(fuser(_mps_safe_teacher_embs(embs_prev, fuser)))
+        z_curr = god_encoder(fuser(_mps_safe_teacher_embs(embs_curr, fuser)))
+        z_next = god_encoder(fuser(_mps_safe_teacher_embs(embs_next, fuser)))
         triplet_z = (z_prev, z_curr, z_next)
         loss_momentum, loss_next = compute_momentum_and_next_clause_loss(
             triplet_z=triplet_z,
@@ -500,8 +555,8 @@ def compute_god_manifold_loss(
             next_tau=cfg.next_tau,
         )
     else:
-        loss_momentum = z_mean.new_zeros(())
-        loss_next = z_mean.new_zeros(())
+        loss_momentum = torch.zeros((), device=z_mean.device, dtype=torch.float32)
+        loss_next = torch.zeros((), device=z_mean.device, dtype=torch.float32)
 
     total_loss = (
         cfg.w_recon * loss_recon
@@ -544,18 +599,20 @@ def _compute_participation_ratio(z: torch.Tensor, eps: float = 1e-8) -> Tuple[fl
     if n_samples <= 1:
         return 1.0, 1.0
 
-    z_c = z.float() - z.float().mean(dim=0, keepdim=True)
-    gram_raw = (z_c @ z_c.T) / float(n_samples - 1)
-    tr_raw = torch.diagonal(gram_raw).sum()
-    frob_sq_raw = gram_raw.pow(2).sum().clamp(min=eps)
-    raw_pr = float((tr_raw.pow(2) / frob_sq_raw).item())
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        z_f = z.float()
+        z_c = z_f - z_f.mean(dim=0, keepdim=True)
+        gram_raw = (z_c @ z_c.T) / float(n_samples - 1)
+        tr_raw = torch.diagonal(gram_raw).sum()
+        frob_sq_raw = gram_raw.pow(2).sum().clamp(min=eps)
+        raw_pr = float((tr_raw.pow(2) / frob_sq_raw).item())
 
-    std = torch.sqrt(z_c.var(dim=0, unbiased=True) + 1e-6)
-    z_w = z_c / std.unsqueeze(0)
-    gram_w = (z_w @ z_w.T) / float(n_samples - 1)
-    tr_w = torch.diagonal(gram_w).sum()
-    frob_sq_w = gram_w.pow(2).sum().clamp(min=eps)
-    whitened_pr = float((tr_w.pow(2) / frob_sq_w).item())
+        std = torch.sqrt(z_c.var(dim=0, unbiased=True) + 1e-6)
+        z_w = z_c / std.unsqueeze(0)
+        gram_w = (z_w @ z_w.T) / float(n_samples - 1)
+        tr_w = torch.diagonal(gram_w).sum()
+        frob_sq_w = gram_w.pow(2).sum().clamp(min=eps)
+        whitened_pr = float((tr_w.pow(2) / frob_sq_w).item())
 
     return raw_pr, whitened_pr
 
@@ -620,8 +677,8 @@ def evaluate_god_manifold_health(
             drop_prob=modality_drop_prob,
             min_active=2,
             device=f_stack.device,
-            dtype=f_stack.dtype,
-        )
+            dtype=torch.float32,
+        ).to(dtype=f_stack.dtype)
         cloud_views_z.append(god_encoder(fuser.fuse_encoded_views(f_stack, weights=w)))
 
     z_view_a = cloud_views_z[1]
@@ -641,24 +698,27 @@ def evaluate_god_manifold_health(
         relational_spearman = 1.0
 
     # 3. Cloud view top-1 retrieval accuracy
-    z_a_norm = F.normalize(z_view_a, p=2, dim=-1, eps=1e-8)
-    z_b_norm = F.normalize(z_view_b, p=2, dim=-1, eps=1e-8)
-    sim_ab = z_a_norm @ z_b_norm.T
-    labels = torch.arange(bsz, device=z_mean.device)
-    acc_a2b = (sim_ab.argmax(dim=-1) == labels).float().mean().item()
-    acc_b2a = (sim_ab.T.argmax(dim=-1) == labels).float().mean().item()
+    with torch.autocast(device_type=z_mean.device.type, enabled=False):
+        z_a_norm = F.normalize(z_view_a.float(), p=2, dim=-1, eps=1e-8)
+        z_b_norm = F.normalize(z_view_b.float(), p=2, dim=-1, eps=1e-8)
+        sim_ab = z_a_norm @ z_b_norm.T
+        labels = torch.arange(bsz, device=z_mean.device)
+        acc_a2b = (sim_ab.argmax(dim=-1) == labels).float().mean().item()
+        acc_b2a = (sim_ab.T.argmax(dim=-1) == labels).float().mean().item()
     cloud_view_top1_acc = float(0.5 * (acc_a2b + acc_b2a))
 
     # 4. Midpoint cavity reconstruction cosine
     if bsz > 1:
-        s_masked = s_consensus.clone()
-        s_masked.fill_diagonal_(-1e9)
+        s_masked = s_consensus.float().clone()
+        s_masked.fill_diagonal_(float("-inf"))
         nn_idx = s_masked.argmax(dim=-1)
 
-        f_mid = 0.5 * (f_mean + f_mean[nn_idx])
+        f_mid = 0.5 * f_mean + 0.5 * f_mean[nn_idx]
         z_mid_enc = god_encoder(f_mid)
-        z_mid_lat = project_to_sphere(0.5 * (z_mean + z_mean[nn_idx]), scale_sqrt_d=True)
-        mid_teacher_embs = [0.5 * (emb + emb[nn_idx]) for emb in teacher_embs]
+        z_mid_lat = project_to_sphere(
+            0.5 * (z_mean.float() + z_mean[nn_idx].float()), scale_sqrt_d=True
+        )
+        mid_teacher_embs = [0.5 * (emb.float() + emb[nn_idx].float()) for emb in teacher_embs]
 
         _, mid_cos_enc = compute_single_view_recon_loss(z_mid_enc, mid_teacher_embs, recon_heads)
         _, mid_cos_lat = compute_single_view_recon_loss(z_mid_lat, mid_teacher_embs, recon_heads)
@@ -693,25 +753,26 @@ def evaluate_god_manifold_health(
     # 6. Contiguous next-clause accuracy and adjacent AUC
     n_pairs = z_curr.shape[0]
     if n_pairs > 1:
-        if next_clause_head is not None:
-            q_curr = F.normalize(next_clause_head(z_curr), p=2, dim=-1, eps=1e-8)
-        else:
-            q_curr = F.normalize(z_curr, p=2, dim=-1, eps=1e-8)
-        k_next = F.normalize(z_next, p=2, dim=-1, eps=1e-8)
+        raw_q_curr = next_clause_head(z_curr) if next_clause_head is not None else z_curr
+        with torch.autocast(device_type=z_mean.device.type, enabled=False):
+            q_curr = F.normalize(raw_q_curr.float(), p=2, dim=-1, eps=1e-8)
+            k_next = F.normalize(z_next.float(), p=2, dim=-1, eps=1e-8)
 
-        sim_next = q_curr @ k_next.T
-        pair_labels = torch.arange(n_pairs, device=z_mean.device)
-        next_clause_top1_acc = float((sim_next.argmax(dim=-1) == pair_labels).float().mean().item())
+            sim_next = q_curr @ k_next.T
+            pair_labels = torch.arange(n_pairs, device=z_mean.device)
+            next_clause_top1_acc = float(
+                (sim_next.argmax(dim=-1) == pair_labels).float().mean().item()
+            )
 
-        pos_scores = torch.diagonal(sim_next)
-        idx_grid = torch.arange(n_pairs, device=z_mean.device)
-        neg_mask = (idx_grid[:, None] - idx_grid[None, :]).abs() > 1
-        if torch.any(neg_mask):
-            neg_scores = sim_next[neg_mask]
-        else:
-            off_mask_pairs = ~torch.eye(n_pairs, dtype=torch.bool, device=z_mean.device)
-            neg_scores = sim_next[off_mask_pairs]
-        adjacent_auc = _roc_auc_torch(pos_scores, neg_scores)
+            pos_scores = torch.diagonal(sim_next)
+            idx_grid = torch.arange(n_pairs, device=z_mean.device)
+            neg_mask = (idx_grid[:, None] - idx_grid[None, :]).abs() > 1
+            if torch.any(neg_mask):
+                neg_scores = sim_next[neg_mask]
+            else:
+                off_mask_pairs = ~torch.eye(n_pairs, dtype=torch.bool, device=z_mean.device)
+                neg_scores = sim_next[off_mask_pairs]
+            adjacent_auc = _roc_auc_torch(pos_scores, neg_scores)
     else:
         next_clause_top1_acc = 1.0
         adjacent_auc = 1.0

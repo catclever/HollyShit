@@ -727,6 +727,13 @@ def get_phase0_v3_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w_next", type=float, default=0.5)
     parser.add_argument("--dirichlet_alpha", type=float, default=1.0)
     parser.add_argument("--modality_drop_prob", type=float, default=0.15)
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="CUDA mixed precision mode: 'auto' uses bf16 on Ampere+ (L4/A100) and fp16 on T4",
+    )
     return parser
 
 
@@ -771,11 +778,29 @@ def main():
         + list(next_clause_head.parameters())
     )
     optimizer = optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
-    use_amp = device.type == "cuda"
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    if device.type == "cuda" and args.mixed_precision != "fp32":
+        bf16_ok = bool(hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
+        if args.mixed_precision == "bf16" or (args.mixed_precision == "auto" and bf16_ok):
+            use_amp = True
+            amp_dtype = torch.bfloat16
+            use_scaler = False
+            print("⚡ [AMP] Using CUDA bfloat16 mixed precision (overflow-free, GradScaler disabled).")
+        else:
+            use_amp = True
+            amp_dtype = torch.float16
+            use_scaler = True
+            print("⚡ [AMP] Using CUDA float16 mixed precision (GradScaler enabled).")
     else:
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        use_amp = False
+        amp_dtype = torch.float32
+        use_scaler = False
+        print(f"⚡ [AMP] Using full float32 precision on {device.type}.")
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     loss_weights = GodManifoldLossWeights(
         w_recon=args.w_recon,
@@ -851,7 +876,7 @@ def main():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.autocast(device_type="cuda", enabled=use_amp):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     loss, metrics, aux = compute_god_manifold_loss(
                         fuser=fuser,
                         god_encoder=god_encoder,

@@ -15,11 +15,14 @@ def project_to_sphere(
     Projects latent vectors onto the hypersphere.
     When `scale_sqrt_d=True`, projects onto the sphere of radius sqrt(z_dim) so that
     per-dimension average energy E[z_d^2] = 1.0 (matching FlowDecoder.embed_text).
+    Computes L2 norm in float32 (with autocast disabled) so neither `sum(z^2)` overflows
+    65504 nor `eps=1e-8` underflows under FP16/BF16.
     """
-    z_unit = F.normalize(z, p=2, dim=-1, eps=eps)
-    if scale_sqrt_d:
-        return z_unit * math.sqrt(float(z.shape[-1]))
-    return z_unit
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        z_unit = F.normalize(z.float(), p=2, dim=-1, eps=eps)
+        if scale_sqrt_d:
+            z_unit = z_unit * math.sqrt(float(z.shape[-1]))
+    return z_unit.to(dtype=z.dtype)
 
 
 class _TwoLayerMlpCUDA(nn.Module):
@@ -70,6 +73,11 @@ class GodEncoderCUDA(nn.Module):
         f_t: torch.Tensor,
         normalize_sphere: Optional[bool] = None,
     ) -> torch.Tensor:
+        if (
+            not torch.is_autocast_enabled(f_t.device.type)
+            and f_t.dtype != self.net.layers[0].weight.dtype
+        ):
+            f_t = f_t.to(dtype=self.net.layers[0].weight.dtype)
         z = self.net(f_t)
         use_sphere = self.sphere_scale if normalize_sphere is None else bool(normalize_sphere)
         if use_sphere:
@@ -94,6 +102,16 @@ class _SingleTeacherReconHeadCUDA(nn.Module):
         self.fc2 = nn.Linear(h_dim, out_dim)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if not torch.is_autocast_enabled(z.device.type) and z.dtype != self.lin.weight.dtype:
+            z = z.to(dtype=self.lin.weight.dtype)
+        # Guard against PyTorch 2.10 Apple MPS `native_layer_norm_backward` uninitialized grad bug
+        if (
+            z.device.type == "mps"
+            and torch.is_grad_enabled()
+            and not z.requires_grad
+            and self.norm.weight.requires_grad
+        ):
+            z = z.detach().requires_grad_(True)
         h = self.norm(z)
         return self.lin(h) + self.fc2(self.act(self.fc1(h)))
 
@@ -143,4 +161,14 @@ class AsymmetricNextClauseHeadCUDA(nn.Module):
             self.proj.weight.copy_(0.7 * eye + 0.3 * orth)
 
     def forward(self, z_t: torch.Tensor) -> torch.Tensor:
+        if not torch.is_autocast_enabled(z_t.device.type) and z_t.dtype != self.proj.weight.dtype:
+            z_t = z_t.to(dtype=self.proj.weight.dtype)
+        if (
+            isinstance(self.norm, nn.LayerNorm)
+            and z_t.device.type == "mps"
+            and torch.is_grad_enabled()
+            and not z_t.requires_grad
+            and self.norm.weight.requires_grad
+        ):
+            z_t = z_t.detach().requires_grad_(True)
         return self.proj(self.norm(z_t))

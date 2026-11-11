@@ -32,6 +32,18 @@ class SenseAdapterCUDA(nn.Module):
         self.scale = 1.0 / (input_dim ** 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.is_autocast_enabled(x.device.type) and x.dtype != self.norm.weight.dtype:
+            x = x.to(dtype=self.norm.weight.dtype)
+        # Workaround for PyTorch 2.10 Apple MPS `native_layer_norm_backward` bug:
+        # when `input.requires_grad == False`, MPS leaves `LayerNorm.{weight,bias}.grad`
+        # populated with uninitialized Metal memory (`inf` / garbage).
+        if (
+            x.device.type == "mps"
+            and torch.is_grad_enabled()
+            and not x.requires_grad
+            and self.norm.weight.requires_grad
+        ):
+            x = x.detach().requires_grad_(True)
         x = self.norm(x) * self.scale
         return self.net(x)
 
@@ -125,6 +137,8 @@ class SensoryFuserCUDA(nn.Module):
         """
         Samples per-sample Dirichlet simplex weights of shape (B, N_views) with optional
         stochastic view dropout keeping at least `min_active` teachers active per sample.
+        Computes simplex normalization in float32 before casting to `dtype` so `1e-8` never
+        underflows to 0/0 NaN under FP16.
         """
         n_views = len(self.adapters)
         if batch_size <= 0:
@@ -152,7 +166,7 @@ class SensoryFuserCUDA(nn.Module):
                 raise ValueError("All Dirichlet concentration values must be > 0")
 
         gamma_samples = torch._standard_gamma(conc).clamp(min=1e-8)
-        w = gamma_samples.to(device=device, dtype=dtype)
+        w = gamma_samples.to(device=device, dtype=torch.float32)
 
         eff_min_active = min(max(1, int(min_active)), n_views)
         if drop_prob > 0.0 and n_views > eff_min_active:
@@ -166,10 +180,10 @@ class SensoryFuserCUDA(nn.Module):
                 top_idx = rescue_scores.topk(eff_min_active, dim=-1).indices
                 force_keep = torch.zeros_like(keep_mask).scatter_(-1, top_idx, True)
                 keep_mask = torch.where(needs_rescue, keep_mask | force_keep, keep_mask)
-            w = w * keep_mask.to(dtype=w.dtype)
+            w = w * keep_mask.to(dtype=torch.float32)
 
         w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        return w
+        return w.to(dtype=dtype)
 
     def forward_cloud(
         self,
