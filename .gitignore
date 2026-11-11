@@ -40,7 +40,6 @@ wheels/
 /data
 /data/
 embs/
-dataset_config.json
 checkpoints/
 *.npz
 *.safetensors

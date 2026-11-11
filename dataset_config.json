@@ -1,0 +1,19 @@
+{
+    "modelscope_repo_id": "catclever/emb_npy",
+    "base_models": [
+        "bge",
+        "qwen",
+        "xiaobu",
+        "youtu",
+        "conan_v1"
+    ],
+    "chunk_name_patterns": {
+        "bge": "bge_m3/bge_embeddings_chunk_{start:07d}_{end:07d}.npz",
+        "qwen": "gte_qwen/gte_qwen2_embeddings_chunk_{start:07d}_{end:07d}.npz",
+        "xiaobu": "xiaobu/xiaobu_embeddings_chunk_{start:07d}_{end:07d}.npz",
+        "youtu": "youtu/youtu_embeddings_chunk_{start:07d}_{end:07d}.npz",
+        "conan_v1": "conan/conan_v1_embeddings_chunk_{start:07d}_{end:07d}.npz"
+    },
+    "emb_dims": [1024, 3584, 1792, 2048, 1792],
+    "parquet_path": "data/Basic_ZH/chunked_mixed_omni.parquet"
+}
