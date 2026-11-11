@@ -1,5 +1,8 @@
 import numpy as np
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 import json
 import os
@@ -12,20 +15,22 @@ from typing import List, Tuple, Dict, Any
 class Phase1_MultiEmbDataLoader:
     """
     Dataloader that handles:
-    1. Reading text chunks from Parquet (in-memory, fast enough for 7M strings).
-    2. Zero-copy / mmap loading of 4 massive .npy embedding files.
-    3. Dynamic tokenization & padding.
+    1. Reading text chunks from Parquet (in-memory, fast enough for 7M strings),
+       or skipping Parquet completely when `embedding_only=True`.
+    2. Zero-copy / mmap loading of massive .npy embedding files.
+    3. Dynamic tokenization & padding (skipped when `embedding_only=True`).
     4. Interrupt / Resume Checkpointing (Saving the exact shuffled order).
     """
     def __init__(self, 
                  parquet_path: str,
                  emb_paths: List[str],
-                 tokenizer,
+                 tokenizer=None,
                  batch_size: int = 256,
                  max_seq_len: int = 512,
                  shuffle: bool = True,
                  seed: int = 42,
-                 backend: str = 'mlx'):
+                 backend: str = 'mlx',
+                 embedding_only: bool = False):
         
         self.backend = backend
         
@@ -34,27 +39,51 @@ class Phase1_MultiEmbDataLoader:
         self.shuffle = shuffle
         self.seed = seed if seed is not None else int(__import__("time").time())
         self.tokenizer = tokenizer
+        self.embedding_only = bool(embedding_only)
         
-        # 1. Load Text Data
-        print(f"Loading Text Parquet from {parquet_path}...")
-        df = pd.read_parquet(parquet_path)
-        # Explode the lists of chunks into a flat list of 7.6M strings
-        # dropna() just in case
-        self.text_chunks = df['chunks'].explode().dropna().tolist()
-        self.total_samples = len(self.text_chunks)
-        print(f"Loaded {self.total_samples} text chunks into memory.")
-        del df # free up memory of the original dataframe
-        
-        # 2. Memory-Map the Numpy Embeddings
-        print("Memory-mapping embedding arrays...")
-        self.embs = []
-        for path in emb_paths:
-            # mmap_mode='r' completely avoids loading the massive files into RAM
-            arr = np.load(path, mmap_mode='r')
-            assert arr.shape[0] == self.total_samples, f"Shape mismatch in {path}: {arr.shape[0]} != {self.total_samples}"
-            self.embs.append(arr)
+        if self.embedding_only:
+            self.text_chunks = None
+            if not emb_paths:
+                raise ValueError("emb_paths must be non-empty when embedding_only=True")
+            print("Memory-mapping embedding arrays (embedding_only=True)...")
+            self.embs = []
+            self.total_samples = None
+            for path in emb_paths:
+                arr = np.load(path, mmap_mode='r')
+                if self.total_samples is None:
+                    self.total_samples = int(arr.shape[0])
+                assert int(arr.shape[0]) == self.total_samples, (
+                    f"Shape mismatch in {path}: {arr.shape[0]} != {self.total_samples}"
+                )
+                self.embs.append(arr)
+            print(
+                f"[DataLoader] ⚡ 纯向量 mmap 模式 (embedding_only=True): "
+                f"免加载 Parquet 文本池，总条数: {self.total_samples}"
+            )
+        else:
+            # 1. Load Text Data
+            if pd is None:
+                import pandas as _pd  # raises ModuleNotFoundError clearly
+                globals()["pd"] = _pd
+            print(f"Loading Text Parquet from {parquet_path}...")
+            df = pd.read_parquet(parquet_path)
+            # Explode the lists of chunks into a flat list of 7.6M strings
+            # dropna() just in case
+            self.text_chunks = df['chunks'].explode().dropna().tolist()
+            self.total_samples = len(self.text_chunks)
+            print(f"Loaded {self.total_samples} text chunks into memory.")
+            del df # free up memory of the original dataframe
             
-        print("Embeddings mapped successfully.")
+            # 2. Memory-Map the Numpy Embeddings
+            print("Memory-mapping embedding arrays...")
+            self.embs = []
+            for path in emb_paths:
+                # mmap_mode='r' completely avoids loading the massive files into RAM
+                arr = np.load(path, mmap_mode='r')
+                assert arr.shape[0] == self.total_samples, f"Shape mismatch in {path}: {arr.shape[0]} != {self.total_samples}"
+                self.embs.append(arr)
+                
+            print("Embeddings mapped successfully.")
         
         # 3. Epoch & Batch tracking
         self.rng = np.random.default_rng(seed)
@@ -84,6 +113,16 @@ class Phase1_MultiEmbDataLoader:
         
         batch_indices = self.indices[start_idx:end_idx]
         
+        if self.embedding_only or self.text_chunks is None or self.tokenizer is None:
+            if self.backend == 'torch':
+                import torch
+                batch_embs = [torch.from_numpy(np.array(arr[batch_indices])).float() for arr in self.embs]
+            else:
+                import mlx.core as mx
+                batch_embs = [mx.array(arr[batch_indices]) for arr in self.embs]
+            self.batch_idx += 1
+            return None, batch_embs, None
+
         # 1. Fetch Texts
         batch_texts = [self.text_chunks[i] for i in batch_indices]
         
@@ -138,6 +177,7 @@ class Phase1_ChunkedNpzDataLoader:
     机制：
     1. 不吃内存：只在内存驻留"当前正在训练的任务块"的特征（比如每次只把某个 50w 条特征解压进 RAM）。
     2. 双层乱序 (Double Shuffle)：每个 Epoch 开始时打乱所有 Chunk 文件的流转顺序；在读取单个 Chunk 时，在 Chunk 内部将其局部 batch 完全乱序。
+    3. 纯向量流式模式 (`embedding_only=True`)：免加载本地 Parquet 语料与逐批分词，直接由远端/本地 `.npz` 分块边界推导总样本数并流式产出多师向量。
     """
     def __init__(self, 
                  parquet_path: str,
@@ -154,7 +194,8 @@ class Phase1_ChunkedNpzDataLoader:
                  backend: str = 'mlx',
                  lazy_start: bool = False,
                  cache_dir: str = './datas',
-                 auto_cleanup: bool = True):
+                 auto_cleanup: bool = True,
+                 embedding_only: bool = False):
         
         self.backend = backend
         self.batch_size = batch_size
@@ -167,14 +208,22 @@ class Phase1_ChunkedNpzDataLoader:
         self.tokenizer = tokenizer
         self.cache_dir = cache_dir
         self.auto_cleanup = auto_cleanup
+        self.embedding_only = bool(embedding_only)
         
-        # 3. 提取对应的全体文本数据 (先行提取，以获得 total_samples 决定边界)
-        print(f"[DataLoader] 正在装载基准文本体系: {parquet_path}...")
-        df = pd.read_parquet(parquet_path)
-        self.text_chunks = df['chunks'].explode().dropna().tolist()
-        self.total_samples = len(self.text_chunks)
-        print(f"[DataLoader] 成功吃进文本池: {self.total_samples} 条")
-        del df
+        # 3. 提取对应的全体文本数据 (embedding_only=True 时完全免加载 Parquet)
+        if self.embedding_only:
+            self.text_chunks = None
+            self.total_samples = 0
+        else:
+            if pd is None:
+                import pandas as _pd
+                globals()["pd"] = _pd
+            print(f"[DataLoader] 正在装载基准文本体系: {parquet_path}...")
+            df = pd.read_parquet(parquet_path)
+            self.text_chunks = df['chunks'].explode().dropna().tolist()
+            self.total_samples = len(self.text_chunks)
+            print(f"[DataLoader] 成功吃进文本池: {self.total_samples} 条")
+            del df
         
         # 1. 自动挂载魔搭数据集或加载本地路径 (改为只验证配置，去除暴力的 snapshot_download 全本拉取)
         if ms_repo_id:
@@ -195,6 +244,17 @@ class Phase1_ChunkedNpzDataLoader:
             if self.ms_repo_id:
                 from modelscope.hub.api import HubApi
                 api = HubApi()
+                ms_token = (
+                    os.environ.get("MODELSCOPE_API_TOKEN")
+                    or os.environ.get("MS_TOKEN")
+                    or ""
+                ).strip()
+                if ms_token:
+                    try:
+                        api.login(ms_token)
+                        print("[DataLoader] 🔑 已应用 ModelScope Access Token 鉴权。")
+                    except Exception as login_err:
+                        print(f"[DataLoader] ⚠️ ModelScope Token 登录忽略 (将继续匿名拉取): {login_err}")
                 res = api.get_dataset_files(self.ms_repo_id, recursive=True)
                 chunk_files = [f.get("Path", f.get("Name", "")) for f in res]
             else:
@@ -207,8 +267,11 @@ class Phase1_ChunkedNpzDataLoader:
                 start_to_end = {}
                 for f in chunk_files:
                     f_normalized = f.replace("\\", "/")
-                    if f_normalized.endswith(".npz") and (f_normalized.startswith(prefix + "/") or f"/{prefix}/" in f_normalized):
-                        match = re.search(r'chunk_(\d+)_(\d+)\.npz', os.path.basename(f))
+                    base_fn = os.path.basename(f_normalized)
+                    in_subdir = f_normalized.startswith(prefix + "/") or f"/{prefix}/" in f_normalized
+                    in_flat = ("/" not in pattern) and base_fn.startswith(prefix)
+                    if f_normalized.endswith(".npz") and (in_subdir or in_flat):
+                        match = re.search(r'chunk_(\d+)_(\d+)\.npz', base_fn)
                         if match:
                             start_to_end[int(match.group(1))] = int(match.group(2))
                 self._per_model_bounds[model_name] = start_to_end
@@ -230,7 +293,17 @@ class Phase1_ChunkedNpzDataLoader:
                  end_idx = min(start_idx + chunk_size, self.total_samples)
                  self.chunk_bounds.append((start_idx, end_idx))
 
-
+        if self.embedding_only:
+            if not self.chunk_bounds:
+                raise RuntimeError(
+                    f"[DataLoader] embedding_only=True 模式下未探测到任何可用的 .npz 分块 "
+                    f"(ms_repo_id={self.ms_repo_id!r}, local_npz_dir={local_npz_dir!r})。"
+                )
+            self.total_samples = int(self.chunk_bounds[-1][1])
+            print(
+                f"[DataLoader] ⚡ 纯向量流式模式 (embedding_only=True): "
+                f"免加载 Parquet 文本池，由分块边界推得总条数: {self.total_samples}"
+            )
         
         # 4. 统计与 Epoch 控制变量
         self.rng = np.random.default_rng(seed)
@@ -305,6 +378,7 @@ class Phase1_ChunkedNpzDataLoader:
 
             chunk_idx = self.macro_chunk_indices[worker_macro_ptr]
             start_idx, end_idx = self.chunk_bounds[chunk_idx]
+            cur_chunk_size = end_idx - start_idx
             
             try:
                 active_chunk_embs = []
@@ -324,10 +398,11 @@ class Phase1_ChunkedNpzDataLoader:
                               raise FileNotFoundError(f"后台打工仔抓取失败！本地目标块缺失：{path}")
                     
                     arr = np.load(path)['features']
+                    if arr.shape[0] > cur_chunk_size:
+                        arr = arr[:cur_chunk_size]
                     active_chunk_embs.append(arr)
                     cached_paths.append(path)
                     
-                cur_chunk_size = end_idx - start_idx
                 active_micro_indices = np.arange(cur_chunk_size)
                 
                 if self.shuffle:
@@ -404,6 +479,15 @@ class Phase1_ChunkedNpzDataLoader:
         batch_local_indices = self.active_micro_indices[self.active_micro_ptr : self.active_micro_ptr + fetch_len]
         self.active_micro_ptr += fetch_len
         
+        if self.embedding_only or self.text_chunks is None or self.tokenizer is None:
+            if self.backend == 'torch':
+                import torch
+                batch_embs = [torch.from_numpy(arr[batch_local_indices].copy()).float() for arr in self.active_chunk_embs]
+            else:
+                import mlx.core as mx
+                batch_embs = [mx.array(arr[batch_local_indices]) for arr in self.active_chunk_embs]
+            return None, batch_embs, None
+
         # 1. 映射回全局索引以抓取物理对应的文本序列
         batch_global_indices = self.active_global_start + batch_local_indices
         batch_texts = [self.text_chunks[i] for i in batch_global_indices]
@@ -493,6 +577,9 @@ class Phase1DataLoader:
         self.max_episode_len = max_episode_len
         
         # 1. Load exact document boundaries to avoid crossing them!
+        if pd is None:
+            import pandas as _pd
+            globals()["pd"] = _pd
         print("Reading Document Chunk Counts...")
         df = pd.read_parquet(parquet_path, columns=['chunk_count'])
         self.chunk_counts = df['chunk_count'].values
@@ -616,6 +703,9 @@ class TextDocumentDataLoader:
         self.max_episode_len = max_episode_len
         self.max_seq_len = max_seq_len
         
+        if pd is None:
+            import pandas as _pd
+            globals()["pd"] = _pd
         print("Reading Document Texts and Chunk Counts...")
         df = pd.read_parquet(parquet_path)
         self.text_chunks = df['chunks'].explode().dropna().tolist()

@@ -30,7 +30,6 @@ from model.god_encoder_cuda import (
     GodEncoderCUDA,
     MultiViewReconstructionHeadsCUDA,
 )
-from training.core.char_tokenizer import CharTokenizer
 from training.data.alignment_dataloader import (
     Phase1_ChunkedNpzDataLoader,
     Phase1_MultiEmbDataLoader,
@@ -72,6 +71,151 @@ def expected_checkpoint_dir(
     base_name = "latest_emergency" if is_emergency else f"step_{step}"
     folder_name = f"{prefix}_{base_name}" if prefix else base_name
     return os.path.join(out_dir, folder_name)
+
+
+def _is_valid_phase0_v3_ckpt_dir(ckpt_dir: str) -> Tuple[bool, Optional[int]]:
+    """
+    Checks whether `ckpt_dir` contains required Phase 0 v3 artifacts (`sense_fuser.pt`,
+    `god_encoder.pt`, `dataloader.json`) and returns `(True, global_step)` if valid.
+    """
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return False, None
+    required_files = ("sense_fuser.pt", "god_encoder.pt", "dataloader.json")
+    for fn in required_files:
+        if not os.path.isfile(os.path.join(ckpt_dir, fn)):
+            return False, None
+
+    dl_path = os.path.join(ckpt_dir, "dataloader.json")
+    try:
+        with open(dl_path, "r", encoding="utf-8") as f:
+            dl_meta = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return False, None
+
+    if not isinstance(dl_meta, dict):
+        return False, None
+
+    step_val = dl_meta.get("global_step")
+    if step_val is not None:
+        try:
+            return True, int(step_val)
+        except (ValueError, TypeError):
+            return False, None
+
+    m = re.search(r"step_(\d+)$", os.path.basename(ckpt_dir))
+    return True, (int(m.group(1)) if m else 0)
+
+
+def resolve_latest_phase0_v3_checkpoint(out_dir: str, prefix: str) -> Optional[str]:
+    """
+    Scans `out_dir` for `{prefix}_step_*` and `{prefix}_latest_emergency` (or `step_*` /
+    `latest_emergency` when `prefix` is empty), filters to valid Phase 0 v3 checkpoints,
+    and returns the directory with the highest `global_step` (preferring regular `step_*`
+    over `latest_emergency` on ties).
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return None
+
+    step_re = re.compile(
+        rf"^{re.escape(prefix)}_step_(\d+)$" if prefix else r"^step_(\d+)$"
+    )
+    emerg_name = f"{prefix}_latest_emergency" if prefix else "latest_emergency"
+
+    candidates: List[Tuple[int, int, str]] = []
+    for entry in os.listdir(out_dir):
+        is_emerg = entry == emerg_name
+        is_step = bool(step_re.match(entry))
+        if not (is_emerg or is_step):
+            continue
+        cand_path = os.path.join(out_dir, entry)
+        ok, step_val = _is_valid_phase0_v3_ckpt_dir(cand_path)
+        if not ok or step_val is None:
+            continue
+        non_emerg_rank = 0 if is_emerg else 1
+        candidates.append((step_val, non_emerg_rank, cand_path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def prune_old_phase0_v3_checkpoints(out_dir: str, prefix: str, keep_last: int) -> List[str]:
+    """
+    When `keep_last > 0`, retains only the newest `keep_last` valid `{prefix}_step_*`
+    checkpoint directories in `out_dir` and removes older ones. Also removes
+    `{prefix}_latest_emergency` once a regular `step_*` checkpoint at or beyond its
+    step has been saved.
+    """
+    removed: List[str] = []
+    if keep_last <= 0 or not out_dir or not os.path.isdir(out_dir):
+        return removed
+
+    step_re = re.compile(
+        rf"^{re.escape(prefix)}_step_(\d+)$" if prefix else r"^step_(\d+)$"
+    )
+    emerg_name = f"{prefix}_latest_emergency" if prefix else "latest_emergency"
+
+    valid_steps: List[Tuple[int, str]] = []
+    for entry in os.listdir(out_dir):
+        m = step_re.match(entry)
+        if not m:
+            continue
+        cand_path = os.path.join(out_dir, entry)
+        ok, step_val = _is_valid_phase0_v3_ckpt_dir(cand_path)
+        if not ok or step_val is None:
+            continue
+        valid_steps.append((step_val, cand_path))
+
+    valid_steps.sort(key=lambda item: (item[0], item[1]))
+    if len(valid_steps) > keep_last:
+        for _old_step, old_path in valid_steps[:-keep_last]:
+            shutil.rmtree(old_path, ignore_errors=True)
+            removed.append(old_path)
+
+    if valid_steps:
+        newest_regular_step = valid_steps[-1][0]
+        emerg_path = os.path.join(out_dir, emerg_name)
+        if os.path.isdir(emerg_path):
+            ok_emerg, emerg_step = _is_valid_phase0_v3_ckpt_dir(emerg_path)
+            if (not ok_emerg) or (emerg_step is not None and emerg_step <= newest_regular_step):
+                shutil.rmtree(emerg_path, ignore_errors=True)
+                removed.append(emerg_path)
+
+    return removed
+
+
+def load_manifold_stats_from_ckpt(
+    ckpt_dir: str,
+    device: torch.device,
+    z_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float], Optional[int]]:
+    """
+    Restores `(running_z_mean, running_z_std, last_health, saved_step)` from
+    `manifold_stats.pt` inside `ckpt_dir` if present, falling back to `(0, 1, {}, None)`.
+    """
+    z_mean = torch.zeros(z_dim, dtype=torch.float32, device=device)
+    z_std = torch.ones(z_dim, dtype=torch.float32, device=device)
+    health: Dict[str, float] = {}
+    saved_step: Optional[int] = None
+
+    ms_path = os.path.join(ckpt_dir, "manifold_stats.pt")
+    if not os.path.isfile(ms_path):
+        return z_mean, z_std, health, saved_step
+
+    ms_state = torch.load(ms_path, map_location=device)
+    if isinstance(ms_state, dict):
+        if ms_state.get("z_mean") is not None:
+            z_mean = ms_state["z_mean"].to(device=device, dtype=torch.float32)
+        if ms_state.get("z_std") is not None:
+            z_std = ms_state["z_std"].to(device=device, dtype=torch.float32)
+        if isinstance(ms_state.get("health_metrics"), dict):
+            health = {k: float(v) for k, v in ms_state["health_metrics"].items()}
+        if ms_state.get("global_step") is not None:
+            saved_step = int(ms_state["global_step"])
+
+    return z_mean, z_std, health, saved_step
 
 
 def load_mlx_safetensors_into_torch(torch_module: nn.Module, safetensor_path: str):
@@ -271,6 +415,7 @@ def disable_chunk_prefetch(loader):
             return None
         chunk_idx = loader.macro_chunk_indices[macro_ptr]
         start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+        cur_chunk_size = end_idx - start_idx
         active_chunk_embs = []
         cached_paths = []
         for model_name in loader.models:
@@ -284,10 +429,11 @@ def disable_chunk_prefetch(loader):
             else:
                 path = os.path.join(loader.npz_dir, cand_name)
             arr = load_npz_features_with_repair(loader, path, cand_name=cand_name)
+            if arr.shape[0] > cur_chunk_size:
+                arr = arr[:cur_chunk_size]
             active_chunk_embs.append(arr)
             cached_paths.append(path)
 
-        cur_chunk_size = end_idx - start_idx
         active_micro_indices = np.arange(cur_chunk_size)
         if loader.shuffle:
             rng = np.random.default_rng(loader.seed + macro_ptr + loader.current_epoch)
@@ -367,7 +513,7 @@ def sample_contiguous_triplets_from_loader(
     if not source_arrays or len(source_arrays) == 0:
         return None
 
-    n_avail = int(source_arrays[0].shape[0])
+    n_avail = min(int(arr.shape[0]) for arr in source_arrays)
     if n_avail < 3:
         return None
 
@@ -467,7 +613,8 @@ def save_phase0_v3_checkpoint(
     return ckpt_dir
 
 
-def build_phase0_v3_dataloader(args, tokenizer, ds_config: dict):
+def build_phase0_v3_dataloader(args, tokenizer=None, ds_config: Optional[dict] = None):
+    ds_config = ds_config or {}
     has_chunked_conf = bool(ds_config.get("base_models") and ds_config.get("chunk_name_patterns"))
     config_base_dir = (
         os.path.dirname(os.path.abspath(args.config_file)) if args.config_file else os.getcwd()
@@ -482,13 +629,13 @@ def build_phase0_v3_dataloader(args, tokenizer, ds_config: dict):
         chunk_patterns = ds_config["chunk_name_patterns"]
         ms_repo_id = ds_config.get("modelscope_repo_id")
         print(
-            f"[Data] Using Phase1_ChunkedNpzDataLoader ({len(models)} teacher routes: {models})."
+            f"[Data] Using Phase1_ChunkedNpzDataLoader (embedding_only=True, {len(models)} teacher routes: {models})."
         )
         return Phase1_ChunkedNpzDataLoader(
             parquet_path=parquet_path,
             models=models,
             chunk_patterns=chunk_patterns,
-            tokenizer=tokenizer,
+            tokenizer=None,
             ms_repo_id=ms_repo_id,
             chunk_size=args.chunk_size,
             local_npz_dir=args.data_dir,
@@ -498,6 +645,7 @@ def build_phase0_v3_dataloader(args, tokenizer, ds_config: dict):
             shuffle=True,
             lazy_start=True,
             backend="torch",
+            embedding_only=True,
         )
 
     emb_paths = args.emb_paths or ds_config.get("emb_paths")
@@ -507,14 +655,17 @@ def build_phase0_v3_dataloader(args, tokenizer, ds_config: dict):
         raise FileNotFoundError(
             "No teacher embedding files found; provide --config_file or --emb_paths."
         )
-    print(f"[Data] Using Phase1_MultiEmbDataLoader ({len(emb_paths)} routes): {emb_paths}")
+    print(
+        f"[Data] Using Phase1_MultiEmbDataLoader (embedding_only=True, {len(emb_paths)} routes): {emb_paths}"
+    )
     return Phase1_MultiEmbDataLoader(
         parquet_path=parquet_path,
         emb_paths=emb_paths,
-        tokenizer=tokenizer,
+        tokenizer=None,
         batch_size=args.batch_size,
         max_seq_len=args.max_seq_len,
         backend="torch",
+        embedding_only=True,
     )
 
 
@@ -544,6 +695,18 @@ def get_phase0_v3_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out_dir", type=str, default="checkpoints/p0_v3")
     parser.add_argument("--ckpt_prefix", type=str, default="p0_v3_5models")
     parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument(
+        "--auto_resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically resume from latest valid checkpoint in --out_dir (pass --no-auto_resume to disable)",
+    )
+    parser.add_argument(
+        "--keep_last_ckpts",
+        type=int,
+        default=3,
+        help="Keep only the N most recent step_* checkpoints in --out_dir to save Drive space (0 = keep all)",
+    )
     parser.add_argument("--config_file", type=str, default="dataset_config.json")
     parser.add_argument("--emb_paths", nargs="*", default=None)
     parser.add_argument("--emb_dir", type=str, default="data/Basic_ZH/embs/hy-tmp")
@@ -586,9 +749,8 @@ def main():
         args.download_cache_dir = args.data_dir
 
     emb_dims = ds_config.get("emb_dims", [1024, 3584, 1792, 2048, 1792])
-    tokenizer = CharTokenizer()
 
-    dataloader = build_phase0_v3_dataloader(args, tokenizer, ds_config)
+    dataloader = build_phase0_v3_dataloader(args, tokenizer=None, ds_config=ds_config)
     dataloader = attach_chunk_download_router(dataloader, args.data_dir, args.download_cache_dir)
     if args.download_only_prefetch:
         dataloader = enable_download_only_prefetch(dataloader)
@@ -610,7 +772,10 @@ def main():
     )
     optimizer = optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
     use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     loss_weights = GodManifoldLossWeights(
         w_recon=args.w_recon,
@@ -630,29 +795,42 @@ def main():
     manifold_queue = ManifoldFIFOQueue(max_size=max(2048, args.z_dim * 2))
     last_health: Dict[str, float] = {}
 
-    if args.resume_from and os.path.isdir(args.resume_from):
-        print(f"[Resume] Loading Phase 0 v3 state from {args.resume_from}...")
+    resume_dir = args.resume_from
+    if not resume_dir and args.auto_resume:
+        resume_dir = resolve_latest_phase0_v3_checkpoint(args.out_dir, args.ckpt_prefix)
+        if resume_dir:
+            print(f"[Auto-Resume] Found latest valid Phase 0 v3 checkpoint: {resume_dir}")
+
+    if resume_dir and os.path.isdir(resume_dir):
+        args.resume_from = resume_dir
+        print(f"[Resume] Loading Phase 0 v3 state from {resume_dir}...")
         fuser.load_state_dict(
-            torch.load(os.path.join(args.resume_from, "sense_fuser.pt"), map_location=device)
+            torch.load(os.path.join(resume_dir, "sense_fuser.pt"), map_location=device)
         )
         god_encoder.load_state_dict(
-            torch.load(os.path.join(args.resume_from, "god_encoder.pt"), map_location=device)
+            torch.load(os.path.join(resume_dir, "god_encoder.pt"), map_location=device)
         )
-        rh_path = os.path.join(args.resume_from, "recon_heads.pt")
+        rh_path = os.path.join(resume_dir, "recon_heads.pt")
         if os.path.exists(rh_path):
             recon_heads.load_state_dict(torch.load(rh_path, map_location=device))
-        nh_path = os.path.join(args.resume_from, "next_clause_head.pt")
+        nh_path = os.path.join(resume_dir, "next_clause_head.pt")
         if os.path.exists(nh_path):
             next_clause_head.load_state_dict(torch.load(nh_path, map_location=device))
-        opt_path = os.path.join(args.resume_from, "optimizer.pt")
+        opt_path = os.path.join(resume_dir, "optimizer.pt")
         if os.path.exists(opt_path):
             optimizer.load_state_dict(torch.load(opt_path, map_location=device))
-        dl_path = os.path.join(args.resume_from, "dataloader.json")
+        dl_path = os.path.join(resume_dir, "dataloader.json")
         if os.path.exists(dl_path):
             with open(dl_path, "r", encoding="utf-8") as f:
                 dl_state = json.load(f)
             dataloader.load_state_dict(dl_state)
             global_step = int(dl_state.get("global_step", 0))
+
+        running_z_mean, running_z_std, last_health, ms_step = load_manifold_stats_from_ckpt(
+            resume_dir, device=device, z_dim=args.z_dim
+        )
+        if global_step == 0 and ms_step is not None:
+            global_step = ms_step
 
     rng = np.random.default_rng(42)
 
@@ -751,6 +929,15 @@ def main():
                         health_metrics=last_health,
                     )
                     print(f"[Checkpoint] Saved Phase 0 v3 artifacts to {saved_dir}")
+                    if args.keep_last_ckpts > 0:
+                        pruned = prune_old_phase0_v3_checkpoints(
+                            args.out_dir, args.ckpt_prefix, args.keep_last_ckpts
+                        )
+                        if pruned:
+                            print(
+                                f"[Checkpoint] Pruned {len(pruned)} old checkpoint(s): "
+                                f"{[os.path.basename(p) for p in pruned]}"
+                            )
 
         final_dir = save_phase0_v3_checkpoint(
             out_dir=args.out_dir,
@@ -767,6 +954,8 @@ def main():
             z_std_stat=running_z_std,
             health_metrics=last_health,
         )
+        if args.keep_last_ckpts > 0:
+            prune_old_phase0_v3_checkpoints(args.out_dir, args.ckpt_prefix, args.keep_last_ckpts)
         print(f"🎉 Phase 0 v3 Training Complete! Final checkpoint: {final_dir}")
 
     except KeyboardInterrupt:
