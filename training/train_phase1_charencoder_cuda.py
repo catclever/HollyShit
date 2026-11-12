@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import zipfile
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -39,6 +40,236 @@ from training.losses.char_encoder_v2_loss import (
     compute_phase1_v2_distill_loss,
     evaluate_phase1_v2_health,
 )
+
+
+def is_colab_drive_mounted(
+    mount_root: str = "/content/drive",
+    mounts_file: str = "/proc/mounts",
+) -> bool:
+    """
+    Returns True iff `mount_root` is actively mounted as a filesystem (`os.path.ismount`
+    or `mounts_file` contains a mountpoint equal to `mount_root` or under `mount_root + "/"`).
+    """
+    if not mount_root:
+        return False
+    norm_root = os.path.abspath(mount_root).rstrip("/") or "/"
+    real_root = os.path.realpath(mount_root).rstrip("/") or "/"
+    root_variants = {norm_root, real_root}
+
+    try:
+        if os.path.exists(mount_root) and os.path.ismount(mount_root):
+            return True
+    except OSError:
+        pass
+
+    if mounts_file and os.path.isfile(mounts_file):
+        try:
+            with open(mounts_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    mp = parts[1].replace("\\040", " ").rstrip("/") or "/"
+                    for r in root_variants:
+                        if mp == r or mp.startswith(r + "/"):
+                            return True
+        except OSError:
+            pass
+
+    return False
+
+
+def _collect_resolved_target_paths(target_path: str) -> List[str]:
+    abs_target = os.path.abspath(target_path)
+    candidates = [abs_target, os.path.realpath(abs_target)]
+
+    cur = abs_target
+    suffix_parts: List[str] = []
+    while cur and cur != os.path.dirname(cur):
+        if os.path.islink(cur):
+            try:
+                raw_link = os.readlink(cur)
+                link_abs = (
+                    os.path.abspath(raw_link)
+                    if os.path.isabs(raw_link)
+                    else os.path.abspath(os.path.join(os.path.dirname(cur), raw_link))
+                )
+                joined_abs = (
+                    os.path.abspath(os.path.join(link_abs, *reversed(suffix_parts)))
+                    if suffix_parts
+                    else link_abs
+                )
+                candidates.extend(
+                    [link_abs, os.path.realpath(cur), joined_abs, os.path.realpath(joined_abs)]
+                )
+            except OSError:
+                pass
+        suffix_parts.append(os.path.basename(cur))
+        cur = os.path.dirname(cur)
+
+    seen = set()
+    ordered: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+
+def assert_colab_drive_mounted(
+    target_path: str,
+    mount_root: str = "/content/drive",
+    mounts_file: str = "/proc/mounts",
+) -> None:
+    """
+    Hard safety gate preventing silent checkpoint loss on unmounted Colab runtimes:
+    If `target_path` (or any symlink ancestor's resolved target) points inside `mount_root`,
+    verifies `is_colab_drive_mounted(mount_root, mounts_file=mounts_file)` and immediately
+    raises `RuntimeError` if `mount_root` is NOT mounted.
+    """
+    if not target_path or not mount_root:
+        return
+
+    norm_root = os.path.abspath(mount_root).rstrip("/") or "/"
+    real_root = os.path.realpath(mount_root).rstrip("/") or "/"
+    root_variants = {norm_root, real_root}
+
+    resolved_candidates = _collect_resolved_target_paths(target_path)
+    matched_drive_paths: List[str] = []
+    for cand in resolved_candidates:
+        cand_norm = cand.rstrip("/") or "/"
+        for r in root_variants:
+            if cand_norm == r or cand_norm.startswith(r + "/"):
+                matched_drive_paths.append(cand)
+                break
+
+    if not matched_drive_paths:
+        return
+
+    if not is_colab_drive_mounted(mount_root=mount_root, mounts_file=mounts_file):
+        raise RuntimeError(
+            f"❌ [Colab Mount Guard] 致命安全拦截：目标路径 {target_path!r} "
+            f"(解析路径: {matched_drive_paths[0]!r}) 指向 Google Drive 挂载区 {mount_root!r}，"
+            f"但检测到 {mount_root!r} 当前并未挂载！(os.path.ismount 与 {mounts_file} 均未命中)\n"
+            f"👉 已拒绝在 Colab 容器本地临时 SSD 创建伪目录写入权重（断开运行时将导致权重永久丢失）。\n"
+            f"👉 解决方法：请先在 Colab 单元格执行 `from google.colab import drive; drive.mount('/content/drive')` 并完成授权！"
+        )
+
+
+def _get_hf_token() -> Optional[str]:
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    tok = tok.strip()
+    return tok if tok else None
+
+
+def _cleanup_hf_download_metadata(file_path: str, roots: Sequence[Optional[str]]) -> None:
+    if not file_path:
+        return
+    abs_p = os.path.abspath(file_path)
+    seen_roots = set()
+    for root in roots:
+        if not root:
+            continue
+        abs_root = os.path.abspath(root)
+        if abs_root in seen_roots:
+            continue
+        seen_roots.add(abs_root)
+        prefix = abs_root.rstrip(os.sep) + os.sep
+        if not abs_p.startswith(prefix):
+            continue
+        rel = os.path.relpath(abs_p, abs_root)
+        dl_meta_dir = os.path.join(
+            abs_root, ".cache", "huggingface", "download", os.path.dirname(rel)
+        )
+        base_fn = os.path.basename(rel)
+        if not os.path.isdir(dl_meta_dir):
+            continue
+        try:
+            for fn in os.listdir(dl_meta_dir):
+                is_match = fn in {
+                    f"{base_fn}.metadata",
+                    f"{base_fn}.incomplete",
+                    f"{base_fn}.lock",
+                } or (
+                    fn.startswith(base_fn + ".")
+                    and fn.endswith((".metadata", ".incomplete", ".lock"))
+                )
+                if is_match:
+                    try:
+                        os.remove(os.path.join(dl_meta_dir, fn))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+
+def _download_hf_dataset_chunk_file(
+    repo_id: str,
+    filename: str,
+    local_dir: str,
+    cache_dir: Optional[str] = None,
+) -> str:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError("请安装 huggingface_hub: pip install huggingface_hub")
+
+    hf_token = _get_hf_token()
+    os.makedirs(local_dir, exist_ok=True)
+    try:
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            local_dir=local_dir,
+            token=hf_token,
+        )
+    except TypeError:
+        fallback_cache = cache_dir or local_dir
+        os.makedirs(fallback_cache, exist_ok=True)
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            cache_dir=fallback_cache,
+            token=hf_token,
+        )
+
+
+def mirror_checkpoint_to_hf_hub(
+    ckpt_dir: str,
+    hf_ckpt_repo: Optional[str],
+    include_optimizer: bool = False,
+) -> bool:
+    """
+    Mirrors a saved Phase 1 v2 checkpoint directory to a private Hugging Face model repository
+    under `p1_v2/<basename(ckpt_dir)>`. Non-fatal on network/API errors so training never crashes.
+    """
+    if not hf_ckpt_repo or not hf_ckpt_repo.strip():
+        return False
+    repo_id = hf_ckpt_repo.strip()
+    try:
+        from huggingface_hub import HfApi
+
+        hf_token = _get_hf_token()
+        api = HfApi(token=hf_token)
+        api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
+        folder_name = os.path.basename(os.path.normpath(ckpt_dir))
+        ignore_patterns = [] if include_optimizer else ["optimizer.pt"]
+        api.upload_folder(
+            repo_id=repo_id,
+            repo_type="model",
+            folder_path=ckpt_dir,
+            path_in_repo=f"p1_v2/{folder_name}",
+            ignore_patterns=ignore_patterns,
+        )
+        print(
+            f"[HF-Backup] ☁️ Mirrored Phase 1 v2 checkpoint to https://huggingface.co/{repo_id}/tree/main/p1_v2/{folder_name}"
+        )
+        return True
+    except Exception as e:
+        print(f"[HF-Backup] ⚠️ Failed to mirror checkpoint {ckpt_dir} to {repo_id}: {e}")
+        return False
 
 
 def custom_lr_schedule(global_step: int, max_lr: float, warmup_steps: int):
@@ -151,6 +382,7 @@ def resolve_emb_paths(args, ds_config: dict, expected_routes: int):
 
 
 def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
+    ds_config = ds_config or {}
     has_chunked_conf = bool(ds_config.get("base_models") and ds_config.get("chunk_name_patterns"))
     config_base_dir = os.path.dirname(os.path.abspath(args.config_file)) if args.config_file else os.getcwd()
     parquet_path = args.parquet_path or ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_wiki.parquet")
@@ -159,7 +391,27 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
     if has_chunked_conf:
         models = ds_config["base_models"]
         chunk_patterns = ds_config["chunk_name_patterns"]
-        ms_repo_id = ds_config.get("modelscope_repo_id")
+
+        raw_hf_arg = getattr(args, "hf_repo_id", None)
+        hf_repo_id = (
+            raw_hf_arg if raw_hf_arg is not None else ds_config.get("huggingface_repo_id")
+        )
+        if isinstance(hf_repo_id, str):
+            hf_repo_id = hf_repo_id.strip()
+        if not hf_repo_id:
+            hf_repo_id = None
+
+        raw_ms_arg = getattr(args, "ms_repo_id", None)
+        ms_repo_id = (
+            raw_ms_arg if raw_ms_arg is not None else ds_config.get("modelscope_repo_id")
+        )
+        if isinstance(ms_repo_id, str):
+            ms_repo_id = ms_repo_id.strip()
+        if not ms_repo_id:
+            ms_repo_id = None
+
+        effective_ms_repo_id = None if hf_repo_id else ms_repo_id
+
         if len(models) != expected_routes:
             msg = (
                 f"Model route mismatch: checkpoint expects {expected_routes}, "
@@ -172,13 +424,23 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
             print(f"[Warn] {msg} | Non-strict mode: truncating to first {expected_routes} models.")
             models = models[:expected_routes]
             chunk_patterns = {k: v for k, v in chunk_patterns.items() if k in models}
-        print(f"[Data] Using Phase1_ChunkedNpzDataLoader ({len(models)} routes, dynamic ModelScope/local chunks).")
+
+        src_desc = (
+            f"hf_repo_id={hf_repo_id}"
+            if hf_repo_id
+            else (
+                f"ms_repo_id={effective_ms_repo_id}"
+                if effective_ms_repo_id
+                else f"local_npz_dir={args.data_dir}"
+            )
+        )
+        print(f"[Data] Using Phase1_ChunkedNpzDataLoader ({len(models)} routes, {src_desc}).")
         return Phase1_ChunkedNpzDataLoader(
             parquet_path=parquet_path,
             models=models,
             chunk_patterns=chunk_patterns,
             tokenizer=tokenizer,
-            ms_repo_id=ms_repo_id,
+            ms_repo_id=effective_ms_repo_id,
             chunk_size=args.chunk_size,
             local_npz_dir=args.data_dir,
             cache_dir=args.download_cache_dir,
@@ -187,6 +449,7 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
             shuffle=True,
             lazy_start=True,
             backend="torch",
+            hf_repo_id=hf_repo_id,
         )
 
     emb_paths = resolve_emb_paths(args, ds_config, expected_routes)
@@ -209,7 +472,7 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
     download_cache_dir = os.path.abspath(download_cache_dir)
     loader.npz_dir = local_data_dir
     loader.cache_dir = download_cache_dir
-    _cand_locks = {}
+    _cand_locks: Dict[str, threading.Lock] = {}
     _cand_locks_guard = threading.Lock()
     _last_temp_cleanup_at = 0.0
 
@@ -224,6 +487,8 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
         roots = {
             os.path.join(local_data_dir, "._____temp"),
             os.path.join(download_cache_dir, "._____temp"),
+            os.path.join(local_data_dir, ".cache", "huggingface", "download"),
+            os.path.join(download_cache_dir, ".cache", "huggingface", "download"),
             local_data_dir,
             download_cache_dir,
         }
@@ -266,14 +531,37 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                 return local_path
 
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            if loader.ms_repo_id:
+            hf_repo = getattr(loader, "hf_repo_id", None)
+            ms_repo = getattr(loader, "ms_repo_id", None)
+            if hf_repo:
+                last_err = None
+                downloaded_path = None
+                for _ in range(3):
+                    try:
+                        downloaded_path = _download_hf_dataset_chunk_file(
+                            hf_repo,
+                            cand_name,
+                            local_dir=local_data_dir,
+                            cache_dir=download_cache_dir,
+                        )
+                        break
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.5)
+                if downloaded_path is None:
+                    raise last_err
+                downloaded_path = os.path.abspath(downloaded_path)
+                _cleanup_hf_download_metadata(
+                    local_path, [local_data_dir, download_cache_dir]
+                )
+            elif ms_repo:
                 from modelscope.hub.file_download import dataset_file_download
                 last_err = None
                 downloaded_path = None
                 for _ in range(3):
                     try:
                         downloaded_path = dataset_file_download(
-                            loader.ms_repo_id, cand_name, cache_dir=download_cache_dir
+                            ms_repo, cand_name, cache_dir=download_cache_dir
                         )
                         break
                     except FileNotFoundError as e:
@@ -288,14 +576,37 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                     raise FileNotFoundError(f"本地目标块缺失：{downloaded_path}")
 
             if downloaded_path != os.path.abspath(local_path):
-                try:
-                    os.replace(downloaded_path, local_path)
-                except OSError:
-                    shutil.copy2(downloaded_path, local_path)
+                is_link = os.path.islink(downloaded_path)
+                real_src = os.path.realpath(downloaded_path) if is_link else None
+                if is_link:
                     try:
                         os.remove(downloaded_path)
                     except OSError:
                         pass
+                    if not real_src or not os.path.exists(real_src):
+                        raise FileNotFoundError(
+                            f"Broken HF cache symlink {downloaded_path} -> {real_src}"
+                        )
+                    try:
+                        os.replace(real_src, local_path)
+                    except OSError:
+                        shutil.copy2(real_src, local_path)
+                        try:
+                            os.remove(real_src)
+                        except OSError:
+                            pass
+                else:
+                    try:
+                        os.replace(downloaded_path, local_path)
+                    except OSError:
+                        shutil.copy2(downloaded_path, local_path)
+                        try:
+                            os.remove(downloaded_path)
+                        except OSError:
+                            pass
+                _cleanup_hf_download_metadata(
+                    downloaded_path, [local_data_dir, download_cache_dir]
+                )
             return local_path
 
     loader._resolve_npz_path = _resolve_npz_path
@@ -319,7 +630,9 @@ def save_char_subspace_stats(
     Saves `char_subspace_stats.pt` containing the native orthogonal 32-D basis and
     valid-token mean offset for downstream Phase 4/5 (`HiPPOOracleCUDA` / Translator / Left Brain).
     """
+    assert_colab_drive_mounted(out_dir)
     ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
+    assert_colab_drive_mounted(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
     stats_path = os.path.join(ckpt_dir, "char_subspace_stats.pt")
     w_sub = student.char_subspace_proj.weight.detach().cpu()  # (d_sub, d_model)
@@ -338,7 +651,9 @@ def save_char_subspace_stats(
 
 
 def save_torch_optimizer_state(optimizer, out_dir: str, prefix: str, step: int, is_emergency: bool = False):
+    assert_colab_drive_mounted(out_dir)
     ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
+    assert_colab_drive_mounted(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
     opt_path = os.path.join(ckpt_dir, "optimizer.pt")
     torch.save(optimizer.state_dict(), opt_path)
@@ -360,6 +675,24 @@ def get_distill_parser():
     parser.add_argument("--ckpt_prefix", type=str, default="charencoder_pt_v2")
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Frozen Phase 0 checkpoint to distill from")
     parser.add_argument("--config_file", type=str, default=None, help="Optional dataset config JSON")
+    parser.add_argument(
+        "--hf_repo_id",
+        type=str,
+        default=None,
+        help="Optional Hugging Face dataset repo ID overriding dataset_config.json (e.g. catclever/emb_npy)",
+    )
+    parser.add_argument(
+        "--ms_repo_id",
+        type=str,
+        default=None,
+        help="Optional ModelScope dataset repo ID override",
+    )
+    parser.add_argument(
+        "--hf_ckpt_repo",
+        type=str,
+        default=None,
+        help="Optional Hugging Face model repo ID to mirror saved checkpoints (e.g. user/hollyshit-checkpoints)",
+    )
     parser.add_argument("--emb_paths", nargs="*", default=None, help="Explicit embedding .npy paths")
     parser.add_argument("--emb_dir", type=str, default="data/Basic_ZH/embs/hy-tmp")
     parser.add_argument("--parquet_path", type=str, default=None)
@@ -381,12 +714,22 @@ def get_distill_parser():
     parser.add_argument("--w_char_iso", type=float, default=2.0)
     parser.add_argument("--w_char_id", type=float, default=1.0)
     parser.add_argument("--ema_momentum", type=float, default=0.05)
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="CUDA mixed precision mode: 'auto' uses bf16 on Ampere+ (L4/A100) and fp16 on T4",
+    )
     return parser
 
 
 def main():
     parser = get_distill_parser()
     args = parser.parse_args()
+
+    # Hard Drive mount guard at second 0 (before Checkpointer / dataloaders / models!)
+    assert_colab_drive_mounted(args.out_dir)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -458,8 +801,29 @@ def main():
     )
 
     optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
-    use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if device.type == "cuda" and args.mixed_precision != "fp32":
+        bf16_ok = bool(hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
+        if args.mixed_precision == "bf16" or (args.mixed_precision == "auto" and bf16_ok):
+            use_amp = True
+            amp_dtype = torch.bfloat16
+            use_scaler = False
+            print("⚡ [AMP] Using CUDA bfloat16 mixed precision (overflow-free, GradScaler disabled).")
+        else:
+            use_amp = True
+            amp_dtype = torch.float16
+            use_scaler = True
+            print("⚡ [AMP] Using CUDA float16 mixed precision (GradScaler enabled).")
+    else:
+        use_amp = False
+        amp_dtype = torch.float32
+        use_scaler = False
+        print(f"⚡ [AMP] Using full float32 precision on {device.type}.")
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
     checkpointer.register_model("student", student)
@@ -479,6 +843,7 @@ def main():
         for epoch in range(dataloader.current_epoch, args.epochs):
             for token_inputs, batch_embs, attention_mask in dataloader:
                 global_step += 1
+                checkpointer.set_step(global_step)
                 if len(batch_embs) != len(emb_dims):
                     if args.strict_route_check or len(batch_embs) < len(emb_dims):
                         raise ValueError(
@@ -500,7 +865,7 @@ def main():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.autocast(device_type="cuda", enabled=use_amp):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     with torch.no_grad():
                         f_t = fuser(batch_embs, weights=None)
                         z_target_truth = god_encoder(f_t)
@@ -569,15 +934,39 @@ def main():
                     )
 
                 if global_step % args.save_steps == 0:
+                    assert_colab_drive_mounted(args.out_dir)
                     checkpointer.save(global_step)
                     save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step)
                     save_char_subspace_stats(student, args.out_dir, checkpointer.prefix, global_step)
+                    ckpt_dir = expected_checkpoint_dir(args.out_dir, checkpointer.prefix, global_step)
+                    if args.hf_ckpt_repo:
+                        mirror_checkpoint_to_hf_hub(ckpt_dir, args.hf_ckpt_repo)
+
+        if global_step > 0 and global_step % args.save_steps != 0:
+            assert_colab_drive_mounted(args.out_dir)
+            checkpointer.save(global_step)
+            save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step)
+            save_char_subspace_stats(student, args.out_dir, checkpointer.prefix, global_step)
+            final_dir = expected_checkpoint_dir(args.out_dir, checkpointer.prefix, global_step)
+            if args.hf_ckpt_repo:
+                mirror_checkpoint_to_hf_hub(final_dir, args.hf_ckpt_repo)
 
     except KeyboardInterrupt:
         print(f"\n[Interrupt] Caught kill signal at step {global_step}! Saving emergency checkpoint...")
-        checkpointer.save(global_step, is_emergency=True)
+        assert_colab_drive_mounted(args.out_dir)
         save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step, is_emergency=True)
         save_char_subspace_stats(student, args.out_dir, checkpointer.prefix, global_step, is_emergency=True)
+        emerg_dir = expected_checkpoint_dir(
+            args.out_dir, checkpointer.prefix, global_step, is_emergency=True
+        )
+        try:
+            checkpointer.save(global_step, is_emergency=True)
+        except SystemExit:
+            if args.hf_ckpt_repo:
+                mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
+            raise
+        if args.hf_ckpt_repo:
+            mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
 
 
 if __name__ == "__main__":

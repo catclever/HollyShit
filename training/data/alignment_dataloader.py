@@ -10,7 +10,94 @@ import glob
 import re
 import queue
 import threading
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
+
+
+def _get_hf_token() -> Optional[str]:
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    tok = tok.strip()
+    return tok if tok else None
+
+
+def _download_hf_dataset_file(repo_id: str, filename: str, cache_dir: str) -> str:
+    """
+    Downloads a single dataset file from Hugging Face Hub directly into `cache_dir`
+    (`local_dir=cache_dir` in huggingface_hub >= 0.23 to avoid duplicating multi-GB blobs,
+    falling back to `cache_dir=cache_dir` on older versions).
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError("请安装 huggingface_hub: pip install huggingface_hub")
+
+    hf_token = _get_hf_token()
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    try:
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            local_dir=cache_dir,
+            token=hf_token,
+        )
+    except TypeError:
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+            token=hf_token,
+        )
+
+
+def _cleanup_hf_download_metadata_for_path(file_path: str, roots: List[Optional[str]]) -> int:
+    """
+    Cleans `.cache/huggingface/download/<rel>.metadata`, `.incomplete`, and `.lock`
+    artifacts associated with `file_path` under any root in `roots`.
+    """
+    removed = 0
+    if not file_path:
+        return removed
+    abs_p = os.path.abspath(file_path)
+    seen_roots = set()
+    for root in roots:
+        if not root:
+            continue
+        abs_root = os.path.abspath(root)
+        if abs_root in seen_roots:
+            continue
+        seen_roots.add(abs_root)
+
+        prefix = abs_root.rstrip(os.sep) + os.sep
+        if not abs_p.startswith(prefix):
+            continue
+        rel = os.path.relpath(abs_p, abs_root)
+        rel_dir = os.path.dirname(rel)
+        base_fn = os.path.basename(rel)
+        dl_meta_dir = os.path.join(abs_root, ".cache", "huggingface", "download", rel_dir)
+        if not os.path.isdir(dl_meta_dir):
+            continue
+        try:
+            for fn in os.listdir(dl_meta_dir):
+                is_match = fn in {
+                    f"{base_fn}.metadata",
+                    f"{base_fn}.incomplete",
+                    f"{base_fn}.lock",
+                } or (
+                    fn.startswith(base_fn + ".")
+                    and fn.endswith((".metadata", ".incomplete", ".lock"))
+                )
+                if is_match:
+                    try:
+                        os.remove(os.path.join(dl_meta_dir, fn))
+                        removed += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return removed
+
 
 class Phase1_MultiEmbDataLoader:
     """
@@ -173,7 +260,7 @@ class Phase1_MultiEmbDataLoader:
 
 class Phase1_ChunkedNpzDataLoader:
     """
-    专门适配从 ModelScope (如 catclever/emb_npy) 拉取的 `.npz` 切片矩阵设计的双层乱序 DataLoader。
+    专门适配从 Hugging Face Hub / ModelScope (如 catclever/emb_npy) 拉取的 `.npz` 切片矩阵设计的双层乱序 DataLoader。
     机制：
     1. 不吃内存：只在内存驻留"当前正在训练的任务块"的特征（比如每次只把某个 50w 条特征解压进 RAM）。
     2. 双层乱序 (Double Shuffle)：每个 Epoch 开始时打乱所有 Chunk 文件的流转顺序；在读取单个 Chunk 时，在 Chunk 内部将其局部 batch 完全乱序。
@@ -195,7 +282,8 @@ class Phase1_ChunkedNpzDataLoader:
                  lazy_start: bool = False,
                  cache_dir: str = './datas',
                  auto_cleanup: bool = True,
-                 embedding_only: bool = False):
+                 embedding_only: bool = False,
+                 hf_repo_id: str = None):
         
         self.backend = backend
         self.batch_size = batch_size
@@ -204,11 +292,13 @@ class Phase1_ChunkedNpzDataLoader:
         self.seed = seed if seed is not None else int(__import__("time").time())
         self.models = models
         self.chunk_patterns = chunk_patterns or {}
+        self.hf_repo_id = hf_repo_id
         self.ms_repo_id = ms_repo_id
         self.tokenizer = tokenizer
         self.cache_dir = cache_dir
         self.auto_cleanup = auto_cleanup
         self.embedding_only = bool(embedding_only)
+        self.npz_dir = local_npz_dir
         
         # 3. 提取对应的全体文本数据 (embedding_only=True 时完全免加载 Parquet)
         if self.embedding_only:
@@ -225,23 +315,38 @@ class Phase1_ChunkedNpzDataLoader:
             print(f"[DataLoader] 成功吃进文本池: {self.total_samples} 条")
             del df
         
-        # 1. 自动挂载魔搭数据集或加载本地路径 (改为只验证配置，去除暴力的 snapshot_download 全本拉取)
-        if ms_repo_id:
+        # 1. 自动校验 Hugging Face Hub / ModelScope 数据集配置或本地路径 (优先级: HF -> ModelScope -> 本地目录)
+        if self.hf_repo_id:
             try:
-                from modelscope.hub.file_download import dataset_file_download
-                print(f"[DataLoader] 已启用 ModelScope 终极按需流式串流模式: {ms_repo_id}...")
+                from huggingface_hub import HfApi, hf_hub_download  # noqa: F401
+                print(f"[DataLoader] 已启用 Hugging Face Hub 极速按需流式串流模式: {self.hf_repo_id}...")
+            except ImportError:
+                raise RuntimeError("请安装 huggingface_hub: pip install huggingface_hub")
+        elif self.ms_repo_id:
+            try:
+                from modelscope.hub.file_download import dataset_file_download  # noqa: F401
+                print(f"[DataLoader] 已启用 ModelScope 终极按需流式串流模式: {self.ms_repo_id}...")
             except ImportError:
                 raise RuntimeError("请安装 modelscope: pip install modelscope")
         else:
-            self.npz_dir = local_npz_dir
             if not self.npz_dir or not os.path.isdir(self.npz_dir):
-                raise ValueError("必须提供 ms_repo_id 或有效的 local_npz_dir")
+                raise ValueError("必须提供 hf_repo_id、ms_repo_id 或有效的 local_npz_dir")
 
         # 2. 按模型分别探测物理分块，按 start 索引取交集（容错不同模型尾部 end 不同）
         self.chunk_bounds = []
         self._per_model_bounds = {}  # {model_name: {start: end}}
         try:
-            if self.ms_repo_id:
+            if self.hf_repo_id:
+                from huggingface_hub import HfApi
+                hf_token = _get_hf_token()
+                if hf_token:
+                    print("[DataLoader] 🔑 已应用 Hugging Face Token 鉴权。")
+                chunk_files = list(
+                    HfApi(token=hf_token).list_repo_files(
+                        repo_id=self.hf_repo_id, repo_type="dataset"
+                    )
+                )
+            elif self.ms_repo_id:
                 from modelscope.hub.api import HubApi
                 api = HubApi()
                 ms_token = (
@@ -297,7 +402,7 @@ class Phase1_ChunkedNpzDataLoader:
             if not self.chunk_bounds:
                 raise RuntimeError(
                     f"[DataLoader] embedding_only=True 模式下未探测到任何可用的 .npz 分块 "
-                    f"(ms_repo_id={self.ms_repo_id!r}, local_npz_dir={local_npz_dir!r})。"
+                    f"(hf_repo_id={self.hf_repo_id!r}, ms_repo_id={self.ms_repo_id!r}, local_npz_dir={local_npz_dir!r})。"
                 )
             self.total_samples = int(self.chunk_bounds[-1][1])
             print(
@@ -331,6 +436,10 @@ class Phase1_ChunkedNpzDataLoader:
         if not lazy_start:
             self._do_start()
 
+    @staticmethod
+    def _download_hf_dataset_file(repo_id: str, filename: str, cache_dir: str) -> str:
+        return _download_hf_dataset_file(repo_id=repo_id, filename=filename, cache_dir=cache_dir)
+
     def _do_start(self):
         """真正启动后台下载，首次加载第一个块"""
         if self._started:
@@ -340,56 +449,119 @@ class Phase1_ChunkedNpzDataLoader:
         self._pop_next_chunk()
 
     def _cleanup_cached_files(self, paths: list):
-        """清理已经消费完毕的 ModelScope 缓存文件，释放磁盘空间"""
+        """清理已经消费完毕的 HF Hub / ModelScope 缓存文件（含软链接真实 blob 与 .metadata/.incomplete），释放磁盘空间"""
         cleaned = 0
+        roots = [self.cache_dir, getattr(self, "npz_dir", None)]
         for p in paths:
+            if not p:
+                continue
             try:
-                if p and os.path.exists(p):
+                if os.path.islink(p):
+                    real_p = os.path.realpath(p)
+                    try:
+                        os.remove(p)
+                        cleaned += 1
+                    except OSError:
+                        pass
+                    if real_p and real_p != os.path.abspath(p) and os.path.exists(real_p):
+                        try:
+                            os.remove(real_p)
+                            cleaned += 1
+                        except OSError:
+                            pass
+                elif os.path.exists(p):
                     os.remove(p)
                     cleaned += 1
             except OSError:
                 pass
+            cleaned += _cleanup_hf_download_metadata_for_path(p, roots)
         if cleaned:
-            print(f"[DataLoader] 🧹 已清理 {cleaned} 个已消费缓存文件")
+            print(f"[DataLoader] 🧹 已清理 {cleaned} 个已消费缓存文件/元数据")
 
-    def _start_prefetching(self, start_macro_ptr):
-        """挂起旧线程，启动全新后台线程，从指定的 macro_ptr 开始默默搬取"""
-        self.stop_event.set()
-        
-        # 清空队列残骸
-        while not self.prefetch_queue.empty():
+    def _drain_and_cleanup_prefetch_queue(self):
+        """排空预取队列，并在 auto_cleanup=True 时清理队列中尚未消费分块的缓存文件"""
+        while True:
             try:
-                self.prefetch_queue.get_nowait()
+                queued = self.prefetch_queue.get_nowait()
             except queue.Empty:
                 break
-                
+            if (
+                self.auto_cleanup
+                and isinstance(queued, dict)
+                and queued.get("cached_paths")
+            ):
+                self._cleanup_cached_files(queued["cached_paths"])
+
+    def close(self):
+        """安全终止后台预取线程，并清理预取队列与当前分块遗留的缓存文件"""
+        self.stop_event.set()
+        self._drain_and_cleanup_prefetch_queue()
+        t = getattr(self, "prefetch_thread", None)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5.0)
+        self._drain_and_cleanup_prefetch_queue()
+        if self.auto_cleanup and getattr(self, "_prev_chunk_paths", None):
+            self._cleanup_cached_files(self._prev_chunk_paths)
+            self._prev_chunk_paths = []
+
+    def _start_prefetching(self, start_macro_ptr):
+        """挂起并汇合旧线程，清理队列残骸后启动全新后台线程，从指定的 macro_ptr 开始默默搬取"""
+        self.stop_event.set()
+        self._drain_and_cleanup_prefetch_queue()
+        old_thread = getattr(self, "prefetch_thread", None)
+        if (
+            old_thread is not None
+            and old_thread.is_alive()
+            and old_thread is not threading.current_thread()
+        ):
+            old_thread.join(timeout=3.0)
+        self._drain_and_cleanup_prefetch_queue()
+
         self.stop_event = threading.Event()
-        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, args=(start_macro_ptr,), daemon=True)
+        worker_stop_event = self.stop_event
+        self.prefetch_thread = threading.Thread(
+            target=self._prefetch_worker,
+            args=(start_macro_ptr, worker_stop_event),
+            daemon=True,
+        )
         self.prefetch_thread.start()
         
-    def _prefetch_worker(self, start_macro_ptr):
+    def _prefetch_worker(self, start_macro_ptr, stop_ev: Optional[threading.Event] = None):
         """高强度纯后台下载/解压打工仔，永远走在 GPU 的前面"""
+        if stop_ev is None:
+            stop_ev = self.stop_event
         worker_macro_ptr = start_macro_ptr
-        while not self.stop_event.is_set():
+        while not stop_ev.is_set():
             if worker_macro_ptr >= len(self.macro_chunk_indices):
                 # 提示时代结束
-                self.prefetch_queue.put(None)
+                while not stop_ev.is_set():
+                    try:
+                        self.prefetch_queue.put(None, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
                 return
 
             chunk_idx = self.macro_chunk_indices[worker_macro_ptr]
             start_idx, end_idx = self.chunk_bounds[chunk_idx]
             cur_chunk_size = end_idx - start_idx
+            cached_paths = []  # 记录下载路径用于后续清理
             
             try:
                 active_chunk_embs = []
-                cached_paths = []  # 记录下载路径用于后续清理
                 for model_name in self.models:
+                    if stop_ev.is_set():
+                        if self.auto_cleanup and cached_paths:
+                            self._cleanup_cached_files(cached_paths)
+                        return
                     pattern = self.chunk_patterns.get(model_name, f"{model_name}_chunk_{'{start:07d}'}_{'{end:07d}'}.npz")
                     # 用该模型自己的真实 end（容错命名差异，如 youtu 的 9000000 vs bge 的 8656199）
                     model_end = self._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
                     cand_name = pattern.format(start=start_idx, end=model_end)
                     
-                    if self.ms_repo_id:
+                    if self.hf_repo_id:
+                         path = _download_hf_dataset_file(self.hf_repo_id, cand_name, self.cache_dir)
+                    elif self.ms_repo_id:
                          from modelscope.hub.file_download import dataset_file_download
                          path = dataset_file_download(self.ms_repo_id, cand_name, cache_dir=self.cache_dir)
                     else:
@@ -397,11 +569,16 @@ class Phase1_ChunkedNpzDataLoader:
                          if not os.path.exists(path):
                               raise FileNotFoundError(f"后台打工仔抓取失败！本地目标块缺失：{path}")
                     
+                    cached_paths.append(path)
+                    if stop_ev.is_set():
+                        if self.auto_cleanup and cached_paths:
+                            self._cleanup_cached_files(cached_paths)
+                        return
+
                     arr = np.load(path)['features']
                     if arr.shape[0] > cur_chunk_size:
                         arr = arr[:cur_chunk_size]
                     active_chunk_embs.append(arr)
-                    cached_paths.append(path)
                     
                 active_micro_indices = np.arange(cur_chunk_size)
                 
@@ -417,14 +594,28 @@ class Phase1_ChunkedNpzDataLoader:
                     "macro_idx_ptr": worker_macro_ptr,
                     "cached_paths": cached_paths
                 }
-                # 这里会阻塞！直到上一块被 GPU 吃光
-                self.prefetch_queue.put(payload)
+                # 带超时可中断入队，若在等待 GPU 消费期间收到 stop_ev 则立即回收本块缓存并退出
+                queued_ok = False
+                while not stop_ev.is_set():
+                    try:
+                        self.prefetch_queue.put(payload, timeout=0.2)
+                        queued_ok = True
+                        break
+                    except queue.Full:
+                        continue
+                if not queued_ok:
+                    if self.auto_cleanup and cached_paths:
+                        self._cleanup_cached_files(cached_paths)
+                    return
                 worker_macro_ptr += 1
             except Exception as e:
+                if self.auto_cleanup and cached_paths:
+                    self._cleanup_cached_files(cached_paths)
+                if stop_ev.is_set():
+                    return
                 print(f"\n[DataLoader] 后台打工仔抓取/加载失败 (网络可能断开了？): {e}")
                 print(f"[DataLoader] 这不是致命错误！打工仔将在 10 秒后原地重新尝试拉取 Chunk {chunk_idx}...")
-                import time
-                time.sleep(10)
+                stop_ev.wait(10.0)
                 # 不退出进程，不抛出异常。
                 # 既然失败了，worker_macro_ptr 就不加 1，直接 continue，下一轮会继续死磕这个块！
                 continue
