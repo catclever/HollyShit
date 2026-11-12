@@ -26,6 +26,7 @@ import numpy as np
 
 
 DEFAULT_DATASET_CONFIG: Dict[str, Any] = {
+    "huggingface_repo_id": "drukencat/emb_npy",
     "modelscope_repo_id": "catclever/emb_npy",
     "base_models": ["bge", "qwen", "xiaobu", "youtu", "conan_v1"],
     "chunk_name_patterns": {
