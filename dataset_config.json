@@ -1,6 +1,8 @@
 {
-    "huggingface_repo_id": "drunkencat/emb_npy",
+    "default_source": "ms",
     "modelscope_repo_id": "catclever/emb_npy",
+    "huggingface_repo_id": "drunkencat/emb_npy",
+    "gdrive_dir": "/content/drive/MyDrive/hollyshit/embs",
     "base_models": [
         "bge",
         "qwen",

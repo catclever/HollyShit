@@ -9,6 +9,7 @@ import os
 import glob
 import re
 import queue
+import shutil
 import threading
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -150,22 +151,19 @@ class Phase1_MultiEmbDataLoader:
         else:
             # 1. Load Text Data
             if pd is None:
-                import pandas as _pd  # raises ModuleNotFoundError clearly
+                import pandas as _pd
                 globals()["pd"] = _pd
             print(f"Loading Text Parquet from {parquet_path}...")
             df = pd.read_parquet(parquet_path)
-            # Explode the lists of chunks into a flat list of 7.6M strings
-            # dropna() just in case
             self.text_chunks = df['chunks'].explode().dropna().tolist()
             self.total_samples = len(self.text_chunks)
             print(f"Loaded {self.total_samples} text chunks into memory.")
-            del df # free up memory of the original dataframe
+            del df
             
             # 2. Memory-Map the Numpy Embeddings
             print("Memory-mapping embedding arrays...")
             self.embs = []
             for path in emb_paths:
-                # mmap_mode='r' completely avoids loading the massive files into RAM
                 arr = np.load(path, mmap_mode='r')
                 assert arr.shape[0] == self.total_samples, f"Shape mismatch in {path}: {arr.shape[0]} != {self.total_samples}"
                 self.embs.append(arr)
@@ -188,7 +186,6 @@ class Phase1_MultiEmbDataLoader:
         
     def __next__(self) -> Tuple[Any, List[Any], Any]:
         if self.batch_idx >= self.num_batches:
-            # End of Epoch
             self.current_epoch += 1
             self.batch_idx = 0
             if self.shuffle:
@@ -197,7 +194,6 @@ class Phase1_MultiEmbDataLoader:
             
         start_idx = self.batch_idx * self.batch_size
         end_idx = min(start_idx + self.batch_size, self.total_samples)
-        
         batch_indices = self.indices[start_idx:end_idx]
         
         if self.embedding_only or self.text_chunks is None or self.tokenizer is None:
@@ -210,10 +206,7 @@ class Phase1_MultiEmbDataLoader:
             self.batch_idx += 1
             return None, batch_embs, None
 
-        # 1. Fetch Texts
         batch_texts = [self.text_chunks[i] for i in batch_indices]
-        
-        # 2. Tokenize and Pad dynamically using Custom CharTokenizer
         encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in batch_texts]
         max_len = max(len(seq) for seq in encoded_list)
         
@@ -224,8 +217,6 @@ class Phase1_MultiEmbDataLoader:
             padded_ids.append(seq + [self.tokenizer.pad_token_id] * pad_len)
             masks.append([1] * len(seq) + [0] * pad_len)
             
-        # 3. Fetch Embeddings via Mmap
-        # This triggers Disk I/O precisely for these specific indices
         if self.backend == 'torch':
             import torch
             token_inputs = torch.tensor(padded_ids, dtype=torch.long)
@@ -238,37 +229,38 @@ class Phase1_MultiEmbDataLoader:
             batch_embs = [mx.array(arr[batch_indices]) for arr in self.embs]
         
         self.batch_idx += 1
-        
         return token_inputs, batch_embs, attention_mask
 
-    # --- Checkpointing / Interrupt Resume Support ---
-    
     def state_dict(self) -> Dict[str, Any]:
-        """Returns the internal state for resuming."""
         return {
             "current_epoch": self.current_epoch,
             "batch_idx": self.batch_idx,
-            "indices": self.indices.tolist() # Safe to serialize exactly how it was shuffled
+            "indices": self.indices.tolist()
         }
         
     def load_state_dict(self, state: Dict[str, Any]):
-        """Restores the exact shuffle and position."""
         self.current_epoch = state["current_epoch"]
         self.batch_idx = state["batch_idx"]
         self.indices = np.array(state["indices"])
         print(f"Resumed Dataloader from Epoch {self.current_epoch}, Batch {self.batch_idx}/{self.num_batches}")
 
+
 class Phase1_ChunkedNpzDataLoader:
     """
-    专门适配从 Hugging Face Hub / ModelScope (如 catclever/emb_npy) 拉取的 `.npz` 切片矩阵设计的双层乱序 DataLoader。
+    专门适配从 ModelScope / Google Drive / Hugging Face Hub / 本地目录拉取的 `.npz` 切片矩阵设计的统一双层乱序 DataLoader。
     机制：
-    1. 不吃内存：只在内存驻留"当前正在训练的任务块"的特征（比如每次只把某个 50w 条特征解压进 RAM）。
+    1. 不吃内存：只在内存驻留当前正在训练的任务块的特征（比如每次只把某个 50w 条特征解压进 RAM）。
     2. 双层乱序 (Double Shuffle)：每个 Epoch 开始时打乱所有 Chunk 文件的流转顺序；在读取单个 Chunk 时，在 Chunk 内部将其局部 batch 完全乱序。
     3. 纯向量流式模式 (`embedding_only=True`)：免加载本地 Parquet 语料与逐批分词，直接由远端/本地 `.npz` 分块边界推导总样本数并流式产出多师向量。
+    4. 统一多数据源架构：
+       - `ms` (默认): ModelScope 零配置按需流式串流 (catclever/emb_npy)
+       - `gdrive`: Google Drive 持久目录挂载源，后台异步向本地 NVMe 临时目录 (`cache_dir`) 暂存 (Staging)，消费完立即清除本地暂存，严禁误删云盘原始文件
+       - `hf`: Hugging Face Hub 按需流式串流 (drunkencat/emb_npy)
+       - `local`: 本地磁盘直接读取，不走临时暂存复制
     """
     def __init__(self, 
                  parquet_path: str,
-                 models: List[str], # 对应你的模型标识，例如 ["bge", "qwen", "xiaobu"]
+                 models: List[str],
                  chunk_patterns: dict = None,
                  tokenizer=None,
                  ms_repo_id: str = None, 
@@ -283,7 +275,9 @@ class Phase1_ChunkedNpzDataLoader:
                  cache_dir: str = './datas',
                  auto_cleanup: bool = True,
                  embedding_only: bool = False,
-                 hf_repo_id: str = None):
+                 hf_repo_id: str = None,
+                 data_source: str = "ms",
+                 gdrive_dir: Optional[str] = None):
         
         self.backend = backend
         self.batch_size = batch_size
@@ -292,13 +286,30 @@ class Phase1_ChunkedNpzDataLoader:
         self.seed = seed if seed is not None else int(__import__("time").time())
         self.models = models
         self.chunk_patterns = chunk_patterns or {}
-        self.hf_repo_id = hf_repo_id
-        self.ms_repo_id = ms_repo_id
         self.tokenizer = tokenizer
         self.cache_dir = cache_dir
         self.auto_cleanup = auto_cleanup
         self.embedding_only = bool(embedding_only)
         self.npz_dir = local_npz_dir
+        self.gdrive_dir = gdrive_dir
+
+        # 规范化 data_source: ms (默认), gdrive, hf, local
+        ds_raw = (data_source or "ms").strip().lower()
+        if ds_raw in ("ms", "modelscope"):
+            self.data_source = "ms"
+        elif ds_raw in ("gdrive", "google_drive", "googledrive"):
+            self.data_source = "gdrive"
+        elif ds_raw in ("hf", "huggingface", "hugging_face"):
+            self.data_source = "hf"
+        elif ds_raw in ("local", "dir", "local_dir"):
+            self.data_source = "local"
+        else:
+            raise ValueError(
+                f"[DataLoader] 未知数据源 data_source={data_source!r}。仅支持: 'ms', 'gdrive', 'hf', 'local'"
+            )
+
+        self.ms_repo_id = ms_repo_id or ("catclever/emb_npy" if self.data_source == "ms" else None)
+        self.hf_repo_id = hf_repo_id or ("drunkencat/emb_npy" if self.data_source == "hf" else None)
         
         # 3. 提取对应的全体文本数据 (embedding_only=True 时完全免加载 Parquet)
         if self.embedding_only:
@@ -308,45 +319,48 @@ class Phase1_ChunkedNpzDataLoader:
             if pd is None:
                 import pandas as _pd
                 globals()["pd"] = _pd
-            print(f"[DataLoader] 正在装载基准文本体系: {parquet_path}...")
-            df = pd.read_parquet(parquet_path)
-            self.text_chunks = df['chunks'].explode().dropna().tolist()
-            self.total_samples = len(self.text_chunks)
-            print(f"[DataLoader] 成功吃进文本池: {self.total_samples} 条")
-            del df
+            if parquet_path and os.path.isfile(parquet_path):
+                print(f"[DataLoader] 正在装载基准文本体系: {parquet_path}...")
+                df = pd.read_parquet(parquet_path)
+                self.text_chunks = df['chunks'].explode().dropna().tolist()
+                self.total_samples = len(self.text_chunks)
+                print(f"[DataLoader] 成功吃进文本池: {self.total_samples} 条")
+                del df
+            else:
+                self.text_chunks = []
+                self.total_samples = 0
         
-        # 1. 自动校验 Hugging Face Hub / ModelScope 数据集配置或本地路径 (优先级: HF -> ModelScope -> 本地目录)
-        if self.hf_repo_id:
+        # 1. 校验所选数据源所需依赖与路径
+        if self.data_source == "ms":
+            try:
+                from modelscope.hub.file_download import dataset_file_download  # noqa: F401
+                print(f"[DataLoader] 已启用 ModelScope 默认流式串流模式: {self.ms_repo_id}...")
+            except ImportError:
+                raise RuntimeError("请安装 modelscope: pip install modelscope")
+        elif self.data_source == "gdrive":
+            if not self.gdrive_dir or not os.path.isdir(self.gdrive_dir):
+                raise FileNotFoundError(
+                    f"[DataLoader] Google Drive 数据源目录不存在：{self.gdrive_dir}。请检查云盘路径或挂载状态！"
+                )
+            print(
+                f"[DataLoader] 已启用 Google Drive 离线云盘模式 (NVMe 暂存: {self.cache_dir}): {self.gdrive_dir}..."
+            )
+        elif self.data_source == "hf":
             try:
                 from huggingface_hub import HfApi, hf_hub_download  # noqa: F401
                 print(f"[DataLoader] 已启用 Hugging Face Hub 极速按需流式串流模式: {self.hf_repo_id}...")
             except ImportError:
                 raise RuntimeError("请安装 huggingface_hub: pip install huggingface_hub")
-        elif self.ms_repo_id:
-            try:
-                from modelscope.hub.file_download import dataset_file_download  # noqa: F401
-                print(f"[DataLoader] 已启用 ModelScope 终极按需流式串流模式: {self.ms_repo_id}...")
-            except ImportError:
-                raise RuntimeError("请安装 modelscope: pip install modelscope")
-        else:
+        elif self.data_source == "local":
             if not self.npz_dir or not os.path.isdir(self.npz_dir):
-                raise ValueError("必须提供 hf_repo_id、ms_repo_id 或有效的 local_npz_dir")
+                raise ValueError(f"[DataLoader] local 模式必须提供有效的 local_npz_dir，当前为: {self.npz_dir!r}")
+            print(f"[DataLoader] 已启用本地目录直接读取模式: {self.npz_dir}...")
 
         # 2. 按模型分别探测物理分块，按 start 索引取交集（容错不同模型尾部 end 不同）
         self.chunk_bounds = []
         self._per_model_bounds = {}  # {model_name: {start: end}}
         try:
-            if self.hf_repo_id:
-                from huggingface_hub import HfApi
-                hf_token = _get_hf_token()
-                if hf_token:
-                    print("[DataLoader] 🔑 已应用 Hugging Face Token 鉴权。")
-                chunk_files = list(
-                    HfApi(token=hf_token).list_repo_files(
-                        repo_id=self.hf_repo_id, repo_type="dataset"
-                    )
-                )
-            elif self.ms_repo_id:
+            if self.data_source == "ms":
                 from modelscope.hub.api import HubApi
                 api = HubApi()
                 ms_token = (
@@ -362,8 +376,22 @@ class Phase1_ChunkedNpzDataLoader:
                         print(f"[DataLoader] ⚠️ ModelScope Token 登录忽略 (将继续匿名拉取): {login_err}")
                 res = api.get_dataset_files(self.ms_repo_id, recursive=True)
                 chunk_files = [f.get("Path", f.get("Name", "")) for f in res]
-            else:
+            elif self.data_source == "gdrive":
+                chunk_files = glob.glob(os.path.join(self.gdrive_dir, "**", "*.npz"), recursive=True)
+            elif self.data_source == "hf":
+                from huggingface_hub import HfApi
+                hf_token = _get_hf_token()
+                if hf_token:
+                    print("[DataLoader] 🔑 已应用 Hugging Face Token 鉴权。")
+                chunk_files = list(
+                    HfApi(token=hf_token).list_repo_files(
+                        repo_id=self.hf_repo_id, repo_type="dataset"
+                    )
+                )
+            elif self.data_source == "local":
                 chunk_files = glob.glob(os.path.join(self.npz_dir, "**", "*.npz"), recursive=True)
+            else:
+                chunk_files = []
             
             # 按模型归类，各自收集 start → end 的映射
             for model_name in self.models:
@@ -382,11 +410,9 @@ class Phase1_ChunkedNpzDataLoader:
                 self._per_model_bounds[model_name] = start_to_end
                 print(f"[DataLoader]   {model_name}: {len(start_to_end)} 个分块")
             
-            # 按 start 索引取交集（容错：youtu 的 end=9000000 和 bge 的 end=8656199 都算 start=8500000）
             if self._per_model_bounds:
                 common_starts = set.intersection(*[set(d.keys()) for d in self._per_model_bounds.values()])
                 for s in sorted(common_starts):
-                    # 取所有模型中最小的 end 作为安全数据范围
                     min_end = min(self._per_model_bounds[m][s] for m in self.models)
                     self.chunk_bounds.append((s, min_end))
             
@@ -402,7 +428,8 @@ class Phase1_ChunkedNpzDataLoader:
             if not self.chunk_bounds:
                 raise RuntimeError(
                     f"[DataLoader] embedding_only=True 模式下未探测到任何可用的 .npz 分块 "
-                    f"(hf_repo_id={self.hf_repo_id!r}, ms_repo_id={self.ms_repo_id!r}, local_npz_dir={local_npz_dir!r})。"
+                    f"(data_source={self.data_source!r}, ms_repo_id={self.ms_repo_id!r}, "
+                    f"gdrive_dir={self.gdrive_dir!r}, hf_repo_id={self.hf_repo_id!r}, local_npz_dir={local_npz_dir!r})。"
                 )
             self.total_samples = int(self.chunk_bounds[-1][1])
             print(
@@ -419,20 +446,19 @@ class Phase1_ChunkedNpzDataLoader:
         if self.shuffle:
              self.rng.shuffle(self.macro_chunk_indices)
              
-        self.active_macro_idx_ptr = 0 # 当前正训练到第几个 chunk
+        self.active_macro_idx_ptr = 0
         
         # 微观控制表 (内部流)
         self.active_chunk_embs = None
         self.active_micro_indices = []
         self.active_micro_ptr = 0
-        self._prev_chunk_paths = []  # 上一个已消费分块的缓存路径，用于清理
+        self._prev_chunk_paths = []
         
         # 异步流水线 (Async Prefetch)
-        self.prefetch_queue = queue.Queue(maxsize=1) # 内存里永远只多塞一块，极限控流
+        self.prefetch_queue = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self._started = False
         
-        # 延迟启动：如果要从 checkpoint 恢复，不要在这里白白下载一个块
         if not lazy_start:
             self._do_start()
 
@@ -449,26 +475,48 @@ class Phase1_ChunkedNpzDataLoader:
         self._pop_next_chunk()
 
     def _cleanup_cached_files(self, paths: list):
-        """清理已经消费完毕的 HF Hub / ModelScope 缓存文件（含软链接真实 blob 与 .metadata/.incomplete），释放磁盘空间"""
+        """
+        清理已经消费完毕的缓存文件（含软链接真实 blob 与 .metadata/.incomplete），
+        铁律防线：严格禁止删除 Google Drive 原始文件或 local 源文件！
+        """
         cleaned = 0
         roots = [self.cache_dir, getattr(self, "npz_dir", None)]
+        gdrive_abs = os.path.abspath(self.gdrive_dir) if getattr(self, "gdrive_dir", None) else None
+        local_abs = os.path.abspath(self.npz_dir) if getattr(self, "npz_dir", None) else None
+
         for p in paths:
             if not p:
                 continue
+            abs_p = os.path.abspath(p)
+            real_p = os.path.realpath(p)
+
+            # 铁律拦截：绝不能删除 gdrive_dir 或 local 模式下的 npz_dir 原始文件！
+            if gdrive_abs:
+                if abs_p == gdrive_abs or abs_p.startswith(gdrive_abs + os.sep):
+                    continue
+                if real_p and (real_p == gdrive_abs or real_p.startswith(gdrive_abs + os.sep)):
+                    continue
+            if self.data_source == "local" and local_abs:
+                if abs_p == local_abs or abs_p.startswith(local_abs + os.sep):
+                    continue
+                if real_p and (real_p == local_abs or real_p.startswith(local_abs + os.sep)):
+                    continue
+
             try:
                 if os.path.islink(p):
-                    real_p = os.path.realpath(p)
+                    real_target = os.path.realpath(p)
                     try:
                         os.remove(p)
                         cleaned += 1
                     except OSError:
                         pass
-                    if real_p and real_p != os.path.abspath(p) and os.path.exists(real_p):
-                        try:
-                            os.remove(real_p)
-                            cleaned += 1
-                        except OSError:
-                            pass
+                    if real_target and real_target != abs_p and os.path.exists(real_target):
+                        if not (gdrive_abs and (real_target == gdrive_abs or real_target.startswith(gdrive_abs + os.sep))):
+                            try:
+                                os.remove(real_target)
+                                cleaned += 1
+                            except OSError:
+                                pass
                 elif os.path.exists(p):
                     os.remove(p)
                     cleaned += 1
@@ -533,7 +581,6 @@ class Phase1_ChunkedNpzDataLoader:
         worker_macro_ptr = start_macro_ptr
         while not stop_ev.is_set():
             if worker_macro_ptr >= len(self.macro_chunk_indices):
-                # 提示时代结束
                 while not stop_ev.is_set():
                     try:
                         self.prefetch_queue.put(None, timeout=0.2)
@@ -545,7 +592,7 @@ class Phase1_ChunkedNpzDataLoader:
             chunk_idx = self.macro_chunk_indices[worker_macro_ptr]
             start_idx, end_idx = self.chunk_bounds[chunk_idx]
             cur_chunk_size = end_idx - start_idx
-            cached_paths = []  # 记录下载路径用于后续清理
+            cached_paths = []
             
             try:
                 active_chunk_embs = []
@@ -554,22 +601,53 @@ class Phase1_ChunkedNpzDataLoader:
                         if self.auto_cleanup and cached_paths:
                             self._cleanup_cached_files(cached_paths)
                         return
-                    pattern = self.chunk_patterns.get(model_name, f"{model_name}_chunk_{'{start:07d}'}_{'{end:07d}'}.npz")
-                    # 用该模型自己的真实 end（容错命名差异，如 youtu 的 9000000 vs bge 的 8656199）
+                    pattern = self.chunk_patterns.get(
+                        model_name, f"{model_name}_chunk_{'{start:07d}'}_{'{end:07d}'}.npz"
+                    )
                     model_end = self._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
                     cand_name = pattern.format(start=start_idx, end=model_end)
                     
-                    if self.hf_repo_id:
-                         path = _download_hf_dataset_file(self.hf_repo_id, cand_name, self.cache_dir)
-                    elif self.ms_repo_id:
-                         from modelscope.hub.file_download import dataset_file_download
-                         path = dataset_file_download(self.ms_repo_id, cand_name, cache_dir=self.cache_dir)
-                    else:
-                         path = os.path.join(self.npz_dir, cand_name)
-                         if not os.path.exists(path):
-                              raise FileNotFoundError(f"后台打工仔抓取失败！本地目标块缺失：{path}")
-                    
-                    cached_paths.append(path)
+                    if self.data_source == "ms":
+                        from modelscope.hub.file_download import dataset_file_download
+                        path = dataset_file_download(self.ms_repo_id, cand_name, cache_dir=self.cache_dir)
+                        cached_paths.append(path)
+                    elif self.data_source == "gdrive":
+                        # Google Drive 数据源：从 gdrive_dir 读取并暂存到 NVMe cache_dir
+                        gdrive_src = os.path.join(self.gdrive_dir, cand_name)
+                        if not os.path.exists(gdrive_src):
+                            flat_src = os.path.join(self.gdrive_dir, os.path.basename(cand_name))
+                            if os.path.exists(flat_src):
+                                gdrive_src = flat_src
+                            else:
+                                raise FileNotFoundError(f"[DataLoader] Google Drive 源分块缺失：{gdrive_src}")
+                        
+                        abs_cache = os.path.abspath(self.cache_dir)
+                        abs_gdrive = os.path.abspath(self.gdrive_dir)
+                        if abs_cache != abs_gdrive:
+                            staged_path = os.path.join(self.cache_dir, cand_name)
+                            os.makedirs(os.path.dirname(staged_path), exist_ok=True)
+                            if (not os.path.exists(staged_path)) or (
+                                os.path.getsize(staged_path) != os.path.getsize(gdrive_src)
+                            ):
+                                shutil.copy2(gdrive_src, staged_path)
+                            path = staged_path
+                            cached_paths.append(staged_path)
+                        else:
+                            # 缓存目录与云盘相同，直接读取，严禁加入 cached_paths 以免被清理
+                            path = gdrive_src
+                    elif self.data_source == "hf":
+                        path = _download_hf_dataset_file(self.hf_repo_id, cand_name, self.cache_dir)
+                        cached_paths.append(path)
+                    elif self.data_source == "local":
+                        path = os.path.join(self.npz_dir, cand_name)
+                        if not os.path.exists(path):
+                            flat_path = os.path.join(self.npz_dir, os.path.basename(cand_name))
+                            if os.path.exists(flat_path):
+                                path = flat_path
+                            else:
+                                raise FileNotFoundError(f"后台打工仔抓取失败！本地目标块缺失：{path}")
+                        # 本地目录持久文件，严禁加入 cached_paths
+
                     if stop_ev.is_set():
                         if self.auto_cleanup and cached_paths:
                             self._cleanup_cached_files(cached_paths)
@@ -583,7 +661,6 @@ class Phase1_ChunkedNpzDataLoader:
                 active_micro_indices = np.arange(cur_chunk_size)
                 
                 if self.shuffle:
-                    # 构建独立的后台局部无序宇宙
                     rng = np.random.default_rng(self.seed + worker_macro_ptr + self.current_epoch)
                     rng.shuffle(active_micro_indices)
                     
@@ -594,7 +671,6 @@ class Phase1_ChunkedNpzDataLoader:
                     "macro_idx_ptr": worker_macro_ptr,
                     "cached_paths": cached_paths
                 }
-                # 带超时可中断入队，若在等待 GPU 消费期间收到 stop_ev 则立即回收本块缓存并退出
                 queued_ok = False
                 while not stop_ev.is_set():
                     try:
@@ -616,13 +692,10 @@ class Phase1_ChunkedNpzDataLoader:
                 print(f"\n[DataLoader] 后台打工仔抓取/加载失败 (网络可能断开了？): {e}")
                 print(f"[DataLoader] 这不是致命错误！打工仔将在 10 秒后原地重新尝试拉取 Chunk {chunk_idx}...")
                 stop_ev.wait(10.0)
-                # 不退出进程，不抛出异常。
-                # 既然失败了，worker_macro_ptr 就不加 1，直接 continue，下一轮会继续死磕这个块！
                 continue
 
     def _pop_next_chunk(self):
         """主线程调用的吸星大法，把工人装好的箱子拿走"""
-        # 先清理上一个已消费的分块缓存
         if self.auto_cleanup and self._prev_chunk_paths:
             self._cleanup_cached_files(self._prev_chunk_paths)
             self._prev_chunk_paths = []
@@ -652,18 +725,15 @@ class Phase1_ChunkedNpzDataLoader:
         return self
 
     def __next__(self) -> Tuple[Any, List[Any], Any]:
-        # 如果当前 Chunk 已经被彻底吸干了，无缝提取下一个
         if self.active_micro_ptr >= len(self.active_micro_indices):
             try:
                 self._pop_next_chunk()
             except StopIteration:
-                # 一个 Epoch 完结！
                 self.current_epoch += 1
                 if self.shuffle:
                     self.rng.shuffle(self.macro_chunk_indices)
-                # 重新使唤工人从头开始搬砖
                 self._start_prefetching(start_macro_ptr=0)
-                self._pop_next_chunk()  # 直接抓下一个 Epoch 的第一块
+                self._pop_next_chunk()
                 raise StopIteration
             
         fetch_len = min(self.batch_size, len(self.active_micro_indices) - self.active_micro_ptr)
@@ -679,11 +749,9 @@ class Phase1_ChunkedNpzDataLoader:
                 batch_embs = [mx.array(arr[batch_local_indices]) for arr in self.active_chunk_embs]
             return None, batch_embs, None
 
-        # 1. 映射回全局索引以抓取物理对应的文本序列
         batch_global_indices = self.active_global_start + batch_local_indices
         batch_texts = [self.text_chunks[i] for i in batch_global_indices]
         
-        # 2. Tokenize & Pad (与旧版完全一致)
         encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in batch_texts]
         max_len = max(max(len(seq) for seq in encoded_list), 1)
         
@@ -694,7 +762,6 @@ class Phase1_ChunkedNpzDataLoader:
             padded_ids.append(seq + [self.tokenizer.pad_token_id] * pad_len)
             masks.append([1] * len(seq) + [0] * pad_len)
             
-        # 3. 局域拷贝内存数据构造 Tensor/Array
         if self.backend == 'torch':
             import torch
             token_inputs = torch.tensor(padded_ids, dtype=torch.long)
@@ -713,8 +780,8 @@ class Phase1_ChunkedNpzDataLoader:
             "current_epoch": self.current_epoch,
             "active_macro_idx_ptr": getattr(self, "active_macro_idx_ptr", 0),
             "macro_chunk_indices": getattr(self, "macro_chunk_indices", np.array([])).tolist(),
-            "active_micro_ptr": getattr(self, "active_micro_ptr", 0),  # 保存当前块内部的微观进度！
-            "seed_snapshot": getattr(self, "seed", int(__import__("time").time()))  # 永久锁定随机种子
+            "active_micro_ptr": getattr(self, "active_micro_ptr", 0),
+            "seed_snapshot": getattr(self, "seed", int(__import__("time").time()))
         }
         
     def load_state_dict(self, state: Dict[str, Any]):
@@ -724,29 +791,24 @@ class Phase1_ChunkedNpzDataLoader:
         
         print(f"[DataLoader] 🔌 自断点恢复：正处于 Epoch {self.current_epoch},  宏观 Chunk 指针 {self.active_macro_idx_ptr}/{len(self.macro_chunk_indices)}")
 
-        # 核心漏洞修复法则：如果是从早期未记录种子与微观游标的破损失忆版本恢复（当前情况）
-        # 强行拨动宏观指针进入下一个崭新纯净块，避免在一锅被错乱打散重组的烂粥里吃重复数据
         is_legacy_state = "seed_snapshot" not in state or "active_micro_ptr" not in state
         
         if is_legacy_state:
             self.active_macro_idx_ptr = min(self.active_macro_idx_ptr + 1, len(self.macro_chunk_indices) - 1)
-            print(f"[DataLoader] ⚠️ 检测到历史遗留 Checkpoint 缺乏微秩序信息，为了避免重复喂入，已强行剥离并将指针拨至下一块干净数据：{self.active_macro_idx_ptr}。")
+            print(f"[DataLoader] ⚠️ 检测到历史遗留 Checkpoint 缺乏微秩序信息，已拨至下一块干净数据：{self.active_macro_idx_ptr}。")
         else:
-            # 未来恢复逻辑：一切数据时空完美复刻
             self.seed = state["seed_snapshot"]
             
-        # 断点恢复：直接从历史断点启动下载，跳过 __init__ 的默认启动
         self._started = True
         self._start_prefetching(start_macro_ptr=self.active_macro_idx_ptr)
         self._pop_next_chunk()
         
         if not is_legacy_state:
-            # 严格对准之前在这个块里吃过的条数（只有新形态拥有这个待遇）
             self.active_micro_ptr = state["active_micro_ptr"]
             print(f"[DataLoader] 📍 已还原微观读取游标与世界线乱序定律：从当前块的第 {self.active_micro_ptr} 条语句无缝继续训练！")
         else:
-            # 遗留强行跳块版本下，微观进度自然是从 0 重新算起
             self.active_micro_ptr = 0
+
 
 class Phase1DataLoader:
     """
@@ -763,11 +825,9 @@ class Phase1DataLoader:
                  backend: str = 'mlx'):
         
         self.backend = backend
-        
         self.batch_size = batch_size
         self.max_episode_len = max_episode_len
         
-        # 1. Load exact document boundaries to avoid crossing them!
         if pd is None:
             import pandas as _pd
             globals()["pd"] = _pd
@@ -775,11 +835,9 @@ class Phase1DataLoader:
         df = pd.read_parquet(parquet_path, columns=['chunk_count'])
         self.chunk_counts = df['chunk_count'].values
         
-        # 2. Cumulative sum gives us the exact starting index for each document in the giant mmapped arrays
         self.doc_start_indices = np.concatenate(([0], np.cumsum(self.chunk_counts)[:-1]))
         self.total_docs = len(self.chunk_counts)
         print(f"Loaded strictly bounded {self.total_docs} semantic documents.")
-        
         del df
         
         print("Mmapping embedding arrays for Phase 1...")
@@ -808,10 +866,8 @@ class Phase1DataLoader:
             
         start_idx = self.batch_idx * self.batch_size
         end_idx = min(start_idx + self.batch_size, self.total_docs)
-        
         batch_doc_indices = self.indices[start_idx:end_idx]
         
-        # 1. Fetch exactly the bounded chunks for each document
         raw_embs_list = [[] for _ in range(len(self.embs))]
         lengths = []
         
@@ -822,18 +878,15 @@ class Phase1DataLoader:
             if self.max_episode_len is not None:
                 eff_len = min(count, self.max_episode_len)
             else:
-                eff_len = min(count, 256) # Safety cap
+                eff_len = min(count, 256)
                 
             lengths.append(eff_len)
             
             for i in range(len(self.embs)):
-                # Just copy the slice into memory
                 raw_embs_list[i].append(np.array(self.embs[i][start_pos : start_pos+eff_len]))
                 
-        # 2. Pad to the length of the longest document in THIS specific batch (Dynamic Batching)
         max_len = max(lengths)
         
-        # 2. Pad to the maximum document length in THIS specific batch
         padded_embs = [[] for _ in range(len(self.embs))]
         masks = []
         
@@ -851,7 +904,6 @@ class Phase1DataLoader:
                 
             masks.append([1] * l + [0] * pad_len)
             
-        # Convert to arrays matching backend
         if self.backend == 'torch':
             import torch
             batch_embs_tensor = [torch.from_numpy(np.stack(padded_embs[i])).float() for i in range(len(self.embs))]
@@ -872,6 +924,7 @@ class Phase1DataLoader:
         self.batch_idx = state["batch_idx"]
         self.current_epoch = state["current_epoch"]
         self.indices = np.array(state["indices"])
+
 
 class TextDocumentDataLoader:
     """
@@ -905,7 +958,6 @@ class TextDocumentDataLoader:
         self.doc_start_indices = np.concatenate(([0], np.cumsum(self.chunk_counts)[:-1]))
         self.total_docs = len(self.chunk_counts)
         print(f"Loaded strictly bounded {self.total_docs} semantic documents (Text only).")
-        
         del df
         
         self.rng = np.random.default_rng(seed)
@@ -928,7 +980,6 @@ class TextDocumentDataLoader:
             
         start_idx = self.batch_idx * self.batch_size
         end_idx = min(start_idx + self.batch_size, self.total_docs)
-        
         batch_doc_indices = self.indices[start_idx:end_idx]
         
         batch_docs_sentences = []
@@ -939,16 +990,13 @@ class TextDocumentDataLoader:
             if self.max_episode_len is not None:
                 eff_len = min(count, self.max_episode_len)
             else:
-                eff_len = min(count, 256) # Safety cap
+                eff_len = min(count, 256)
                 
             sentences = self.text_chunks[start_pos : start_pos + eff_len]
             batch_docs_sentences.append(sentences)
             
-        # 强制固定句子长度维度！这是为了防止 Apple MLX 的 @mx.compile 
-        # 因为每一批次的 shape 不同而疯狂重新编译，最终导致图缓存撑爆统一内存 (Jetsam Kill)。
         max_sentences = self.max_episode_len if self.max_episode_len else 256
         
-        # We will flatten to tokenize efficiently, then reshape
         flat_texts = []
         for doc in batch_docs_sentences:
             flat_texts.extend(doc)
@@ -956,7 +1004,6 @@ class TextDocumentDataLoader:
         encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in flat_texts]
         max_tokens = max(max((len(seq) for seq in encoded_list), default=1), 1)
         
-        # Prepare 3D tensors: (B, max_sentences, max_tokens)
         padded_ids = np.zeros((len(batch_docs_sentences), max_sentences, max_tokens), dtype=np.int32)
         padded_ids.fill(self.tokenizer.pad_token_id)
         

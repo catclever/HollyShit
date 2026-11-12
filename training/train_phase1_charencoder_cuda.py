@@ -23,7 +23,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py")):
     sys.path = [p for p in sys.path if p != script_dir] + [script_dir]
 
-from training.data.alignment_dataloader import Phase1_ChunkedNpzDataLoader, Phase1_MultiEmbDataLoader
+from training.data.alignment_dataloader import (
+    Phase1_ChunkedNpzDataLoader,
+    Phase1_MultiEmbDataLoader,
+)
+
 from training.core.char_tokenizer import CharTokenizer
 from training.core.checkpoint import Checkpointer
 from model.config import WeakDecoderConfig
@@ -388,6 +392,23 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
     parquet_path = args.parquet_path or ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_wiki.parquet")
     parquet_path = resolve_path_maybe_relative(parquet_path, config_base_dir)
 
+    raw_data_source = getattr(args, "data_source", None) or ds_config.get("default_source", "ms")
+    ds_lower = (raw_data_source or "ms").strip().lower()
+    if ds_lower in ("ms", "modelscope"):
+        data_source = "ms"
+    elif ds_lower in ("gdrive", "google_drive", "googledrive"):
+        data_source = "gdrive"
+    elif ds_lower in ("hf", "huggingface", "hugging_face"):
+        data_source = "hf"
+    elif ds_lower in ("local", "dir", "local_dir"):
+        data_source = "local"
+    else:
+        data_source = "ms"
+
+    gdrive_dir = getattr(args, "gdrive_dir", None) or ds_config.get(
+        "gdrive_dir", "/content/drive/MyDrive/hollyshit/embs"
+    )
+
     if has_chunked_conf:
         models = ds_config["base_models"]
         chunk_patterns = ds_config["chunk_name_patterns"]
@@ -410,8 +431,6 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
         if not ms_repo_id:
             ms_repo_id = None
 
-        effective_ms_repo_id = None if hf_repo_id else ms_repo_id
-
         if len(models) != expected_routes:
             msg = (
                 f"Model route mismatch: checkpoint expects {expected_routes}, "
@@ -425,22 +444,22 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
             models = models[:expected_routes]
             chunk_patterns = {k: v for k, v in chunk_patterns.items() if k in models}
 
-        src_desc = (
-            f"hf_repo_id={hf_repo_id}"
-            if hf_repo_id
-            else (
-                f"ms_repo_id={effective_ms_repo_id}"
-                if effective_ms_repo_id
-                else f"local_npz_dir={args.data_dir}"
-            )
-        )
-        print(f"[Data] Using Phase1_ChunkedNpzDataLoader ({len(models)} routes, {src_desc}).")
+        if data_source == "ms":
+            src_desc = f"ms_repo_id={ms_repo_id or 'catclever/emb_npy'}"
+        elif data_source == "gdrive":
+            src_desc = f"gdrive_dir={gdrive_dir} (staged to {args.download_cache_dir or args.data_dir})"
+        elif data_source == "hf":
+            src_desc = f"hf_repo_id={hf_repo_id or 'drunkencat/emb_npy'}"
+        else:
+            src_desc = f"local_npz_dir={args.data_dir}"
+
+        print(f"[Data] Using Phase1_ChunkedNpzDataLoader ({len(models)} routes, source={data_source}, {src_desc}).")
         return Phase1_ChunkedNpzDataLoader(
             parquet_path=parquet_path,
             models=models,
             chunk_patterns=chunk_patterns,
             tokenizer=tokenizer,
-            ms_repo_id=effective_ms_repo_id,
+            ms_repo_id=ms_repo_id,
             chunk_size=args.chunk_size,
             local_npz_dir=args.data_dir,
             cache_dir=args.download_cache_dir,
@@ -450,6 +469,8 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
             lazy_start=True,
             backend="torch",
             hf_repo_id=hf_repo_id,
+            data_source=data_source,
+            gdrive_dir=gdrive_dir,
         )
 
     emb_paths = resolve_emb_paths(args, ds_config, expected_routes)
@@ -531,15 +552,30 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                 return local_path
 
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            data_source = getattr(loader, "data_source", "ms")
             hf_repo = getattr(loader, "hf_repo_id", None)
             ms_repo = getattr(loader, "ms_repo_id", None)
-            if hf_repo:
+            gdrive_dir = getattr(loader, "gdrive_dir", None)
+
+            if data_source == "gdrive":
+                if not gdrive_dir:
+                    raise ValueError("[attach_chunk_download_router] loader.data_source 为 'gdrive' 但未配置 gdrive_dir")
+                gdrive_src = os.path.join(gdrive_dir, cand_name)
+                if not os.path.exists(gdrive_src):
+                    flat_src = os.path.join(gdrive_dir, os.path.basename(cand_name))
+                    if os.path.exists(flat_src):
+                        gdrive_src = flat_src
+                    else:
+                        raise FileNotFoundError(f"Missing Google Drive npz chunk: {gdrive_src}")
+                shutil.copy2(gdrive_src, local_path)
+                downloaded_path = local_path
+            elif data_source == "hf" or (data_source is None and hf_repo):
                 last_err = None
                 downloaded_path = None
                 for _ in range(3):
                     try:
                         downloaded_path = _download_hf_dataset_chunk_file(
-                            hf_repo,
+                            hf_repo or "drunkencat/emb_npy",
                             cand_name,
                             local_dir=local_data_dir,
                             cache_dir=download_cache_dir,
@@ -554,14 +590,14 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                 _cleanup_hf_download_metadata(
                     local_path, [local_data_dir, download_cache_dir]
                 )
-            elif ms_repo:
+            elif data_source == "ms" or (data_source is None and ms_repo):
                 from modelscope.hub.file_download import dataset_file_download
                 last_err = None
                 downloaded_path = None
                 for _ in range(3):
                     try:
                         downloaded_path = dataset_file_download(
-                            ms_repo, cand_name, cache_dir=download_cache_dir
+                            ms_repo or "catclever/emb_npy", cand_name, cache_dir=download_cache_dir
                         )
                         break
                     except FileNotFoundError as e:
@@ -573,7 +609,11 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
             else:
                 downloaded_path = os.path.join(local_data_dir, cand_name)
                 if not os.path.exists(downloaded_path):
-                    raise FileNotFoundError(f"本地目标块缺失：{downloaded_path}")
+                    flat_path = os.path.join(local_data_dir, os.path.basename(cand_name))
+                    if os.path.exists(flat_path):
+                        downloaded_path = flat_path
+                    else:
+                        raise FileNotFoundError(f"本地目标块缺失：{downloaded_path}")
 
             if downloaded_path != os.path.abspath(local_path):
                 is_link = os.path.islink(downloaded_path)
@@ -635,10 +675,10 @@ def save_char_subspace_stats(
     assert_colab_drive_mounted(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
     stats_path = os.path.join(ckpt_dir, "char_subspace_stats.pt")
-    w_sub = student.char_subspace_proj.weight.detach().cpu()  # (d_sub, d_model)
+    w_sub = student.char_subspace_proj.weight.detach().cpu()
     payload = {
         "char_subspace_proj": w_sub,
-        "subspace_proj": w_sub.t().contiguous(),  # (d_model, d_sub) for HiPPOOracleCUDA
+        "subspace_proj": w_sub.t().contiguous(),
         "char_token_mean": student.char_token_mean.detach().cpu(),
         "d_sub": student.d_sub,
         "d_model": student.d_model,
@@ -675,6 +715,19 @@ def get_distill_parser():
     parser.add_argument("--ckpt_prefix", type=str, default="charencoder_pt_v2")
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Frozen Phase 0 checkpoint to distill from")
     parser.add_argument("--config_file", type=str, default=None, help="Optional dataset config JSON")
+    parser.add_argument(
+        "--data_source",
+        type=str,
+        default="ms",
+        choices=["ms", "gdrive", "hf", "local", "modelscope", "huggingface"],
+        help="Data source: 'ms' (ModelScope, default), 'gdrive' (Google Drive staged NVMe), 'hf' (Hugging Face CDN), or 'local'",
+    )
+    parser.add_argument(
+        "--gdrive_dir",
+        type=str,
+        default="/content/drive/MyDrive/hollyshit/embs",
+        help="Google Drive directory holding persistent .npz chunks (used when --data_source gdrive)",
+    )
     parser.add_argument(
         "--hf_repo_id",
         type=str,
@@ -730,6 +783,8 @@ def main():
 
     # Hard Drive mount guard at second 0 (before Checkpointer / dataloaders / models!)
     assert_colab_drive_mounted(args.out_dir)
+    if args.data_source in ("gdrive",):
+        assert_colab_drive_mounted(args.gdrive_dir)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -861,35 +916,30 @@ def main():
                     if attention_mask is not None
                     else None
                 )
-                batch_embs = [emb.to(device, non_blocking=True) for emb in batch_embs]
+                batch_embs = [emb.to(device, non_blocking=True).float() for emb in batch_embs]
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    with torch.no_grad():
-                        f_t = fuser(batch_embs, weights=None)
-                        z_target_truth = god_encoder(f_t)
-                        if z_target_truth.ndim == 3:
-                            z_target_truth = z_target_truth.squeeze(1)
+                with torch.no_grad():
+                    e_fused = fuser(batch_embs)
+                    z_god = god_encoder(e_fused)
 
-                    loss, metrics = compute_phase1_v2_distill_loss(
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                    loss, metrics, aux = compute_phase1_v2_distill_loss(
                         student=student,
                         token_inputs=token_inputs,
                         attention_mask=attention_mask,
-                        z_target_truth=z_target_truth,
-                        batch_embs=batch_embs,
+                        z_god=z_god,
                         order_head=order_head,
                         next_clause_head=next_clause_head,
                         char_anchor_head=char_anchor_head,
-                        order_margin=args.order_margin,
                         w_distill=args.w_distill,
                         w_rel=args.w_rel,
                         w_order=args.w_order,
                         w_next=args.w_next,
                         w_char_iso=args.w_char_iso,
                         w_char_id=args.w_char_id,
-                        update_ema=True,
-                        ema_momentum=args.ema_momentum,
+                        order_margin=args.order_margin,
                     )
 
                 scaler.scale(loss).backward()
@@ -898,74 +948,71 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
 
-                if global_step % 10 == 0:
-                    print(
-                        f"Epoch {epoch+1} | Step {global_step} | "
-                        f"Total: {loss.item():.4f} | "
-                        f"Distill: {metrics['loss_distill'].item():.4f} (cos={metrics['z_god_cos'].item():.3f}) | "
-                        f"Rel: {metrics['loss_rel'].item():.4f} | "
-                        f"Order: {metrics['loss_order'].item():.4f} (shuf_cos={metrics['shuffled_order_cos'].item():.3f}, "
-                        f"acc={metrics['order_discrim_acc'].item():.3f}) | "
-                        f"CharIso: {metrics['loss_char_iso'].item():.4f} (PC1={metrics['subspace_pc1_var_ratio'].item():.3f}, "
-                        f"PR={metrics['subspace_participation_ratio'].item():.1f}) | "
-                        f"CharID: {metrics['loss_char_id'].item():.4f} (acc={metrics['subspace_char_top1_acc'].item():.3f})"
+                with torch.no_grad():
+                    student.update_subspace_basis()
+                    z_student = aux["z_student"]
+                    pad_mask = token_inputs != student.pad_token_id
+                    student.update_char_token_mean(
+                        student.embed_tokens(token_inputs),
+                        mask=pad_mask,
+                        momentum=args.ema_momentum,
                     )
 
-                if args.eval_steps > 0 and global_step % args.eval_steps == 0:
-                    health = evaluate_phase1_v2_health(
+                if global_step % 20 == 0:
+                    print(
+                        f"Epoch {epoch + 1} | Step {global_step} | LR {lr:.2e} | "
+                        f"Loss {metrics['loss']:.4f} "
+                        f"(Distill {metrics['loss_distill']:.3f} | "
+                        f"Rel {metrics['loss_rel']:.3f} | "
+                        f"Order {metrics['loss_order']:.3f} [acc={metrics['order_acc']:.2f}] | "
+                        f"Next {metrics['loss_next']:.3f} | "
+                        f"CharIso {metrics['loss_char_iso']:.3f} | "
+                        f"CharID {metrics['loss_char_id']:.3f} [top1={metrics['char_top1_acc']:.2f}])"
+                    )
+
+                if global_step % args.eval_steps == 0:
+                    eval_metrics = evaluate_phase1_v2_health(
                         student=student,
                         token_inputs=token_inputs,
                         attention_mask=attention_mask,
-                        z_target_truth=z_target_truth,
-                        batch_embs=batch_embs,
+                        z_god=z_god,
                         order_head=order_head,
                         char_anchor_head=char_anchor_head,
                     )
                     print(
-                        f"[Health @ Step {global_step}] "
-                        f"z_god_cos={health['z_god_cos']:.4f} | "
-                        f"rel_spearman={health['relational_spearman']:.4f} | "
-                        f"shuf_cos={health['shuffled_order_cos']:.4f} | "
-                        f"order_acc={health['order_discrim_acc']:.4f} | "
-                        f"PC1={health['subspace_pc1_var_ratio']:.4f} | "
-                        f"PR={health['subspace_participation_ratio']:.2f}/32 | "
-                        f"char_acc={health['subspace_char_top1_acc']:.4f} | "
-                        f"mask_diff={health['masked_vs_auto_mask_max_diff']:.2e}"
+                        f"  🩺 [Health @ Step {global_step}] "
+                        f"DistillCos={eval_metrics['mean_distill_cos']:.3f} | "
+                        f"Spearman={eval_metrics['relational_spearman']:.3f} | "
+                        f"OrderAcc={eval_metrics['order_pair_acc']:.3f} | "
+                        f"CharIsoDev={eval_metrics['char_subspace_ortho_dev']:.4f} | "
+                        f"AnchorTop1={eval_metrics['char_anchor_top1_acc']:.3f}"
                     )
 
                 if global_step % args.save_steps == 0:
-                    assert_colab_drive_mounted(args.out_dir)
-                    checkpointer.save(global_step)
-                    save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step)
-                    save_char_subspace_stats(student, args.out_dir, checkpointer.prefix, global_step)
-                    ckpt_dir = expected_checkpoint_dir(args.out_dir, checkpointer.prefix, global_step)
+                    checkpointer.save(step=global_step)
+                    save_char_subspace_stats(student, args.out_dir, args.ckpt_prefix, global_step)
+                    save_torch_optimizer_state(optimizer, args.out_dir, args.ckpt_prefix, global_step)
                     if args.hf_ckpt_repo:
+                        ckpt_dir = expected_checkpoint_dir(args.out_dir, args.ckpt_prefix, global_step)
                         mirror_checkpoint_to_hf_hub(ckpt_dir, args.hf_ckpt_repo)
 
-        if global_step > 0 and global_step % args.save_steps != 0:
-            assert_colab_drive_mounted(args.out_dir)
-            checkpointer.save(global_step)
-            save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step)
-            save_char_subspace_stats(student, args.out_dir, checkpointer.prefix, global_step)
-            final_dir = expected_checkpoint_dir(args.out_dir, checkpointer.prefix, global_step)
-            if args.hf_ckpt_repo:
-                mirror_checkpoint_to_hf_hub(final_dir, args.hf_ckpt_repo)
+        checkpointer.save(step=global_step)
+        save_char_subspace_stats(student, args.out_dir, args.ckpt_prefix, global_step)
+        save_torch_optimizer_state(optimizer, args.out_dir, args.ckpt_prefix, global_step)
+        if args.hf_ckpt_repo:
+            ckpt_dir = expected_checkpoint_dir(args.out_dir, args.ckpt_prefix, global_step)
+            mirror_checkpoint_to_hf_hub(ckpt_dir, args.hf_ckpt_repo)
+        print("🎉 Phase 1 v2 Distillation Training Complete!")
 
     except KeyboardInterrupt:
-        print(f"\n[Interrupt] Caught kill signal at step {global_step}! Saving emergency checkpoint...")
-        assert_colab_drive_mounted(args.out_dir)
-        save_torch_optimizer_state(optimizer, args.out_dir, checkpointer.prefix, global_step, is_emergency=True)
-        save_char_subspace_stats(student, args.out_dir, checkpointer.prefix, global_step, is_emergency=True)
-        emerg_dir = expected_checkpoint_dir(
-            args.out_dir, checkpointer.prefix, global_step, is_emergency=True
-        )
-        try:
-            checkpointer.save(global_step, is_emergency=True)
-        except SystemExit:
-            if args.hf_ckpt_repo:
-                mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
-            raise
+        print(f"\n[Interrupt] Saving emergency Phase 1 v2 checkpoint at step {global_step}...")
+        checkpointer.save(step=global_step, is_emergency=True)
+        save_char_subspace_stats(student, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True)
+        save_torch_optimizer_state(optimizer, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True)
         if args.hf_ckpt_repo:
+            emerg_dir = expected_checkpoint_dir(
+                args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
+            )
             mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
 
 

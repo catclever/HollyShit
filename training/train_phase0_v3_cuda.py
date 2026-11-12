@@ -34,6 +34,7 @@ from training.data.alignment_dataloader import (
     Phase1_ChunkedNpzDataLoader,
     Phase1_MultiEmbDataLoader,
 )
+
 from training.losses.god_manifold_loss import (
     GodManifoldLossWeights,
     ManifoldFIFOQueue,
@@ -565,22 +566,42 @@ def load_npz_features_with_repair(
                     os.remove(path)
             except OSError:
                 pass
+
+            data_source = getattr(loader, "data_source", "ms")
             if cand_name and hasattr(loader, "_resolve_npz_path"):
                 path = loader._resolve_npz_path(cand_name)
-            elif cand_name and getattr(loader, "hf_repo_id", None):
+            elif cand_name and data_source == "gdrive":
+                gdrive_dir = getattr(loader, "gdrive_dir", None)
+                if gdrive_dir:
+                    src = os.path.join(gdrive_dir, cand_name)
+                    if not os.path.exists(src):
+                        flat_src = os.path.join(gdrive_dir, os.path.basename(cand_name))
+                        if os.path.exists(flat_src):
+                            src = flat_src
+                    if src and os.path.exists(src):
+                        cache_dir = getattr(loader, "cache_dir", "./datas")
+                        staged = os.path.join(cache_dir, cand_name)
+                        os.makedirs(os.path.dirname(staged), exist_ok=True)
+                        shutil.copy2(src, staged)
+                        path = staged
+                    else:
+                        raise FileNotFoundError(f"Missing Google Drive npz chunk on retry: {cand_name}")
+                else:
+                    raise
+            elif cand_name and (data_source == "hf" or getattr(loader, "hf_repo_id", None)):
                 cache_dir = getattr(loader, "cache_dir", None) or getattr(loader, "npz_dir", "./datas")
                 path = _download_hf_dataset_chunk_file(
-                    loader.hf_repo_id,
+                    loader.hf_repo_id or "drunkencat/emb_npy",
                     cand_name,
                     local_dir=cache_dir,
                     cache_dir=cache_dir,
                 )
                 _cleanup_hf_download_metadata(path, [cache_dir, getattr(loader, "npz_dir", None)])
-            elif cand_name and getattr(loader, "ms_repo_id", None):
+            elif cand_name and (data_source == "ms" or getattr(loader, "ms_repo_id", None)):
                 from modelscope.hub.file_download import dataset_file_download
 
                 path = dataset_file_download(
-                    loader.ms_repo_id, cand_name, cache_dir=loader.cache_dir
+                    loader.ms_repo_id or "catclever/emb_npy", cand_name, cache_dir=loader.cache_dir
                 )
             else:
                 raise
@@ -611,15 +632,31 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
             if os.path.exists(local_path):
                 return local_path
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            data_source = getattr(loader, "data_source", "ms")
             hf_repo = getattr(loader, "hf_repo_id", None)
             ms_repo = getattr(loader, "ms_repo_id", None)
-            if hf_repo:
+            gdrive_dir = getattr(loader, "gdrive_dir", None)
+
+            if data_source == "gdrive":
+                if not gdrive_dir:
+                    raise ValueError("[attach_chunk_download_router] loader.data_source 为 'gdrive' 但未配置 gdrive_dir")
+                gdrive_src = os.path.join(gdrive_dir, cand_name)
+                if not os.path.exists(gdrive_src):
+                    flat_src = os.path.join(gdrive_dir, os.path.basename(cand_name))
+                    if os.path.exists(flat_src):
+                        gdrive_src = flat_src
+                    else:
+                        raise FileNotFoundError(f"Missing Google Drive npz chunk: {gdrive_src}")
+                shutil.copy2(gdrive_src, local_path)
+                downloaded_path = local_path
+            elif data_source == "hf" or (data_source is None and hf_repo):
                 last_err = None
                 downloaded_path = None
                 for _retry in range(3):
                     try:
                         downloaded_path = _download_hf_dataset_chunk_file(
-                            hf_repo,
+                            hf_repo or "drunkencat/emb_npy",
                             cand_name,
                             local_dir=local_data_dir,
                             cache_dir=download_cache_dir,
@@ -634,7 +671,7 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                 _cleanup_hf_download_metadata(
                     local_path, [local_data_dir, download_cache_dir]
                 )
-            elif ms_repo:
+            elif data_source == "ms" or (data_source is None and ms_repo):
                 from modelscope.hub.file_download import dataset_file_download
 
                 last_err = None
@@ -642,7 +679,7 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                 for _retry in range(3):
                     try:
                         downloaded_path = dataset_file_download(
-                            ms_repo, cand_name, cache_dir=download_cache_dir
+                            ms_repo or "catclever/emb_npy", cand_name, cache_dir=download_cache_dir
                         )
                         break
                     except FileNotFoundError as e:
@@ -654,7 +691,11 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
             else:
                 downloaded_path = os.path.join(local_data_dir, cand_name)
                 if not os.path.exists(downloaded_path):
-                    raise FileNotFoundError(f"Missing local npz chunk: {downloaded_path}")
+                    flat_path = os.path.join(local_data_dir, os.path.basename(cand_name))
+                    if os.path.exists(flat_path):
+                        downloaded_path = flat_path
+                    else:
+                        raise FileNotFoundError(f"Missing local npz chunk: {downloaded_path}")
 
             if downloaded_path != os.path.abspath(local_path):
                 is_link = os.path.islink(downloaded_path)
@@ -853,12 +894,7 @@ def save_phase0_v3_checkpoint(
     is_emergency: bool = False,
 ) -> str:
     """
-    Saves Phase 0 v3 checkpoint in both PyTorch (.pt) and MLX-compatible (.safetensors) formats:
-      - sense_fuser.safetensors & sense_fuser.pt
-      - god_encoder.safetensors & god_encoder.pt
-      - recon_heads.pt & next_clause_head.pt
-      - manifold_stats.pt (z_mean, z_std, health_metrics, architecture metadata)
-      - optimizer.pt, dataloader.json, training_args.json
+    Saves Phase 0 v3 checkpoint in both PyTorch (.pt) and MLX-compatible (.safetensors) formats.
     """
     assert_colab_drive_mounted(out_dir)
     ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
@@ -868,11 +904,9 @@ def save_phase0_v3_checkpoint(
     fuser_cpu_state = {k: v.detach().cpu().contiguous() for k, v in fuser.state_dict().items()}
     god_cpu_state = {k: v.detach().cpu().contiguous() for k, v in god_encoder.state_dict().items()}
 
-    # 1. Save MLX/PyTorch dual-compatible safetensors (used by Phase 1 infer_teacher_arch_from_ckpt)
     save_safetensors_file(fuser_cpu_state, os.path.join(ckpt_dir, "sense_fuser.safetensors"))
     save_safetensors_file(god_cpu_state, os.path.join(ckpt_dir, "god_encoder.safetensors"))
 
-    # 2. Save PyTorch .pt state_dicts
     torch.save(fuser_cpu_state, os.path.join(ckpt_dir, "sense_fuser.pt"))
     torch.save(god_cpu_state, os.path.join(ckpt_dir, "god_encoder.pt"))
 
@@ -926,6 +960,23 @@ def build_phase0_v3_dataloader(args, tokenizer=None, ds_config: Optional[dict] =
     )
     parquet_path = resolve_path_maybe_relative(parquet_path, config_base_dir)
 
+    raw_data_source = getattr(args, "data_source", None) or ds_config.get("default_source", "ms")
+    ds_lower = (raw_data_source or "ms").strip().lower()
+    if ds_lower in ("ms", "modelscope"):
+        data_source = "ms"
+    elif ds_lower in ("gdrive", "google_drive", "googledrive"):
+        data_source = "gdrive"
+    elif ds_lower in ("hf", "huggingface", "hugging_face"):
+        data_source = "hf"
+    elif ds_lower in ("local", "dir", "local_dir"):
+        data_source = "local"
+    else:
+        data_source = "ms"
+
+    gdrive_dir = getattr(args, "gdrive_dir", None) or ds_config.get(
+        "gdrive_dir", "/content/drive/MyDrive/hollyshit/embs"
+    )
+
     if has_chunked_conf:
         models = ds_config["base_models"]
         chunk_patterns = ds_config["chunk_name_patterns"]
@@ -948,25 +999,24 @@ def build_phase0_v3_dataloader(args, tokenizer=None, ds_config: Optional[dict] =
         if not ms_repo_id:
             ms_repo_id = None
 
-        effective_ms_repo_id = None if hf_repo_id else ms_repo_id
-        src_desc = (
-            f"hf_repo_id={hf_repo_id}"
-            if hf_repo_id
-            else (
-                f"ms_repo_id={effective_ms_repo_id}"
-                if effective_ms_repo_id
-                else f"local_npz_dir={args.data_dir}"
-            )
-        )
+        if data_source == "ms":
+            src_desc = f"ms_repo_id={ms_repo_id or 'catclever/emb_npy'}"
+        elif data_source == "gdrive":
+            src_desc = f"gdrive_dir={gdrive_dir} (staged to {args.download_cache_dir or args.data_dir})"
+        elif data_source == "hf":
+            src_desc = f"hf_repo_id={hf_repo_id or 'drunkencat/emb_npy'}"
+        else:
+            src_desc = f"local_npz_dir={args.data_dir}"
+
         print(
-            f"[Data] Using Phase1_ChunkedNpzDataLoader (embedding_only=True, {len(models)} teacher routes: {models}, {src_desc})."
+            f"[Data] Using Phase1_ChunkedNpzDataLoader (embedding_only=True, {len(models)} teacher routes: {models}, source={data_source}, {src_desc})."
         )
         return Phase1_ChunkedNpzDataLoader(
             parquet_path=parquet_path,
             models=models,
             chunk_patterns=chunk_patterns,
             tokenizer=None,
-            ms_repo_id=effective_ms_repo_id,
+            ms_repo_id=ms_repo_id,
             chunk_size=args.chunk_size,
             local_npz_dir=args.data_dir,
             cache_dir=args.download_cache_dir,
@@ -977,6 +1027,8 @@ def build_phase0_v3_dataloader(args, tokenizer=None, ds_config: Optional[dict] =
             backend="torch",
             embedding_only=True,
             hf_repo_id=hf_repo_id,
+            data_source=data_source,
+            gdrive_dir=gdrive_dir,
         )
 
     emb_paths = args.emb_paths or ds_config.get("emb_paths")
@@ -1040,6 +1092,19 @@ def get_phase0_v3_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config_file", type=str, default="dataset_config.json")
     parser.add_argument(
+        "--data_source",
+        type=str,
+        default="ms",
+        choices=["ms", "gdrive", "hf", "local", "modelscope", "huggingface"],
+        help="Data source: 'ms' (ModelScope, default), 'gdrive' (Google Drive staged NVMe), 'hf' (Hugging Face CDN), or 'local'",
+    )
+    parser.add_argument(
+        "--gdrive_dir",
+        type=str,
+        default="/content/drive/MyDrive/hollyshit/embs",
+        help="Google Drive directory holding persistent .npz chunks (used when --data_source gdrive)",
+    )
+    parser.add_argument(
         "--hf_repo_id",
         type=str,
         default=None,
@@ -1092,6 +1157,8 @@ def main():
 
     # Hard Drive mount guard at second 0 (before building dataloaders or models!)
     assert_colab_drive_mounted(args.out_dir)
+    if args.data_source in ("gdrive",):
+        assert_colab_drive_mounted(args.gdrive_dir)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
