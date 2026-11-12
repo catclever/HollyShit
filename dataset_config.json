@@ -1,5 +1,5 @@
 {
-    "huggingface_repo_id": "drukencat/emb_npy",
+    "huggingface_repo_id": "drunkencat/emb_npy",
     "modelscope_repo_id": "catclever/emb_npy",
     "base_models": [
         "bge",

@@ -1043,7 +1043,7 @@ def get_phase0_v3_parser() -> argparse.ArgumentParser:
         "--hf_repo_id",
         type=str,
         default=None,
-        help="Optional Hugging Face dataset repo ID overriding dataset_config.json (e.g. drukencat/emb_npy)",
+        help="Optional Hugging Face dataset repo ID overriding dataset_config.json (e.g. drunkencat/emb_npy)",
     )
     parser.add_argument(
         "--ms_repo_id",
