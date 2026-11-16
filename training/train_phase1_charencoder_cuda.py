@@ -26,6 +26,7 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 from training.data.alignment_dataloader import (
     Phase1_ChunkedNpzDataLoader,
     Phase1_MultiEmbDataLoader,
+    resolve_gdrive_chunk_file,
 )
 
 from training.core.char_tokenizer import CharTokenizer
@@ -551,7 +552,6 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
             if os.path.exists(local_path):
                 return local_path
 
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
             data_source = getattr(loader, "data_source", "ms")
             hf_repo = getattr(loader, "hf_repo_id", None)
             ms_repo = getattr(loader, "ms_repo_id", None)
@@ -560,16 +560,29 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
             if data_source == "gdrive":
                 if not gdrive_dir:
                     raise ValueError("[attach_chunk_download_router] loader.data_source 为 'gdrive' 但未配置 gdrive_dir")
-                gdrive_src = os.path.join(gdrive_dir, cand_name)
-                if not os.path.exists(gdrive_src):
-                    flat_src = os.path.join(gdrive_dir, os.path.basename(cand_name))
-                    if os.path.exists(flat_src):
-                        gdrive_src = flat_src
-                    else:
-                        raise FileNotFoundError(f"Missing Google Drive npz chunk: {gdrive_src}")
+                # Bug Fix (Task 068):
+                # 1) Problem: Sync router in Phase 1 only checked direct/flat paths in `gdrive_dir`,
+                #    failing with FileNotFoundError on nested ModelScope cache structures (`catclever/emb_npy/...`).
+                # 2) Method: Maintain `loader._gdrive_file_map`, resolve via `resolve_gdrive_chunk_file`,
+                #    and copy to NVMe `local_path` only if `os.path.abspath(gdrive_src) != os.path.abspath(local_path)`.
+                # 3) Caveats: Staging uses `shutil.copy2`; persistent `gdrive_dir` originals are never moved or deleted.
+                file_map = getattr(loader, "_gdrive_file_map", None)
+                if file_map is None:
+                    file_map = {}
+                    loader._gdrive_file_map = file_map
+                gdrive_src = resolve_gdrive_chunk_file(
+                    gdrive_dir,
+                    cand_name,
+                    file_map=file_map,
+                    source_label="Google Drive",
+                )
+                if os.path.abspath(gdrive_src) == os.path.abspath(local_path):
+                    return local_path
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 shutil.copy2(gdrive_src, local_path)
                 downloaded_path = local_path
             elif data_source == "hf" or (data_source is None and hf_repo):
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 last_err = None
                 downloaded_path = None
                 for _ in range(3):
@@ -591,6 +604,7 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                     local_path, [local_data_dir, download_cache_dir]
                 )
             elif data_source == "ms" or (data_source is None and ms_repo):
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 from modelscope.hub.file_download import dataset_file_download
                 last_err = None
                 downloaded_path = None
@@ -607,13 +621,21 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                     raise last_err
                 downloaded_path = os.path.abspath(downloaded_path)
             else:
-                downloaded_path = os.path.join(local_data_dir, cand_name)
-                if not os.path.exists(downloaded_path):
-                    flat_path = os.path.join(local_data_dir, os.path.basename(cand_name))
-                    if os.path.exists(flat_path):
-                        downloaded_path = flat_path
-                    else:
-                        raise FileNotFoundError(f"本地目标块缺失：{downloaded_path}")
+                # Bug Fix (Task 068):
+                # 1) Problem: Local mode fell through to `os.replace(downloaded_path, local_path)`,
+                #    moving persistent flat/nested files and failing on nested ModelScope directories.
+                # 2) Method: Maintain `loader._local_file_map` and return `resolve_gdrive_chunk_file(...)` directly.
+                # 3) Caveats: Early return prevents `os.replace` or cleanup sweeps from altering persistent local chunks.
+                local_map = getattr(loader, "_local_file_map", None)
+                if local_map is None:
+                    local_map = {}
+                    loader._local_file_map = local_map
+                return resolve_gdrive_chunk_file(
+                    local_data_dir,
+                    cand_name,
+                    file_map=local_map,
+                    source_label="local",
+                )
 
             if downloaded_path != os.path.abspath(local_path):
                 is_link = os.path.islink(downloaded_path)

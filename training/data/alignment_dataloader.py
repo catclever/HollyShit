@@ -100,6 +100,123 @@ def _cleanup_hf_download_metadata_for_path(file_path: str, roots: List[Optional[
     return removed
 
 
+# Bug Fix (Task 068):
+# 1) Problem: ModelScope `dataset_file_download` stores chunks under nested repo paths
+#    (e.g. `<base_dir>/catclever/emb_npy/<prefix>/<chunk>.npz`) and leaves `._____temp/`
+#    / `.cache/` / `.incomplete` artifacts, causing direct/flat lookups to raise FileNotFoundError
+#    or pick up corrupt temporary files.
+# 2) Method: Provide `_is_temp_or_incomplete_npz`, `_index_npz_directory` (sorted shortest-path-first
+#    and indexed by relative path, `<parent>/<basename>`, and basename), and `resolve_gdrive_chunk_file`
+#    (checking direct -> flat -> pre-indexed map -> lazy one-time directory scan fallback).
+# 3) Caveats: Preserves direct/flat precedence over deeper nested paths; callers must still
+#    never delete or modify persistent originals resolved under `gdrive_dir` or `local_npz_dir`.
+def _is_temp_or_incomplete_npz(path: str) -> bool:
+    norm = (path or "").replace("\\", "/")
+    base_fn = os.path.basename(norm)
+    return (
+        "/._____temp/" in norm
+        or norm.startswith("._____temp/")
+        or "/.cache/" in norm
+        or norm.startswith(".cache/")
+        or base_fn.endswith((".incomplete", ".tmp", ".partial"))
+        or ".tmp." in base_fn
+        or not base_fn.endswith(".npz")
+    )
+
+
+def _index_npz_directory(
+    base_dir: str, raw_files: Optional[List[str]] = None
+) -> Dict[str, str]:
+    file_map: Dict[str, str] = {}
+    if not base_dir:
+        return file_map
+    abs_base = os.path.abspath(base_dir)
+    candidates = (
+        raw_files
+        if raw_files is not None
+        else glob.glob(os.path.join(base_dir, "**", "*.npz"), recursive=True)
+    )
+    valid_entries: List[Tuple[str, str]] = []
+    for f in candidates:
+        if _is_temp_or_incomplete_npz(f):
+            continue
+        try:
+            if (not os.path.isfile(f)) or os.path.getsize(f) <= 0:
+                continue
+        except OSError:
+            continue
+        abs_f = os.path.abspath(f)
+        rel_norm = os.path.relpath(abs_f, abs_base).replace("\\", "/")
+        valid_entries.append((rel_norm, abs_f))
+
+    valid_entries.sort(key=lambda item: (len(item[0]), item[0]))
+    for rel_norm, abs_f in valid_entries:
+        parts = rel_norm.split("/")
+        file_map[rel_norm] = abs_f
+        if len(parts) >= 2:
+            file_map.setdefault(f"{parts[-2]}/{parts[-1]}", abs_f)
+        file_map.setdefault(parts[-1], abs_f)
+    return file_map
+
+
+def resolve_gdrive_chunk_file(
+    base_dir: str,
+    cand_name: str,
+    file_map: Optional[Dict[str, str]] = None,
+    source_label: str = "Google Drive",
+) -> str:
+    if not base_dir:
+        raise FileNotFoundError(
+            f"Missing {source_label} npz chunk: {cand_name} (empty base directory)"
+        )
+
+    direct_path = os.path.join(base_dir, cand_name)
+    try:
+        if os.path.isfile(direct_path) and os.path.getsize(direct_path) > 0:
+            return os.path.abspath(direct_path)
+    except OSError:
+        pass
+
+    flat_path = os.path.join(base_dir, os.path.basename(cand_name))
+    try:
+        if os.path.isfile(flat_path) and os.path.getsize(flat_path) > 0:
+            return os.path.abspath(flat_path)
+    except OSError:
+        pass
+
+    cand_norm = cand_name.replace("\\", "/").lstrip("/")
+    parts = cand_norm.split("/")
+    tail2 = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else cand_norm
+    base_fn = parts[-1]
+
+    if file_map:
+        for key in (cand_norm, tail2, base_fn):
+            hit = file_map.get(key)
+            if hit:
+                try:
+                    if os.path.isfile(hit) and os.path.getsize(hit) > 0:
+                        return os.path.abspath(hit)
+                except OSError:
+                    pass
+
+    scanned = _index_npz_directory(base_dir)
+    if isinstance(file_map, dict):
+        file_map.update(scanned)
+    for key in (cand_norm, tail2, base_fn):
+        hit = scanned.get(key)
+        if hit:
+            try:
+                if os.path.isfile(hit) and os.path.getsize(hit) > 0:
+                    return os.path.abspath(hit)
+            except OSError:
+                pass
+
+    raise FileNotFoundError(
+        f"Missing {source_label} npz chunk: {os.path.join(base_dir, cand_name)} "
+        f"(also searched nested subdirectories under {base_dir})"
+    )
+
+
 class Phase1_MultiEmbDataLoader:
     """
     Dataloader that handles:
@@ -292,6 +409,8 @@ class Phase1_ChunkedNpzDataLoader:
         self.embedding_only = bool(embedding_only)
         self.npz_dir = local_npz_dir
         self.gdrive_dir = gdrive_dir
+        self._gdrive_file_map: Dict[str, str] = {}
+        self._local_file_map: Dict[str, str] = {}
 
         # 规范化 data_source: ms (默认), gdrive, hf, local
         ds_raw = (data_source or "ms").strip().lower()
@@ -377,7 +496,20 @@ class Phase1_ChunkedNpzDataLoader:
                 res = api.get_dataset_files(self.ms_repo_id, recursive=True)
                 chunk_files = [f.get("Path", f.get("Name", "")) for f in res]
             elif self.data_source == "gdrive":
-                chunk_files = glob.glob(os.path.join(self.gdrive_dir, "**", "*.npz"), recursive=True)
+                # Bug Fix (Task 068):
+                # 1) Problem: Recursive glob picked up ModelScope `._____temp/` & 0-byte partials and
+                #    didn't retain an index for nested `<prefix>/<chunk>.npz` resolution.
+                # 2) Method: Filter out `_is_temp_or_incomplete_npz` and non-positive-size files, then
+                #    pre-index valid files into `self._gdrive_file_map`.
+                # 3) Caveats: Only local/gdrive physical files are filtered here; remote `ms`/`hf` lists are untouched.
+                raw_files = glob.glob(os.path.join(self.gdrive_dir, "**", "*.npz"), recursive=True)
+                chunk_files = [
+                    f for f in raw_files
+                    if (not _is_temp_or_incomplete_npz(f))
+                    and os.path.isfile(f)
+                    and os.path.getsize(f) > 0
+                ]
+                self._gdrive_file_map = _index_npz_directory(self.gdrive_dir, raw_files=chunk_files)
             elif self.data_source == "hf":
                 from huggingface_hub import HfApi
                 hf_token = _get_hf_token()
@@ -389,7 +521,18 @@ class Phase1_ChunkedNpzDataLoader:
                     )
                 )
             elif self.data_source == "local":
-                chunk_files = glob.glob(os.path.join(self.npz_dir, "**", "*.npz"), recursive=True)
+                # Bug Fix (Task 068):
+                # 1) Problem: Local recursive discovery lacked temp/0-byte filtering and nested indexing.
+                # 2) Method: Exclude `_is_temp_or_incomplete_npz` and 0-byte files, and populate `self._local_file_map`.
+                # 3) Caveats: Local files remain persistent originals and must never be cleaned up.
+                raw_files = glob.glob(os.path.join(self.npz_dir, "**", "*.npz"), recursive=True)
+                chunk_files = [
+                    f for f in raw_files
+                    if (not _is_temp_or_incomplete_npz(f))
+                    and os.path.isfile(f)
+                    and os.path.getsize(f) > 0
+                ]
+                self._local_file_map = _index_npz_directory(self.npz_dir, raw_files=chunk_files)
             else:
                 chunk_files = []
             
@@ -612,14 +755,19 @@ class Phase1_ChunkedNpzDataLoader:
                         path = dataset_file_download(self.ms_repo_id, cand_name, cache_dir=self.cache_dir)
                         cached_paths.append(path)
                     elif self.data_source == "gdrive":
-                        # Google Drive 数据源：从 gdrive_dir 读取并暂存到 NVMe cache_dir
-                        gdrive_src = os.path.join(self.gdrive_dir, cand_name)
-                        if not os.path.exists(gdrive_src):
-                            flat_src = os.path.join(self.gdrive_dir, os.path.basename(cand_name))
-                            if os.path.exists(flat_src):
-                                gdrive_src = flat_src
-                            else:
-                                raise FileNotFoundError(f"[DataLoader] Google Drive 源分块缺失：{gdrive_src}")
+                        # Bug Fix (Task 068):
+                        # 1) Problem: Direct/flat `os.path.join(gdrive_dir, cand_name)` failed on nested
+                        #    ModelScope cache layouts (`<gdrive_dir>/catclever/emb_npy/...`).
+                        # 2) Method: Resolve via `resolve_gdrive_chunk_file` using `self._gdrive_file_map`
+                        #    (with lazy fallback scan) before NVMe staging.
+                        # 3) Caveats: Only staged copies under `cache_dir != gdrive_dir` are added to `cached_paths`;
+                        #    never modify or delete persistent originals inside `gdrive_dir`.
+                        gdrive_src = resolve_gdrive_chunk_file(
+                            self.gdrive_dir,
+                            cand_name,
+                            file_map=getattr(self, "_gdrive_file_map", None),
+                            source_label="Google Drive",
+                        )
                         
                         abs_cache = os.path.abspath(self.cache_dir)
                         abs_gdrive = os.path.abspath(self.gdrive_dir)
@@ -639,13 +787,16 @@ class Phase1_ChunkedNpzDataLoader:
                         path = _download_hf_dataset_file(self.hf_repo_id, cand_name, self.cache_dir)
                         cached_paths.append(path)
                     elif self.data_source == "local":
-                        path = os.path.join(self.npz_dir, cand_name)
-                        if not os.path.exists(path):
-                            flat_path = os.path.join(self.npz_dir, os.path.basename(cand_name))
-                            if os.path.exists(flat_path):
-                                path = flat_path
-                            else:
-                                raise FileNotFoundError(f"后台打工仔抓取失败！本地目标块缺失：{path}")
+                        # Bug Fix (Task 068):
+                        # 1) Problem: Nested directory layouts under `local_npz_dir` failed direct/flat lookup.
+                        # 2) Method: Resolve via `resolve_gdrive_chunk_file` using `self._local_file_map`.
+                        # 3) Caveats: Local files are persistent originals and must never be added to `cached_paths`.
+                        path = resolve_gdrive_chunk_file(
+                            self.npz_dir,
+                            cand_name,
+                            file_map=getattr(self, "_local_file_map", None),
+                            source_label="local",
+                        )
                         # 本地目录持久文件，严禁加入 cached_paths
 
                     if stop_ev.is_set():
