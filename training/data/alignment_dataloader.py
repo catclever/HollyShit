@@ -710,6 +710,7 @@ class Phase1_MultiEmbDataLoader:
         self.current_epoch = 0
         self.batch_idx = 0
         self.indices = np.arange(self.total_samples)
+        self.last_batch_global_indices: Optional[np.ndarray] = None
         
         if self.shuffle:
             self.rng.shuffle(self.indices)
@@ -730,6 +731,7 @@ class Phase1_MultiEmbDataLoader:
         start_idx = self.batch_idx * self.batch_size
         end_idx = min(start_idx + self.batch_size, self.total_samples)
         batch_indices = self.indices[start_idx:end_idx]
+        self.last_batch_global_indices = np.asarray(batch_indices, dtype=np.int64)
         
         if self.embedding_only or self.text_chunks is None or self.tokenizer is None:
             if self.backend == 'torch':
@@ -780,6 +782,36 @@ class Phase1_MultiEmbDataLoader:
         print(f"Resumed Dataloader from Epoch {self.current_epoch}, Batch {self.batch_idx}/{self.num_batches}")
 
 
+def _build_micro_indices(
+    cur_chunk_size: int,
+    shuffle: bool,
+    pair_shuffle: bool,
+    seed_val: int,
+) -> np.ndarray:
+    """
+    Builds within-chunk micro-index order of length `cur_chunk_size`.
+    When `pair_shuffle=True`, shuffles 2-clause contiguous pairs `[(0, 1), (2, 3), ...]`
+    so every batch preserves diverse cross-chunk negatives while retaining true `(t, t+1)`
+    adjacent pairs for `AsymmetricNextClauseHeadCUDA` without extra forward passes.
+    """
+    if not shuffle or cur_chunk_size <= 1:
+        return np.arange(cur_chunk_size)
+    rng = np.random.default_rng(seed_val)
+    if pair_shuffle and cur_chunk_size >= 2:
+        n_pairs = cur_chunk_size // 2
+        pairs = np.arange(n_pairs * 2).reshape(n_pairs, 2)
+        perm = rng.permutation(n_pairs)
+        shuffled = pairs[perm].reshape(-1)
+        if cur_chunk_size % 2 == 1:
+            return np.concatenate(
+                [shuffled, np.array([cur_chunk_size - 1], dtype=shuffled.dtype)]
+            )
+        return shuffled
+    micro = np.arange(cur_chunk_size)
+    rng.shuffle(micro)
+    return micro
+
+
 class Phase1_ChunkedNpzDataLoader:
     """
     专门适配从 ModelScope / Google Drive / Hugging Face Hub / 本地目录拉取的 `.npz` 切片矩阵设计的统一双层乱序 DataLoader。
@@ -813,12 +845,14 @@ class Phase1_ChunkedNpzDataLoader:
                  hf_repo_id: str = None,
                  data_source: str = "ms",
                  gdrive_dir: Optional[str] = None,
-                 allow_gdrive_remote_repair: bool = True):
+                 allow_gdrive_remote_repair: bool = True,
+                 pair_shuffle: bool = False):
         
         self.backend = backend
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
         self.shuffle = shuffle
+        self.pair_shuffle = bool(pair_shuffle)
         self.seed = seed if seed is not None else int(time.time())
         self.models = models
         self.chunk_patterns = chunk_patterns or {}
@@ -831,6 +865,7 @@ class Phase1_ChunkedNpzDataLoader:
         self.allow_gdrive_remote_repair = bool(allow_gdrive_remote_repair)
         self._gdrive_file_map: Dict[str, str] = {}
         self._local_file_map: Dict[str, str] = {}
+        self.last_batch_global_indices: Optional[np.ndarray] = None
 
         # 规范化 data_source: ms (默认), gdrive, hf, local
         ds_raw = (data_source or "ms").strip().lower()
@@ -870,6 +905,19 @@ class Phase1_ChunkedNpzDataLoader:
             else:
                 self.text_chunks = []
                 self.total_samples = 0
+
+            # Bug Fix (Task 070):
+            # 1) Problem: In Phase 1 tokenized distillation (`embedding_only=False` and `tokenizer != None`),
+            #    a missing or empty `parquet_path` silently initialized `self.text_chunks = []` and crashed
+            #    only later during chunk iteration with an opaque `IndexError: list index out of range`.
+            # 2) Method: Raise a descriptive `FileNotFoundError` at initialization whenever `self.tokenizer`
+            #    is provided and `self.text_chunks` is empty.
+            # 3) Caveats: Keep `self.tokenizer is None` with `parquet_path=""` working without error for
+            #    backward compatibility with legacy pure-embedding callers.
+            if self.tokenizer is not None and not self.text_chunks:
+                raise FileNotFoundError(
+                    f"[DataLoader] Phase 1 文本分词模式需要有效的基准 Parquet 语料文件，但未找到或为空: {parquet_path!r}"
+                )
         
         # 1. 校验所选数据源所需依赖与路径
         if self.data_source == "ms":
@@ -1017,6 +1065,27 @@ class Phase1_ChunkedNpzDataLoader:
             for start_idx in range(0, self.total_samples, chunk_size):
                  end_idx = min(start_idx + chunk_size, self.total_samples)
                  self.chunk_bounds.append((start_idx, end_idx))
+
+        # Bug Fix (Task 070):
+        # 1) Problem: Physical `.npz` tail chunks may contain padded rows beyond `len(self.text_chunks)`
+        #    (e.g. `.npz` has 100 rows while Parquet has 70 clauses), causing `batch_global_indices` in
+        #    `__next__` to exceed `len(self.text_chunks)` and raise `IndexError`.
+        # 2) Method: Clamp `self.chunk_bounds` logical upper bounds to `self.total_samples` while keeping
+        #    `self._per_model_bounds` unchanged so physical `.npz` filenames (`0_100.npz`) still resolve.
+        # 3) Caveats: Only affects logical iteration bounds when `not self.embedding_only` and
+        #    `self.total_samples > 0`; physical `.npz` archives on Drive/disk are never altered.
+        if (not self.embedding_only) and self.total_samples > 0 and self.chunk_bounds:
+            raw_max_end = max(e for _, e in self.chunk_bounds)
+            self.chunk_bounds = [
+                (s, min(e, self.total_samples))
+                for (s, e) in self.chunk_bounds
+                if s < self.total_samples
+            ]
+            if raw_max_end > self.total_samples:
+                print(
+                    f"[DataLoader] 🛡️ 已将 .npz 分块逻辑上界对齐裁剪至 Parquet 子句总数: "
+                    f"{raw_max_end} -> {self.total_samples}"
+                )
 
         if self.embedding_only:
             if not self.chunk_bounds:
@@ -1321,12 +1390,21 @@ class Phase1_ChunkedNpzDataLoader:
                     if arr.shape[0] > cur_chunk_size:
                         arr = arr[:cur_chunk_size]
                     active_chunk_embs.append(arr)
-                    
-                active_micro_indices = np.arange(cur_chunk_size)
-                
-                if self.shuffle:
-                    rng = np.random.default_rng(self.seed + worker_macro_ptr + self.current_epoch)
-                    rng.shuffle(active_micro_indices)
+
+                eff_chunk_rows = (
+                    min(cur_chunk_size, *(int(a.shape[0]) for a in active_chunk_embs))
+                    if active_chunk_embs
+                    else cur_chunk_size
+                )
+                if eff_chunk_rows < cur_chunk_size:
+                    active_chunk_embs = [a[:eff_chunk_rows] for a in active_chunk_embs]
+
+                active_micro_indices = _build_micro_indices(
+                    eff_chunk_rows,
+                    shuffle=self.shuffle,
+                    pair_shuffle=getattr(self, "pair_shuffle", False),
+                    seed_val=self.seed + worker_macro_ptr + self.current_epoch,
+                )
                     
                 payload = {
                     "embs": active_chunk_embs,
@@ -1403,6 +1481,8 @@ class Phase1_ChunkedNpzDataLoader:
         fetch_len = min(self.batch_size, len(self.active_micro_indices) - self.active_micro_ptr)
         batch_local_indices = self.active_micro_indices[self.active_micro_ptr : self.active_micro_ptr + fetch_len]
         self.active_micro_ptr += fetch_len
+        batch_global_indices = self.active_global_start + batch_local_indices
+        self.last_batch_global_indices = np.asarray(batch_global_indices, dtype=np.int64)
         
         if self.embedding_only or self.text_chunks is None or self.tokenizer is None:
             if self.backend == 'torch':
@@ -1413,7 +1493,6 @@ class Phase1_ChunkedNpzDataLoader:
                 batch_embs = [mx.array(arr[batch_local_indices]) for arr in self.active_chunk_embs]
             return None, batch_embs, None
 
-        batch_global_indices = self.active_global_start + batch_local_indices
         batch_texts = [self.text_chunks[i] for i in batch_global_indices]
         
         encoded_list = [self.tokenizer.encode(t, add_special_tokens=True)[:self.max_seq_len] for t in batch_texts]

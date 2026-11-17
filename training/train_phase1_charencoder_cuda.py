@@ -6,17 +6,20 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import zipfile
 import zlib
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from safetensors.torch import load_file as load_safetensors_file
+from safetensors.torch import save_file as save_safetensors_file
 
 # Auto-resolve the parent workspace root and force it to the FRONT of the import path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,7 +37,6 @@ from training.data.alignment_dataloader import (
 )
 
 from training.core.char_tokenizer import CharTokenizer
-from training.core.checkpoint import Checkpointer
 from model.config import WeakDecoderConfig
 from model.phase1_charencoder_cuda import (
     TinyCharEncoderCUDA,
@@ -289,6 +291,22 @@ def custom_lr_schedule(global_step: int, max_lr: float, warmup_steps: int):
     return max_lr
 
 
+def cosine_warmup_lr_schedule(
+    step: int,
+    max_lr: float,
+    warmup_steps: int,
+    total_steps: int = 100000,
+    min_lr_ratio: float = 0.1,
+) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        return max_lr * (float(step) / float(warmup_steps))
+    if total_steps <= warmup_steps:
+        return max_lr
+    progress = min(max(float(step - warmup_steps) / float(total_steps - warmup_steps), 0.0), 1.0)
+    cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return max_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine_factor)
+
+
 def load_optional_config(config_file: str):
     if not config_file:
         return {}
@@ -312,8 +330,120 @@ def resolve_path_maybe_relative(path_value: str, base_dir: str):
 def _load_ckpt_state_dict(path: str) -> dict:
     if path.endswith(".pt") or path.endswith(".pth"):
         return torch.load(path, map_location="cpu", weights_only=True)
-    from safetensors.torch import load_file
-    return load_file(path)
+    return load_safetensors_file(path)
+
+
+def _has_valid_p0_teacher_files(ckpt_dir: str) -> bool:
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return False
+    fuser_names = (
+        "sense_fuser.safetensors",
+        "sense_adapter.safetensors",
+        "sense_fuser.pt",
+        "sense_adapter.pt",
+    )
+    god_names = ("god_encoder.safetensors", "god_encoder.pt")
+    has_fuser = any(
+        os.path.isfile(os.path.join(ckpt_dir, fn))
+        and os.path.getsize(os.path.join(ckpt_dir, fn)) > 0
+        for fn in fuser_names
+    )
+    has_god = any(
+        os.path.isfile(os.path.join(ckpt_dir, fn))
+        and os.path.getsize(os.path.join(ckpt_dir, fn)) > 0
+        for fn in god_names
+    )
+    return bool(has_fuser and has_god)
+
+
+def _extract_p0_ckpt_step(ckpt_dir: str) -> int:
+    ms_path = os.path.join(ckpt_dir, "manifold_stats.pt")
+    if os.path.isfile(ms_path) and os.path.getsize(ms_path) > 0:
+        try:
+            ms_obj = torch.load(ms_path, map_location="cpu", weights_only=False)
+            if isinstance(ms_obj, dict) and ms_obj.get("global_step") is not None:
+                return int(ms_obj["global_step"])
+        except Exception:
+            pass
+
+    dl_path = os.path.join(ckpt_dir, "dataloader.json")
+    if os.path.isfile(dl_path) and os.path.getsize(dl_path) > 0:
+        try:
+            with open(dl_path, "r", encoding="utf-8") as f:
+                dl_obj = json.load(f)
+            if isinstance(dl_obj, dict) and dl_obj.get("global_step") is not None:
+                return int(dl_obj["global_step"])
+        except Exception:
+            pass
+
+    m = re.search(r"(?:^|_)step_(\d+)$", os.path.basename(os.path.normpath(ckpt_dir)))
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+# Bug Fix (Task 070):
+# 1) Problem: Users may pass `--p0_ckpt /content/drive/MyDrive/hollyshit/checkpoints/p0_v3`
+#    (the parent directory) or run Phase 1 v2 before Cell 7 exported `p0_v3_5models_best` (when
+#    only `p0_v3_5models_step_<N>` / `p0_v3_5models_latest_emergency` exist), causing an immediate
+#    `FileNotFoundError` in `infer_teacher_arch_from_ckpt`.
+# 2) Method: Auto-discover direct teacher checkpoints, `p0_v3_5models_best` / `*_best` aliases, or
+#    the highest-step valid child checkpoint directory (preferring regular `step_*` over emergency
+#    on ties), and also read `sphere_scale` from `manifold_stats.pt` when initializing `GodEncoderCUDA`.
+# 3) Caveats: Falls back to returning `p0_ckpt` unchanged if nothing valid is found so
+#    `infer_teacher_arch_from_ckpt` still raises a clear `FileNotFoundError`.
+def resolve_p0_teacher_ckpt_dir(p0_ckpt: str) -> str:
+    if not p0_ckpt:
+        return p0_ckpt
+    if _has_valid_p0_teacher_files(p0_ckpt):
+        return p0_ckpt
+    if not os.path.isdir(p0_ckpt):
+        return p0_ckpt
+
+    preferred_best = os.path.join(p0_ckpt, "p0_v3_5models_best")
+    if _has_valid_p0_teacher_files(preferred_best):
+        print(f"[Teacher] Auto-resolved Phase 0 teacher checkpoint: {preferred_best}")
+        return preferred_best
+
+    best_children: List[Tuple[int, str]] = []
+    step_children: List[Tuple[int, int, str]] = []
+    for entry in os.listdir(p0_ckpt):
+        child = os.path.join(p0_ckpt, entry)
+        if not _has_valid_p0_teacher_files(child):
+            continue
+        step_val = _extract_p0_ckpt_step(child)
+        if entry.endswith("_best") or entry == "best":
+            best_children.append((step_val, child))
+        else:
+            is_emerg = entry.endswith("latest_emergency") or entry.endswith("_emergency")
+            non_emerg_rank = 0 if is_emerg else 1
+            step_children.append((step_val, non_emerg_rank, child))
+
+    if best_children:
+        best_children.sort(key=lambda item: (item[0], item[1]))
+        chosen = best_children[-1][1]
+        print(f"[Teacher] Auto-resolved Phase 0 teacher checkpoint: {chosen}")
+        return chosen
+
+    if step_children:
+        step_children.sort(key=lambda item: (item[0], item[1], item[2]))
+        chosen = step_children[-1][2]
+        print(f"[Teacher] Auto-resolved Phase 0 teacher checkpoint: {chosen}")
+        return chosen
+
+    return p0_ckpt
+
+
+def _infer_teacher_sphere_scale(p0_ckpt: str) -> bool:
+    ms_path = os.path.join(p0_ckpt, "manifold_stats.pt")
+    if os.path.isfile(ms_path) and os.path.getsize(ms_path) > 0:
+        try:
+            ms_obj = torch.load(ms_path, map_location="cpu", weights_only=False)
+            if isinstance(ms_obj, dict) and "sphere_scale" in ms_obj:
+                return bool(ms_obj["sphere_scale"])
+        except Exception:
+            pass
+    return False
 
 
 def infer_teacher_arch_from_ckpt(p0_ckpt: str):
@@ -390,12 +520,210 @@ def resolve_emb_paths(args, ds_config: dict, expected_routes: int):
     return emb_paths
 
 
+# Bug Fix (Task 070):
+# 1) Problem: Unlike Phase 0 v3 (`embedding_only=True`), Phase 1 v2 requires the aligned clause
+#    text Parquet (`chunked_mixed_omni.parquet`), which may reside under `/content/drive/MyDrive/hollyshit/data`
+#    or a remote dataset repo rather than the container working directory.
+# 2) Method: Check direct `parquet_path` first, search candidate Drive/local data directories for
+#    `os.path.basename(parquet_path)`, and if still missing, attempt remote fetch from ModelScope
+#    (`catclever/emb_npy`) -> Hugging Face (`drunkencat/emb_npy`) with `assert_colab_drive_mounted`
+#    and atomic `.tmp` + `os.replace` write-back.
+# 3) Caveats: Never swallows `[Colab Mount Guard]` `RuntimeError`; on benign offline/missing-remote
+#    errors, logs a concise warning and returns `parquet_path` for `Phase1_ChunkedNpzDataLoader` validation.
+def resolve_or_fetch_parquet_path(parquet_path: str, args, ds_config: Optional[dict]) -> str:
+    ds_config = ds_config or {}
+    if parquet_path and os.path.isfile(parquet_path) and os.path.getsize(parquet_path) > 0:
+        return parquet_path
+
+    cfg_rel = ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_omni.parquet")
+    base_name = os.path.basename(parquet_path or cfg_rel or "chunked_mixed_omni.parquet")
+
+    search_roots: List[str] = ["/content/drive/MyDrive/hollyshit/data"]
+    gdrive_dir = getattr(args, "gdrive_dir", None) if args is not None else None
+    if gdrive_dir:
+        search_roots.append(gdrive_dir)
+        gd_parent = os.path.dirname(os.path.abspath(gdrive_dir.rstrip("/")))
+        if gd_parent:
+            search_roots.append(os.path.join(gd_parent, "data"))
+            search_roots.append(gd_parent)
+    data_dir = getattr(args, "data_dir", None) if args is not None else None
+    if data_dir:
+        search_roots.append(data_dir)
+    search_roots.append(os.path.abspath("data"))
+
+    seen_roots = set()
+    for root in search_roots:
+        if not root:
+            continue
+        abs_r = os.path.abspath(root)
+        if abs_r in seen_roots or not os.path.isdir(abs_r):
+            continue
+        seen_roots.add(abs_r)
+
+        direct_cands = [
+            os.path.join(abs_r, base_name),
+            os.path.join(abs_r, "Basic_ZH", base_name),
+            os.path.join(abs_r, "data", "Basic_ZH", base_name),
+        ]
+        for dc in direct_cands:
+            if os.path.isfile(dc) and os.path.getsize(dc) > 0:
+                print(f"[Data] Resolved existing Parquet corpus at: {dc}")
+                return dc
+
+        for hit in glob.glob(os.path.join(abs_r, "**", base_name), recursive=True):
+            if os.path.isfile(hit) and os.path.getsize(hit) > 0:
+                print(f"[Data] Resolved existing Parquet corpus at: {hit}")
+                return os.path.abspath(hit)
+
+    eff_ms_repo = (
+        (getattr(args, "ms_repo_id", None) if args is not None else None)
+        or ds_config.get("modelscope_repo_id")
+        or "catclever/emb_npy"
+    ).strip()
+    eff_hf_repo = (
+        (getattr(args, "hf_repo_id", None) if args is not None else None)
+        or ds_config.get("huggingface_repo_id")
+        or "drunkencat/emb_npy"
+    ).strip()
+
+    remote_candidates: List[str] = []
+    for rc in (
+        cfg_rel.replace("\\", "/").lstrip("/"),
+        re.sub(r"^data/", "", cfg_rel.replace("\\", "/").lstrip("/")),
+        f"Basic_ZH/{base_name}",
+        f"data/Basic_ZH/{base_name}",
+        base_name,
+    ):
+        if rc and rc not in remote_candidates:
+            remote_candidates.append(rc)
+
+    stage_base = (
+        (getattr(args, "download_cache_dir", None) if args is not None else None)
+        or (getattr(args, "data_dir", None) if args is not None else None)
+        or tempfile.gettempdir()
+    )
+    work_dir = os.path.join(
+        os.path.abspath(stage_base),
+        f"_parquet_fetch_{os.getpid()}_{threading.get_ident()}",
+    )
+
+    dl_path: Optional[str] = None
+    try:
+        os.makedirs(work_dir, exist_ok=True)
+        # 1. Probe ModelScope first
+        try:
+            from modelscope.hub.api import HubApi
+            from modelscope.hub.file_download import dataset_file_download
+
+            ms_cands = list(remote_candidates)
+            try:
+                ms_api = HubApi()
+                ms_tok = (
+                    os.environ.get("MODELSCOPE_API_TOKEN")
+                    or os.environ.get("MS_TOKEN")
+                    or ""
+                ).strip()
+                if ms_tok:
+                    try:
+                        ms_api.login(ms_tok)
+                    except Exception:
+                        pass
+                repo_items = ms_api.get_dataset_files(eff_ms_repo, recursive=True)
+                repo_paths = [
+                    it.get("Path", it.get("Name", "")).replace("\\", "/").lstrip("/")
+                    for it in repo_items
+                ]
+                matched_ms = [
+                    rp for rp in repo_paths if os.path.basename(rp) == base_name or rp in ms_cands
+                ]
+                ms_cands = matched_ms if matched_ms else []
+            except Exception:
+                pass
+
+            for rc in ms_cands:
+                try:
+                    cand_dl = dataset_file_download(eff_ms_repo, rc, cache_dir=work_dir)
+                    if cand_dl and os.path.isfile(cand_dl) and os.path.getsize(cand_dl) > 0:
+                        dl_path = cand_dl
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 2. Fallback to Hugging Face Hub
+        if dl_path is None:
+            try:
+                from huggingface_hub import HfApi
+
+                hf_cands = list(remote_candidates)
+                try:
+                    hf_files = [
+                        rf.replace("\\", "/").lstrip("/")
+                        for rf in HfApi(token=_get_hf_token()).list_repo_files(
+                            repo_id=eff_hf_repo, repo_type="dataset"
+                        )
+                    ]
+                    matched_hf = [
+                        rf for rf in hf_files if os.path.basename(rf) == base_name or rf in hf_cands
+                    ]
+                    hf_cands = matched_hf if matched_hf else []
+                except Exception:
+                    pass
+
+                for rc in hf_cands:
+                    try:
+                        cand_dl = _download_hf_dataset_chunk_file(
+                            eff_hf_repo, rc, local_dir=work_dir, cache_dir=work_dir
+                        )
+                        if cand_dl and os.path.isfile(cand_dl) and os.path.getsize(cand_dl) > 0:
+                            dl_path = cand_dl
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if dl_path is not None and parquet_path:
+            real_dl = os.path.realpath(dl_path) if os.path.islink(dl_path) else os.path.abspath(dl_path)
+            assert_colab_drive_mounted(parquet_path)
+            dest_abs = os.path.abspath(parquet_path)
+            os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
+            tmp_dest = f"{dest_abs}.fetch_{os.getpid()}_{threading.get_ident()}.tmp"
+            try:
+                shutil.copy2(real_dl, tmp_dest)
+                if os.path.getsize(tmp_dest) <= 0:
+                    raise ValueError(f"Fetched empty Parquet file: {tmp_dest}")
+                os.replace(tmp_dest, dest_abs)
+            finally:
+                if os.path.exists(tmp_dest):
+                    try:
+                        os.remove(tmp_dest)
+                    except OSError:
+                        pass
+            print(f"[Data] ✅ Auto-fetched Parquet corpus to: {dest_abs}")
+            return dest_abs
+    except RuntimeError as rt_err:
+        if "[Colab Mount Guard]" in str(rt_err):
+            raise
+        print(f"[Data] ⚠️ Remote Parquet probe skipped ({rt_err}); keeping path: {parquet_path}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    print(
+        f"[Data] ⚠️ Parquet corpus not found locally or in remote dataset repos ({base_name}); "
+        f"keeping target path: {parquet_path}"
+    )
+    return parquet_path
+
+
 def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
     ds_config = ds_config or {}
     has_chunked_conf = bool(ds_config.get("base_models") and ds_config.get("chunk_name_patterns"))
     config_base_dir = os.path.dirname(os.path.abspath(args.config_file)) if args.config_file else os.getcwd()
-    parquet_path = args.parquet_path or ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_wiki.parquet")
+    parquet_path = args.parquet_path or ds_config.get("parquet_path", "data/Basic_ZH/chunked_mixed_omni.parquet")
     parquet_path = resolve_path_maybe_relative(parquet_path, config_base_dir)
+    parquet_path = resolve_or_fetch_parquet_path(parquet_path, args, ds_config)
 
     raw_data_source = getattr(args, "data_source", None) or ds_config.get("default_source", "ms")
     ds_lower = (raw_data_source or "ms").strip().lower()
@@ -476,6 +804,7 @@ def build_dataloader(args, tokenizer, ds_config: dict, expected_routes: int):
             hf_repo_id=hf_repo_id,
             data_source=data_source,
             gdrive_dir=gdrive_dir,
+            pair_shuffle=True,
         )
 
     emb_paths = resolve_emb_paths(args, ds_config, expected_routes)
@@ -741,10 +1070,469 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
     return loader
 
 
-def expected_checkpoint_dir(out_dir: str, prefix: str, step: int, is_emergency: bool = False):
-    base_name = f"step_{step}_emergency" if is_emergency else f"step_{step}"
+# Bug Fix (Task 070):
+# 1) Problem: Phase 1 v2 previously lacked `load_npz_features_with_repair` and `disable_chunk_prefetch`,
+#    so `--no-prefetch` in Colab still spawned the background prefetch queue (doubling `.npz` RAM on
+#    top of the in-memory Parquet text pool and risking OOM) and could not recover from mid-stream
+#    CRC corruption during `np.load(...)["features"]`.
+# 2) Method: Port `load_npz_features_with_repair`, `disable_chunk_prefetch`, and
+#    `enable_download_only_prefetch` from Phase 0 v3, preserving `loader.emb_dims` auto-detection
+#    and `pair_shuffle` micro-batch ordering.
+# 3) Caveats: Healthy persistent files in `gdrive_dir` and `local` mode are never deleted or modified.
+def load_npz_features_with_repair(
+    loader,
+    path: str,
+    cand_name: Optional[str] = None,
+    max_retries: int = 2,
+) -> np.ndarray:
+    attempt = 0
+    last_err = None
+    while attempt <= max_retries:
+        try:
+            return np.load(path)["features"]
+        except (zipfile.BadZipFile, zlib.error, OSError, ValueError, KeyError, EOFError) as e:
+            last_err = e
+            attempt += 1
+            if attempt > max_retries:
+                break
+            data_source = getattr(loader, "data_source", "ms")
+            gdrive_dir = getattr(loader, "gdrive_dir", None)
+            local_npz_dir = getattr(loader, "npz_dir", None)
+            abs_p = os.path.abspath(path) if path else ""
+            real_p = os.path.realpath(path) if path else ""
+            is_protected_persistent = False
+            if gdrive_dir:
+                gd_abs = os.path.abspath(gdrive_dir)
+                if (
+                    abs_p == gd_abs
+                    or abs_p.startswith(gd_abs + os.sep)
+                    or real_p == gd_abs
+                    or real_p.startswith(gd_abs + os.sep)
+                ):
+                    is_protected_persistent = True
+            if data_source == "local" and local_npz_dir:
+                loc_abs = os.path.abspath(local_npz_dir)
+                if (
+                    abs_p == loc_abs
+                    or abs_p.startswith(loc_abs + os.sep)
+                    or real_p == loc_abs
+                    or real_p.startswith(loc_abs + os.sep)
+                ):
+                    is_protected_persistent = True
+
+            if not is_protected_persistent:
+                try:
+                    if os.path.islink(path):
+                        real_link = os.path.realpath(path)
+                        os.remove(path)
+                        if real_link and os.path.exists(real_link):
+                            os.remove(real_link)
+                    elif os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+
+            if (
+                cand_name
+                and data_source == "gdrive"
+                and gdrive_dir
+                and getattr(loader, "allow_gdrive_remote_repair", True)
+                and attempt >= 1
+            ):
+                file_map = getattr(loader, "_gdrive_file_map", None)
+                broken_src: Optional[str] = None
+                try:
+                    broken_src = resolve_gdrive_chunk_file(
+                        gdrive_dir,
+                        cand_name,
+                        file_map=file_map,
+                        source_label="Google Drive",
+                    )
+                except FileNotFoundError:
+                    broken_src = None
+
+                stage_dir = getattr(loader, "npz_dir", None) or getattr(loader, "cache_dir", None)
+                eff_ms = (
+                    getattr(loader, "ms_repo_id", None)
+                    or getattr(loader, "_fallback_ms_repo_id", None)
+                    or "catclever/emb_npy"
+                )
+                eff_hf = (
+                    getattr(loader, "hf_repo_id", None)
+                    or getattr(loader, "_fallback_hf_repo_id", None)
+                    or "drunkencat/emb_npy"
+                )
+                path = repair_gdrive_chunk_from_remote(
+                    gdrive_dir,
+                    cand_name,
+                    cache_dir=stage_dir,
+                    ms_repo_id=eff_ms,
+                    hf_repo_id=eff_hf,
+                    file_map=file_map,
+                    broken_gdrive_path=broken_src,
+                )
+                if (
+                    broken_src
+                    and os.path.abspath(path) != os.path.abspath(broken_src)
+                    and os.path.isfile(path)
+                ):
+                    assert_colab_drive_mounted(broken_src)
+                    tmp_gd = f"{broken_src}.repair_{os.getpid()}_{threading.get_ident()}.tmp"
+                    try:
+                        shutil.copy2(path, tmp_gd)
+                        validate_npz_archive(tmp_gd)
+                        os.replace(tmp_gd, broken_src)
+                    finally:
+                        if os.path.exists(tmp_gd):
+                            try:
+                                os.remove(tmp_gd)
+                            except OSError:
+                                pass
+            elif cand_name and hasattr(loader, "_resolve_npz_path"):
+                path = loader._resolve_npz_path(cand_name)
+            elif cand_name and data_source == "gdrive":
+                if gdrive_dir:
+                    src = resolve_gdrive_chunk_file(
+                        gdrive_dir,
+                        cand_name,
+                        file_map=getattr(loader, "_gdrive_file_map", None),
+                        source_label="Google Drive",
+                    )
+                    cache_dir = getattr(loader, "cache_dir", None) or "./datas"
+                    staged = os.path.join(cache_dir, cand_name)
+                    if os.path.abspath(src) != os.path.abspath(staged):
+                        os.makedirs(os.path.dirname(staged), exist_ok=True)
+                        shutil.copy2(src, staged)
+                        path = staged
+                    else:
+                        path = src
+                else:
+                    raise
+            elif cand_name and (data_source == "hf" or getattr(loader, "hf_repo_id", None)):
+                cache_dir = getattr(loader, "cache_dir", None) or getattr(loader, "npz_dir", "./datas")
+                path = _download_hf_dataset_chunk_file(
+                    loader.hf_repo_id or "drunkencat/emb_npy",
+                    cand_name,
+                    local_dir=cache_dir,
+                    cache_dir=cache_dir,
+                )
+                _cleanup_hf_download_metadata(path, [cache_dir, getattr(loader, "npz_dir", None)])
+            elif cand_name and (data_source == "ms" or getattr(loader, "ms_repo_id", None)):
+                from modelscope.hub.file_download import dataset_file_download
+
+                path = dataset_file_download(
+                    loader.ms_repo_id or "catclever/emb_npy", cand_name, cache_dir=loader.cache_dir
+                )
+            else:
+                raise
+    raise RuntimeError(f"Failed to load npz after retries: {path} | last_error={last_err}")
+
+
+def disable_chunk_prefetch(loader):
+    if not hasattr(loader, "chunk_bounds") or not hasattr(loader, "macro_chunk_indices"):
+        return loader
+
+    try:
+        if hasattr(loader, "stop_event"):
+            loader.stop_event.set()
+        if hasattr(loader, "_drain_and_cleanup_prefetch_queue"):
+            loader._drain_and_cleanup_prefetch_queue()
+        if hasattr(loader, "prefetch_thread") and loader.prefetch_thread.is_alive():
+            loader.prefetch_thread.join(timeout=2.0)
+        if hasattr(loader, "_drain_and_cleanup_prefetch_queue"):
+            loader._drain_and_cleanup_prefetch_queue()
+    except Exception:
+        pass
+
+    def _load_payload_sync(macro_ptr):
+        if macro_ptr >= len(loader.macro_chunk_indices):
+            return None
+        chunk_idx = loader.macro_chunk_indices[macro_ptr]
+        start_idx, end_idx = loader.chunk_bounds[chunk_idx]
+        cur_chunk_size = end_idx - start_idx
+        active_chunk_embs = []
+        cached_paths = []
+        for model_name in loader.models:
+            pattern = loader.chunk_patterns.get(
+                model_name, f"{model_name}_chunk_{{start:07d}}_{{end:07d}}.npz"
+            )
+            model_end = loader._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
+            cand_name = pattern.format(start=start_idx, end=model_end)
+            if hasattr(loader, "_resolve_npz_path"):
+                path = loader._resolve_npz_path(cand_name)
+            else:
+                path = os.path.join(loader.npz_dir, cand_name)
+            arr = load_npz_features_with_repair(loader, path, cand_name=cand_name)
+            if arr.shape[0] > cur_chunk_size:
+                arr = arr[:cur_chunk_size]
+            active_chunk_embs.append(arr)
+            cached_paths.append(path)
+
+        eff_chunk_rows = (
+            min(cur_chunk_size, *(int(a.shape[0]) for a in active_chunk_embs))
+            if active_chunk_embs
+            else cur_chunk_size
+        )
+        if eff_chunk_rows < cur_chunk_size:
+            active_chunk_embs = [a[:eff_chunk_rows] for a in active_chunk_embs]
+
+        if loader.shuffle and eff_chunk_rows > 1:
+            rng = np.random.default_rng(loader.seed + macro_ptr + loader.current_epoch)
+            if getattr(loader, "pair_shuffle", False) and eff_chunk_rows >= 2:
+                n_pairs = eff_chunk_rows // 2
+                pairs = np.arange(n_pairs * 2).reshape(n_pairs, 2)
+                perm = rng.permutation(n_pairs)
+                shuffled_pairs = pairs[perm].reshape(-1)
+                if eff_chunk_rows % 2 == 1:
+                    active_micro_indices = np.concatenate(
+                        [shuffled_pairs, np.array([eff_chunk_rows - 1], dtype=shuffled_pairs.dtype)]
+                    )
+                else:
+                    active_micro_indices = shuffled_pairs
+            else:
+                active_micro_indices = np.arange(eff_chunk_rows)
+                rng.shuffle(active_micro_indices)
+        else:
+            active_micro_indices = np.arange(eff_chunk_rows)
+
+        return {
+            "embs": active_chunk_embs,
+            "micro_indices": active_micro_indices,
+            "global_start": start_idx,
+            "macro_idx_ptr": macro_ptr,
+            "cached_paths": cached_paths,
+        }
+
+    def _start_prefetching_sync(start_macro_ptr):
+        loader._sync_next_macro_ptr = start_macro_ptr
+
+    def _pop_next_chunk_sync():
+        if loader.auto_cleanup and getattr(loader, "_prev_chunk_paths", []):
+            loader._cleanup_cached_files(loader._prev_chunk_paths)
+            loader._prev_chunk_paths = []
+        if not hasattr(loader, "_sync_next_macro_ptr"):
+            loader._sync_next_macro_ptr = getattr(loader, "active_macro_idx_ptr", 0)
+        payload = _load_payload_sync(loader._sync_next_macro_ptr)
+        if payload is None:
+            raise StopIteration
+        loader.active_chunk_embs = payload["embs"]
+        loader.active_micro_indices = payload["micro_indices"]
+        loader.active_global_start = payload["global_start"]
+        loader.active_macro_idx_ptr = payload["macro_idx_ptr"]
+        loader.active_micro_ptr = 0
+        loader._prev_chunk_paths = payload.get("cached_paths", [])
+        loader._sync_next_macro_ptr += 1
+        if not hasattr(loader, "emb_dims"):
+            loader.emb_dims = [arr.shape[-1] for arr in loader.active_chunk_embs]
+            print(f"[DataLoader] 自动侦测到多路特征维度: {loader.emb_dims}")
+
+    loader._start_prefetching = _start_prefetching_sync
+    loader._pop_next_chunk = _pop_next_chunk_sync
+    return loader
+
+
+def enable_download_only_prefetch(loader):
+    return disable_chunk_prefetch(loader)
+
+
+# Bug Fix (Task 070):
+# 1) Problem: Relying on `training.core.checkpoint.Checkpointer` installed global SIGINT/SIGTERM
+#    handlers that called `sys.exit(0)` on emergency save, lacked rolling `keep_last_ckpts` pruning,
+#    only saved `.pt` weights (omitting `phase1_charencoder.safetensors` required by downstream
+#    Translator & Phase 4 Left Brain), and lacked `resolve_latest_phase1_v2_checkpoint` auto-resume.
+# 2) Method: Implement native Phase 1 v2 checkpoint lifecycle (`expected_checkpoint_dir`,
+#    `_is_valid_phase1_v2_ckpt_dir`, `resolve_latest_phase1_v2_checkpoint`,
+#    `prune_old_phase1_v2_checkpoints`, and `save_phase1_v2_checkpoint`) matching Phase 0 v3 1:1
+#    and exporting `phase1_charencoder.safetensors`, `student.safetensors`, `student.pt`, and
+#    `char_subspace_stats.pt` under `assert_colab_drive_mounted`.
+# 3) Caveats: `training/core/` submodule remains strictly untouched; downstream stages can load
+#    either `phase1_charencoder.safetensors` or `student.pt` interchangeably.
+def expected_checkpoint_dir(
+    out_dir: str,
+    prefix: str,
+    step: int,
+    is_emergency: bool = False,
+) -> str:
+    base_name = "latest_emergency" if is_emergency else f"step_{step}"
     folder_name = f"{prefix}_{base_name}" if prefix else base_name
     return os.path.join(out_dir, folder_name)
+
+
+def _is_valid_phase1_v2_ckpt_dir(ckpt_dir: str) -> Tuple[bool, Optional[int]]:
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return False, None
+
+    student_files = (
+        "phase1_charencoder.safetensors",
+        "student.safetensors",
+        "student.pt",
+    )
+    has_student = any(
+        os.path.isfile(os.path.join(ckpt_dir, fn))
+        and os.path.getsize(os.path.join(ckpt_dir, fn)) > 0
+        for fn in student_files
+    )
+    if not has_student:
+        return False, None
+
+    stats_path = os.path.join(ckpt_dir, "char_subspace_stats.pt")
+    if not os.path.isfile(stats_path) or os.path.getsize(stats_path) <= 0:
+        return False, None
+
+    dl_path = os.path.join(ckpt_dir, "dataloader.json")
+    if os.path.isfile(dl_path) and os.path.getsize(dl_path) > 0:
+        try:
+            with open(dl_path, "r", encoding="utf-8") as f:
+                dl_meta = json.load(f)
+            if isinstance(dl_meta, dict) and dl_meta.get("global_step") is not None:
+                return True, int(dl_meta["global_step"])
+        except (OSError, ValueError, TypeError):
+            pass
+
+    try:
+        st_meta = torch.load(stats_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False, None
+    if isinstance(st_meta, dict) and st_meta.get("global_step") is not None:
+        try:
+            return True, int(st_meta["global_step"])
+        except (ValueError, TypeError):
+            pass
+
+    m = re.search(r"(?:^|_)step_(\d+)$", os.path.basename(os.path.normpath(ckpt_dir)))
+    return True, (int(m.group(1)) if m else 0)
+
+
+def resolve_latest_phase1_v2_checkpoint(out_dir: str, prefix: str) -> Optional[str]:
+    if not out_dir or not os.path.isdir(out_dir):
+        return None
+
+    step_re = re.compile(
+        rf"^{re.escape(prefix)}_step_(\d+)$" if prefix else r"^step_(\d+)$"
+    )
+    emerg_name = f"{prefix}_latest_emergency" if prefix else "latest_emergency"
+
+    candidates: List[Tuple[int, int, str]] = []
+    for entry in os.listdir(out_dir):
+        is_emerg = entry == emerg_name
+        is_step = bool(step_re.match(entry))
+        if not (is_emerg or is_step):
+            continue
+        cand_path = os.path.join(out_dir, entry)
+        ok, step_val = _is_valid_phase1_v2_ckpt_dir(cand_path)
+        if not ok or step_val is None:
+            continue
+        non_emerg_rank = 0 if is_emerg else 1
+        candidates.append((step_val, non_emerg_rank, cand_path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def prune_old_phase1_v2_checkpoints(out_dir: str, prefix: str, keep_last: int) -> List[str]:
+    removed: List[str] = []
+    if keep_last <= 0 or not out_dir or not os.path.isdir(out_dir):
+        return removed
+
+    step_re = re.compile(
+        rf"^{re.escape(prefix)}_step_(\d+)$" if prefix else r"^step_(\d+)$"
+    )
+    emerg_name = f"{prefix}_latest_emergency" if prefix else "latest_emergency"
+
+    valid_steps: List[Tuple[int, str]] = []
+    for entry in os.listdir(out_dir):
+        m = step_re.match(entry)
+        if not m:
+            continue
+        cand_path = os.path.join(out_dir, entry)
+        ok, step_val = _is_valid_phase1_v2_ckpt_dir(cand_path)
+        if not ok or step_val is None:
+            continue
+        valid_steps.append((step_val, cand_path))
+
+    valid_steps.sort(key=lambda item: (item[0], item[1]))
+    if len(valid_steps) > keep_last:
+        for _old_step, old_path in valid_steps[:-keep_last]:
+            shutil.rmtree(old_path, ignore_errors=True)
+            removed.append(old_path)
+
+    if valid_steps:
+        newest_regular_step = valid_steps[-1][0]
+        emerg_path = os.path.join(out_dir, emerg_name)
+        if os.path.isdir(emerg_path):
+            ok_emerg, emerg_step = _is_valid_phase1_v2_ckpt_dir(emerg_path)
+            if (not ok_emerg) or (emerg_step is not None and emerg_step <= newest_regular_step):
+                shutil.rmtree(emerg_path, ignore_errors=True)
+                removed.append(emerg_path)
+
+    return removed
+
+
+def save_phase1_v2_checkpoint(
+    out_dir: str,
+    prefix: str,
+    step: int,
+    student: TinyCharEncoderCUDA,
+    order_head: Optional[OrderDirectionHeadCUDA] = None,
+    next_clause_head: Optional[AsymmetricNextClauseHeadCUDA] = None,
+    char_anchor_head: Optional[CharSubspaceAnchorHeadCUDA] = None,
+    optimizer: Optional[optim.Optimizer] = None,
+    dataloader=None,
+    args: Optional[argparse.Namespace] = None,
+    health_metrics: Optional[Dict[str, float]] = None,
+    is_emergency: bool = False,
+) -> str:
+    assert_colab_drive_mounted(out_dir)
+    ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
+    assert_colab_drive_mounted(ckpt_dir)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    student_cpu_state = {
+        k: v.detach().cpu().contiguous() for k, v in student.state_dict().items()
+    }
+    save_safetensors_file(
+        student_cpu_state, os.path.join(ckpt_dir, "phase1_charencoder.safetensors")
+    )
+    save_safetensors_file(
+        student_cpu_state, os.path.join(ckpt_dir, "student.safetensors")
+    )
+    torch.save(student_cpu_state, os.path.join(ckpt_dir, "student.pt"))
+
+    if order_head is not None:
+        torch.save(order_head.state_dict(), os.path.join(ckpt_dir, "order_head.pt"))
+    if next_clause_head is not None:
+        torch.save(next_clause_head.state_dict(), os.path.join(ckpt_dir, "next_clause_head.pt"))
+    if char_anchor_head is not None:
+        torch.save(char_anchor_head.state_dict(), os.path.join(ckpt_dir, "char_anchor_head.pt"))
+    if optimizer is not None:
+        torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+
+    if dataloader is not None and hasattr(dataloader, "state_dict"):
+        dl_state = dict(dataloader.state_dict())
+        dl_state["global_step"] = int(step)
+        with open(os.path.join(ckpt_dir, "dataloader.json"), "w", encoding="utf-8") as f:
+            json.dump(dl_state, f)
+
+    if args is not None:
+        with open(os.path.join(ckpt_dir, "training_args.json"), "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=4, ensure_ascii=False)
+
+    w_sub = student.char_subspace_proj.weight.detach().cpu().contiguous()
+    stats_payload = {
+        "char_subspace_proj": w_sub,
+        "subspace_proj": w_sub.t().contiguous(),
+        "char_token_mean": student.char_token_mean.detach().cpu().contiguous(),
+        "d_sub": int(student.d_sub),
+        "d_model": int(student.d_model),
+        "pad_token_id": int(student.pad_token_id),
+        "global_step": int(step),
+        "health_metrics": dict(health_metrics) if health_metrics else {},
+    }
+    torch.save(stats_payload, os.path.join(ckpt_dir, "char_subspace_stats.pt"))
+    return ckpt_dir
 
 
 def save_char_subspace_stats(
@@ -753,32 +1541,36 @@ def save_char_subspace_stats(
     prefix: str,
     step: int,
     is_emergency: bool = False,
+    health_metrics: Optional[Dict[str, float]] = None,
 ):
     """
-    Saves `char_subspace_stats.pt` containing the native orthogonal 32-D basis and
-    valid-token mean offset for downstream Phase 4/5 (`HiPPOOracleCUDA` / Translator / Left Brain).
+    Backward-compatible helper saving `char_subspace_stats.pt` containing the native orthogonal
+    32-D basis and valid-token mean offset for downstream Phase 4/5.
     """
     assert_colab_drive_mounted(out_dir)
     ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
     assert_colab_drive_mounted(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
     stats_path = os.path.join(ckpt_dir, "char_subspace_stats.pt")
-    w_sub = student.char_subspace_proj.weight.detach().cpu()
+    w_sub = student.char_subspace_proj.weight.detach().cpu().contiguous()
     payload = {
         "char_subspace_proj": w_sub,
         "subspace_proj": w_sub.t().contiguous(),
-        "char_token_mean": student.char_token_mean.detach().cpu(),
-        "d_sub": student.d_sub,
-        "d_model": student.d_model,
-        "pad_token_id": student.pad_token_id,
+        "char_token_mean": student.char_token_mean.detach().cpu().contiguous(),
+        "d_sub": int(student.d_sub),
+        "d_model": int(student.d_model),
+        "pad_token_id": int(student.pad_token_id),
         "global_step": int(step),
+        "health_metrics": dict(health_metrics) if health_metrics else {},
     }
     torch.save(payload, stats_path)
     print(f"[Checkpoint] Saved char_subspace_stats.pt to {stats_path}")
     return stats_path
 
 
-def save_torch_optimizer_state(optimizer, out_dir: str, prefix: str, step: int, is_emergency: bool = False):
+def save_torch_optimizer_state(
+    optimizer, out_dir: str, prefix: str, step: int, is_emergency: bool = False
+):
     assert_colab_drive_mounted(out_dir)
     ckpt_dir = expected_checkpoint_dir(out_dir, prefix, step, is_emergency=is_emergency)
     assert_colab_drive_mounted(ckpt_dir)
@@ -786,6 +1578,31 @@ def save_torch_optimizer_state(optimizer, out_dir: str, prefix: str, step: int, 
     opt_path = os.path.join(ckpt_dir, "optimizer.pt")
     torch.save(optimizer.state_dict(), opt_path)
     print(f"[Checkpoint] Saved optimizer state to {opt_path}")
+
+
+def _build_batch_contiguous_pairs(
+    dataloader, batch_size: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    """
+    Extracts true adjacent clause index pairs `(i, j)` within the current batch where
+    `global_idx[j] == global_idx[i] + 1` so `AsymmetricNextClauseHeadCUDA` never treats
+    random shuffled sentences as adjacent discourse transitions.
+    """
+    g_idx = getattr(dataloader, "last_batch_global_indices", None)
+    if g_idx is None:
+        return None
+    if len(g_idx) != batch_size or batch_size < 2:
+        return torch.empty((0, 2), dtype=torch.long, device=device)
+
+    pos_map = {int(g): idx for idx, g in enumerate(g_idx)}
+    pairs: List[List[int]] = []
+    for i, g in enumerate(g_idx):
+        nxt_pos = pos_map.get(int(g) + 1)
+        if nxt_pos is not None and nxt_pos != i:
+            pairs.append([i, nxt_pos])
+    if not pairs:
+        return torch.empty((0, 2), dtype=torch.long, device=device)
+    return torch.tensor(pairs, dtype=torch.long, device=device)
 
 
 def get_distill_parser():
@@ -796,11 +1613,31 @@ def get_distill_parser():
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=5000)
+    parser.add_argument(
+        "--total_steps",
+        type=int,
+        default=0,
+        help="Total steps for cosine LR schedule (0 = auto-compute from dataset size * epochs)",
+    )
     parser.add_argument("--max_seq_len", type=int, default=256)
-    parser.add_argument("--save_steps", type=int, default=10000)
+    parser.add_argument("--save_steps", type=int, default=2000)
     parser.add_argument("--eval_steps", type=int, default=200)
-    parser.add_argument("--out_dir", type=str, default="checkpoints/distilled_v2")
+    parser.add_argument("--log_steps", type=int, default=20)
+    parser.add_argument("--out_dir", type=str, default="checkpoints/p1_v2")
     parser.add_argument("--ckpt_prefix", type=str, default="charencoder_pt_v2")
+    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument(
+        "--auto_resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically resume from latest valid checkpoint in --out_dir (pass --no-auto_resume to disable)",
+    )
+    parser.add_argument(
+        "--keep_last_ckpts",
+        type=int,
+        default=3,
+        help="Keep only the N most recent step_* checkpoints in --out_dir (0 = keep all)",
+    )
     parser.add_argument("--p0_ckpt", type=str, required=True, help="Frozen Phase 0 checkpoint to distill from")
     parser.add_argument("--config_file", type=str, default=None, help="Optional dataset config JSON")
     parser.add_argument(
@@ -869,7 +1706,7 @@ def main():
     parser = get_distill_parser()
     args = parser.parse_args()
 
-    # Hard Drive mount guard at second 0 (before Checkpointer / dataloaders / models!)
+    # Hard Drive mount guard at second 0 (before dataloaders or models!)
     assert_colab_drive_mounted(args.out_dir)
     if args.data_source in ("gdrive",):
         assert_colab_drive_mounted(args.gdrive_dir)
@@ -894,20 +1731,35 @@ def main():
     tokenizer = CharTokenizer()
     pad_token_id = getattr(tokenizer, "pad_token_id", 0)
 
-    fuser_path, god_path, emb_dims, d_model, z_dim = infer_teacher_arch_from_ckpt(args.p0_ckpt)
+    p0_ckpt_resolved = resolve_p0_teacher_ckpt_dir(args.p0_ckpt)
+    fuser_path, god_path, emb_dims, d_model, z_dim = infer_teacher_arch_from_ckpt(p0_ckpt_resolved)
+    teacher_sphere_scale = _infer_teacher_sphere_scale(p0_ckpt_resolved)
     print(
-        f"\n[Teacher Arch] routes={len(emb_dims)} emb_dims={emb_dims} "
-        f"d_model={d_model} z_dim={z_dim}"
+        f"\n[Teacher Arch] ckpt={p0_ckpt_resolved} | routes={len(emb_dims)} emb_dims={emb_dims} "
+        f"d_model={d_model} z_dim={z_dim} sphere_scale={teacher_sphere_scale}"
     )
 
     dataloader = build_dataloader(args, tokenizer, ds_config, expected_routes=len(emb_dims))
     dataloader = attach_chunk_download_router(dataloader, args.data_dir, args.download_cache_dir)
+    if args.download_only_prefetch:
+        dataloader = enable_download_only_prefetch(dataloader)
+    elif not args.prefetch:
+        dataloader = disable_chunk_prefetch(dataloader)
+
+    if args.total_steps <= 0:
+        eff_total_steps = max(
+            1,
+            int(math.ceil(max(getattr(dataloader, "total_samples", 0), 1) / float(args.batch_size)))
+            * args.epochs,
+        )
+    else:
+        eff_total_steps = args.total_steps
 
     # 1. Instantiate the Frozen Teacher Replicas (SensoryFuser + GodEncoder; NO WeakDecoder!)
     fuser = SensoryFuserCUDA(emb_dims, d_model).to(device)
-    god_encoder = GodEncoderCUDA(d_model, z_dim).to(device)
+    god_encoder = GodEncoderCUDA(d_model, z_dim, sphere_scale=teacher_sphere_scale).to(device)
 
-    print(f"\n[Teacher] Loading Frozen Phase 0 Teacher from {args.p0_ckpt} (Zero WeakDecoder CE)...")
+    print(f"\n[Teacher] Loading Frozen Phase 0 Teacher from {p0_ckpt_resolved} (Zero WeakDecoder CE)...")
     load_mlx_safetensors_into_torch(fuser, fuser_path)
     load_mlx_safetensors_into_torch(god_encoder, god_path)
     fuser.eval()
@@ -968,25 +1820,86 @@ def main():
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
-    checkpointer = Checkpointer(args.out_dir, prefix=args.ckpt_prefix)
-    checkpointer.register_model("student", student)
-    checkpointer.register_model("order_head", order_head)
-    checkpointer.register_model("next_clause_head", next_clause_head)
-    checkpointer.register_model("char_anchor_head", char_anchor_head)
-    checkpointer.register_dataloader("dataloader", dataloader)
-    checkpointer.register_args(args)
-
     global_step = 0
+    last_health: Dict[str, float] = {}
+
+    resume_dir = args.resume_from
+    if not resume_dir and args.auto_resume:
+        resume_dir = resolve_latest_phase1_v2_checkpoint(args.out_dir, args.ckpt_prefix)
+        if resume_dir:
+            print(f"[Auto-Resume] Found latest valid Phase 1 v2 checkpoint: {resume_dir}")
+
+    if resume_dir and os.path.isdir(resume_dir):
+        args.resume_from = resume_dir
+        print(f"[Resume] Loading Phase 1 v2 state from {resume_dir}...")
+        stu_pt = os.path.join(resume_dir, "student.pt")
+        stu_st1 = os.path.join(resume_dir, "phase1_charencoder.safetensors")
+        stu_st2 = os.path.join(resume_dir, "student.safetensors")
+        if os.path.isfile(stu_pt):
+            student.load_state_dict(
+                torch.load(stu_pt, map_location=device, weights_only=True), strict=False
+            )
+        elif os.path.isfile(stu_st1):
+            load_mlx_safetensors_into_torch(student, stu_st1)
+        elif os.path.isfile(stu_st2):
+            load_mlx_safetensors_into_torch(student, stu_st2)
+
+        oh_path = os.path.join(resume_dir, "order_head.pt")
+        if os.path.isfile(oh_path):
+            order_head.load_state_dict(torch.load(oh_path, map_location=device, weights_only=True))
+        nh_path = os.path.join(resume_dir, "next_clause_head.pt")
+        if os.path.isfile(nh_path):
+            next_clause_head.load_state_dict(
+                torch.load(nh_path, map_location=device, weights_only=True)
+            )
+        ca_path = os.path.join(resume_dir, "char_anchor_head.pt")
+        if os.path.isfile(ca_path):
+            char_anchor_head.load_state_dict(
+                torch.load(ca_path, map_location=device, weights_only=True)
+            )
+        opt_path = os.path.join(resume_dir, "optimizer.pt")
+        if os.path.isfile(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=False))
+
+        dl_path = os.path.join(resume_dir, "dataloader.json")
+        if os.path.isfile(dl_path):
+            with open(dl_path, "r", encoding="utf-8") as f:
+                dl_state = json.load(f)
+            dataloader.load_state_dict(dl_state)
+            global_step = int(dl_state.get("global_step", 0))
+
+        stats_path = os.path.join(resume_dir, "char_subspace_stats.pt")
+        if os.path.isfile(stats_path):
+            st_meta = torch.load(stats_path, map_location="cpu", weights_only=False)
+            if isinstance(st_meta, dict):
+                if isinstance(st_meta.get("health_metrics"), dict):
+                    last_health = {k: float(v) for k, v in st_meta["health_metrics"].items()}
+                if global_step == 0 and st_meta.get("global_step") is not None:
+                    global_step = int(st_meta["global_step"])
+
     print(f"\n========================================================")
     print(f"🚀 Phase 1 v2 Dual-Head Masked Engine Ignited! Target Epochs: {args.epochs}")
-    print(f"⚙️  Batch: {args.batch_size} | d_sub: {args.student_d_sub} | Peak LR: {args.lr}")
+    print(
+        f"⚙️  Batch: {args.batch_size} | d_sub: {args.student_d_sub} | Peak LR: {args.lr} | "
+        f"Total Steps: {eff_total_steps}"
+    )
     print(f"========================================================\n")
 
+    autocast_dev = "cuda" if device.type == "cuda" else "cpu"
+
+    # Bug Fix (Task 070):
+    # 1) Problem: The training loop previously called `compute_phase1_v2_distill_loss(z_god=...)`
+    #    unpacking 3 values, invoked non-existent `student.update_subspace_basis()` /
+    #    `student.embed_tokens()`, and read stale metric keys (`metrics['loss']`, etc.).
+    # 2) Method: Align all arguments (`z_target_truth=z_god`, `batch_embs=batch_embs`,
+    #    `contiguous_pairs=...`, `update_ema=True`), unpack `(loss, metrics)`, and record both
+    #    canonical `char_encoder_v2_loss` health keys and summary aliases in `last_health`.
+    # 3) Caveats: `char_subspace_stats.pt['health_metrics']` exposes both canonical and alias keys
+    #    so Notebook summaries and diagnostic scripts remain 100% compatible.
     try:
         for epoch in range(dataloader.current_epoch, args.epochs):
             for token_inputs, batch_embs, attention_mask in dataloader:
                 global_step += 1
-                checkpointer.set_step(global_step)
                 if len(batch_embs) != len(emb_dims):
                     if args.strict_route_check or len(batch_embs) < len(emb_dims):
                         raise ValueError(
@@ -994,7 +1907,9 @@ def main():
                         )
                     batch_embs = batch_embs[: len(emb_dims)]
 
-                lr = custom_lr_schedule(global_step, args.lr, args.warmup_steps)
+                lr = cosine_warmup_lr_schedule(
+                    global_step, args.lr, args.warmup_steps, eff_total_steps
+                )
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
@@ -1005,6 +1920,9 @@ def main():
                     else None
                 )
                 batch_embs = [emb.to(device, non_blocking=True).float() for emb in batch_embs]
+                contig_pairs = _build_batch_contiguous_pairs(
+                    dataloader, int(token_inputs.size(0)), device
+                )
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -1012,22 +1930,26 @@ def main():
                     e_fused = fuser(batch_embs)
                     z_god = god_encoder(e_fused)
 
-                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    loss, metrics, aux = compute_phase1_v2_distill_loss(
+                with torch.autocast(device_type=autocast_dev, dtype=amp_dtype, enabled=use_amp):
+                    loss, metrics = compute_phase1_v2_distill_loss(
                         student=student,
                         token_inputs=token_inputs,
                         attention_mask=attention_mask,
-                        z_god=z_god,
+                        z_target_truth=z_god,
+                        batch_embs=batch_embs,
                         order_head=order_head,
                         next_clause_head=next_clause_head,
                         char_anchor_head=char_anchor_head,
+                        contiguous_pairs=contig_pairs,
+                        order_margin=args.order_margin,
                         w_distill=args.w_distill,
                         w_rel=args.w_rel,
                         w_order=args.w_order,
                         w_next=args.w_next,
                         w_char_iso=args.w_char_iso,
                         w_char_id=args.w_char_id,
-                        order_margin=args.order_margin,
+                        update_ema=True,
+                        ema_momentum=args.ema_momentum,
                     )
 
                 scaler.scale(loss).backward()
@@ -1036,26 +1958,16 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
 
-                with torch.no_grad():
-                    student.update_subspace_basis()
-                    z_student = aux["z_student"]
-                    pad_mask = token_inputs != student.pad_token_id
-                    student.update_char_token_mean(
-                        student.embed_tokens(token_inputs),
-                        mask=pad_mask,
-                        momentum=args.ema_momentum,
-                    )
-
-                if global_step % 20 == 0:
+                if global_step % args.log_steps == 0:
                     print(
                         f"Epoch {epoch + 1} | Step {global_step} | LR {lr:.2e} | "
-                        f"Loss {metrics['loss']:.4f} "
-                        f"(Distill {metrics['loss_distill']:.3f} | "
-                        f"Rel {metrics['loss_rel']:.3f} | "
-                        f"Order {metrics['loss_order']:.3f} [acc={metrics['order_acc']:.2f}] | "
-                        f"Next {metrics['loss_next']:.3f} | "
-                        f"CharIso {metrics['loss_char_iso']:.3f} | "
-                        f"CharID {metrics['loss_char_id']:.3f} [top1={metrics['char_top1_acc']:.2f}])"
+                        f"Loss {float(metrics['loss_total']):.4f} "
+                        f"(Distill {float(metrics['loss_distill']):.3f} [cos={float(metrics['z_god_cos']):.3f}] | "
+                        f"Rel {float(metrics['loss_rel']):.3f} | "
+                        f"Order {float(metrics['loss_order']):.3f} [acc={float(metrics['order_discrim_acc']):.2f}] | "
+                        f"Next {float(metrics['loss_next']):.3f} | "
+                        f"CharIso {float(metrics['loss_char_iso']):.3f} [PC1={float(metrics['subspace_pc1_var_ratio']):.3f}] | "
+                        f"CharID {float(metrics['loss_char_id']):.3f} [top1={float(metrics['subspace_char_top1_acc']):.2f}])"
                     )
 
                 if global_step % args.eval_steps == 0:
@@ -1063,50 +1975,100 @@ def main():
                         student=student,
                         token_inputs=token_inputs,
                         attention_mask=attention_mask,
-                        z_god=z_god,
+                        z_target_truth=z_god,
+                        batch_embs=batch_embs,
                         order_head=order_head,
                         char_anchor_head=char_anchor_head,
                     )
+                    with torch.no_grad():
+                        ortho_dev = float(student.orthogonal_subspace_loss().sqrt().item())
+                    last_health = dict(eval_metrics)
+                    last_health["mean_distill_cos"] = float(eval_metrics["z_god_cos"])
+                    last_health["order_pair_acc"] = float(eval_metrics["order_discrim_acc"])
+                    last_health["char_subspace_ortho_dev"] = ortho_dev
+                    last_health["char_anchor_top1_acc"] = float(
+                        eval_metrics["subspace_char_top1_acc"]
+                    )
                     print(
                         f"  🩺 [Health @ Step {global_step}] "
-                        f"DistillCos={eval_metrics['mean_distill_cos']:.3f} | "
-                        f"Spearman={eval_metrics['relational_spearman']:.3f} | "
-                        f"OrderAcc={eval_metrics['order_pair_acc']:.3f} | "
-                        f"CharIsoDev={eval_metrics['char_subspace_ortho_dev']:.4f} | "
-                        f"AnchorTop1={eval_metrics['char_anchor_top1_acc']:.3f}"
+                        f"DistillCos={last_health['mean_distill_cos']:.3f} | "
+                        f"Spearman={last_health['relational_spearman']:.3f} | "
+                        f"OrderAcc={last_health['order_pair_acc']:.3f} | "
+                        f"PC1={last_health['subspace_pc1_var_ratio']:.4f} | "
+                        f"PR={last_health['subspace_participation_ratio']:.1f} | "
+                        f"CharIsoDev={last_health['char_subspace_ortho_dev']:.4f} | "
+                        f"AnchorTop1={last_health['char_anchor_top1_acc']:.3f}"
                     )
 
                 if global_step % args.save_steps == 0:
-                    checkpointer.save(step=global_step)
-                    save_char_subspace_stats(student, args.out_dir, args.ckpt_prefix, global_step)
-                    save_torch_optimizer_state(optimizer, args.out_dir, args.ckpt_prefix, global_step)
+                    saved_dir = save_phase1_v2_checkpoint(
+                        out_dir=args.out_dir,
+                        prefix=args.ckpt_prefix,
+                        step=global_step,
+                        student=student,
+                        order_head=order_head,
+                        next_clause_head=next_clause_head,
+                        char_anchor_head=char_anchor_head,
+                        optimizer=optimizer,
+                        dataloader=dataloader,
+                        args=args,
+                        health_metrics=last_health,
+                    )
+                    print(f"[Checkpoint] Saved Phase 1 v2 artifacts to {saved_dir}")
                     if args.hf_ckpt_repo:
-                        ckpt_dir = expected_checkpoint_dir(args.out_dir, args.ckpt_prefix, global_step)
-                        mirror_checkpoint_to_hf_hub(ckpt_dir, args.hf_ckpt_repo)
+                        mirror_checkpoint_to_hf_hub(saved_dir, args.hf_ckpt_repo)
+                    if args.keep_last_ckpts > 0:
+                        pruned = prune_old_phase1_v2_checkpoints(
+                            args.out_dir, args.ckpt_prefix, args.keep_last_ckpts
+                        )
+                        if pruned:
+                            print(
+                                f"[Checkpoint] Pruned {len(pruned)} old checkpoint(s): "
+                                f"{[os.path.basename(p) for p in pruned]}"
+                            )
 
-        checkpointer.save(step=global_step)
-        save_char_subspace_stats(student, args.out_dir, args.ckpt_prefix, global_step)
-        save_torch_optimizer_state(optimizer, args.out_dir, args.ckpt_prefix, global_step)
+        final_dir = save_phase1_v2_checkpoint(
+            out_dir=args.out_dir,
+            prefix=args.ckpt_prefix,
+            step=global_step,
+            student=student,
+            order_head=order_head,
+            next_clause_head=next_clause_head,
+            char_anchor_head=char_anchor_head,
+            optimizer=optimizer,
+            dataloader=dataloader,
+            args=args,
+            health_metrics=last_health,
+        )
         if args.hf_ckpt_repo:
-            ckpt_dir = expected_checkpoint_dir(args.out_dir, args.ckpt_prefix, global_step)
-            mirror_checkpoint_to_hf_hub(ckpt_dir, args.hf_ckpt_repo)
-        print("🎉 Phase 1 v2 Distillation Training Complete!")
+            mirror_checkpoint_to_hf_hub(final_dir, args.hf_ckpt_repo)
+        if args.keep_last_ckpts > 0:
+            prune_old_phase1_v2_checkpoints(args.out_dir, args.ckpt_prefix, args.keep_last_ckpts)
+        print(f"🎉 Phase 1 v2 Distillation Training Complete! Final checkpoint: {final_dir}")
 
     except KeyboardInterrupt:
         print(f"\n[Interrupt] Saving emergency Phase 1 v2 checkpoint at step {global_step}...")
-        checkpointer.save(step=global_step, is_emergency=True)
-        save_char_subspace_stats(student, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True)
-        save_torch_optimizer_state(optimizer, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True)
+        emerg_dir = save_phase1_v2_checkpoint(
+            out_dir=args.out_dir,
+            prefix=args.ckpt_prefix,
+            step=global_step,
+            student=student,
+            order_head=order_head,
+            next_clause_head=next_clause_head,
+            char_anchor_head=char_anchor_head,
+            optimizer=optimizer,
+            dataloader=dataloader,
+            args=args,
+            health_metrics=last_health,
+            is_emergency=True,
+        )
         if args.hf_ckpt_repo:
-            emerg_dir = expected_checkpoint_dir(
-                args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
-            )
             mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
-    # Bug Fix (Task 069):
+    # Bug Fix (Task 069 & Task 070):
     # 1) Problem: Runtime exceptions after hours of distillation exited without saving an emergency
-    #    checkpoint, losing all progress since the last `--save_steps 10000` boundary.
-    # 2) Method: Catch `Exception as crash_err` when `global_step > 0`, verify Drive mount, save
-    #    emergency student/subspace/optimizer state (plus optional HF mirror), and re-raise `crash_err`.
+    #    checkpoint (or previously relied on Checkpointer which called sys.exit(0)).
+    # 2) Method: Catch `Exception as crash_err` when `global_step > 0`, save `is_emergency=True`
+    #    via `save_phase1_v2_checkpoint` (plus optional HF mirror), and re-raise `crash_err`.
     # 3) Caveats: Always re-raises the original exception so failures remain visible.
     except Exception as crash_err:
         if global_step > 0:
@@ -1115,22 +2077,32 @@ def main():
                 f"💾 Saving emergency Phase 1 v2 checkpoint before exiting..."
             )
             try:
-                assert_colab_drive_mounted(args.out_dir)
-                checkpointer.save(step=global_step, is_emergency=True)
-                save_char_subspace_stats(
-                    student, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
+                emerg_dir = save_phase1_v2_checkpoint(
+                    out_dir=args.out_dir,
+                    prefix=args.ckpt_prefix,
+                    step=global_step,
+                    student=student,
+                    order_head=order_head,
+                    next_clause_head=next_clause_head,
+                    char_anchor_head=char_anchor_head,
+                    optimizer=optimizer,
+                    dataloader=dataloader,
+                    args=args,
+                    health_metrics=last_health,
+                    is_emergency=True,
                 )
-                save_torch_optimizer_state(
-                    optimizer, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
-                )
+                print(f"[Crash-Guard] ✅ Saved emergency checkpoint to {emerg_dir}")
                 if args.hf_ckpt_repo:
-                    emerg_dir = expected_checkpoint_dir(
-                        args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
-                    )
                     mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
             except Exception as save_err:
                 print(f"[Crash-Guard] ❌ Failed to save emergency checkpoint: {save_err}")
         raise
+    finally:
+        if hasattr(dataloader, "close"):
+            try:
+                dataloader.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
