@@ -10,7 +10,11 @@ import glob
 import re
 import queue
 import shutil
+import struct
 import threading
+import time
+import zipfile
+import zlib
 from typing import List, Tuple, Dict, Any, Optional
 
 
@@ -118,10 +122,424 @@ def _is_temp_or_incomplete_npz(path: str) -> bool:
         or norm.startswith("._____temp/")
         or "/.cache/" in norm
         or norm.startswith(".cache/")
+        or "/_npz_repair_staging/" in norm
+        or norm.startswith("_npz_repair_staging/")
         or base_fn.endswith((".incomplete", ".tmp", ".partial"))
         or ".tmp." in base_fn
+        or ".repair_" in base_fn
         or not base_fn.endswith(".npz")
     )
+
+
+# Bug Fix (Task 069):
+# 1) Problem: Interrupted Google Drive FUSE flushes or partial ModelScope downloads leave `.npz`
+#    files with `size > 0` (e.g. hundreds of MB) whose EOF ZIP central directory or `.npy` stream
+#    is truncated, crashing training mid-epoch (e.g. Step 2260) with `BadZipFile` / `ValueError`
+#    because previous checks only verified `os.path.getsize(p) > 0`.
+# 2) Method: Implement lightweight (< 5 MB RAM) `validate_npz_archive` & `is_valid_npz_archive`
+#    inspecting the ZIP central directory, member byte bounds, `.npy` magic/header 2D shape &
+#    uncompressed payload size, and a 16-byte stream decompression probe; plus Colab mount guard
+#    `_assert_drive_mounted_if_colab_path` and `repair_gdrive_chunk_from_remote` (ModelScope ->
+#    Hugging Face fallback, `.repair_*.tmp` validation, and `os.replace` atomic write-back).
+# 3) Caveats: Healthy persistent files in `gdrive_dir` or `local_npz_dir` must NEVER be deleted
+#    or overwritten; only proven missing/corrupt `gdrive` chunks are atomically replaced after
+#    both the mount guard and `validate_npz_archive(tmp_gdrive)` succeed.
+def validate_npz_archive(
+    npz_path: str, expected_key: str = "features"
+) -> Tuple[Tuple[int, ...], str]:
+    """
+    Validates a `.npz` archive in < 5 MB RAM without decompressing the full multi-GB matrix:
+    1. File exists and `file_size > 0`.
+    2. Valid ZIP central directory containing `{expected_key}.npy` within `file_size`.
+    3. Valid `.npy` magic & 2D numeric header `(rows > 0, cols > 0)` whose uncompressed
+       `zinfo.file_size` exceeds `rows * cols * itemsize`.
+    4. Decompresses up to 16 payload bytes to catch local-header / deflate stream corruption.
+    Returns `((rows, cols), dtype_str)`.
+    """
+    if not npz_path or not os.path.isfile(npz_path):
+        raise FileNotFoundError(f"NPZ archive not found: {npz_path}")
+
+    file_size = os.path.getsize(npz_path)
+    if file_size <= 0:
+        raise ValueError(f"Empty NPZ archive (0 bytes): {npz_path}")
+
+    member_name = f"{expected_key}.npy"
+    from numpy.lib import format as _np_format
+
+    with zipfile.ZipFile(npz_path, "r") as zf:
+        if member_name not in zf.namelist():
+            raise KeyError(f"Missing {member_name!r} in NPZ archive: {npz_path}")
+
+        zinfo = zf.getinfo(member_name)
+        if zinfo.header_offset < 0 or (zinfo.header_offset + zinfo.compress_size > file_size):
+            raise zipfile.BadZipFile(
+                f"Truncated ZIP member {member_name!r} in {npz_path}: "
+                f"header_offset={zinfo.header_offset}, compress_size={zinfo.compress_size}, "
+                f"file_size={file_size}"
+            )
+
+        try:
+            with zf.open(member_name, "r") as fp:
+                major, minor = _np_format.read_magic(fp)
+                if (major, minor) == (1, 0):
+                    shape, _fortran_order, dtype = _np_format.read_array_header_1_0(fp)
+                elif (major, minor) == (2, 0):
+                    shape, _fortran_order, dtype = _np_format.read_array_header_2_0(fp)
+                elif hasattr(_np_format, "_read_array_header"):
+                    shape, _fortran_order, dtype = _np_format._read_array_header(
+                        fp, version=(major, minor)
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported .npy format version {(major, minor)} in {npz_path}"
+                    )
+
+                np_dtype = np.dtype(dtype)
+                if np_dtype.hasobject or int(np_dtype.itemsize) <= 0:
+                    raise ValueError(f"Invalid .npy dtype {np_dtype} in {npz_path}")
+
+                if (
+                    not isinstance(shape, tuple)
+                    or len(shape) != 2
+                    or int(shape[0]) <= 0
+                    or int(shape[1]) <= 0
+                ):
+                    raise ValueError(
+                        f"Expected non-empty 2D embedding array in {npz_path}, got shape={shape!r}"
+                    )
+
+                expected_payload_bytes = (
+                    int(shape[0]) * int(shape[1]) * int(np_dtype.itemsize)
+                )
+                if int(zinfo.file_size) <= expected_payload_bytes:
+                    raise ValueError(
+                        f"Truncated .npy uncompressed size in {npz_path}: "
+                        f"zinfo.file_size={zinfo.file_size} <= payload={expected_payload_bytes}"
+                    )
+
+                probe = fp.read(min(16, expected_payload_bytes))
+                if len(probe) <= 0:
+                    raise EOFError(
+                        f"Empty .npy payload stream for {member_name!r} in {npz_path}"
+                    )
+        except (zlib.error, struct.error) as stream_err:
+            raise zipfile.BadZipFile(
+                f"Corrupt ZIP/NPY stream in {npz_path}: {stream_err}"
+            ) from stream_err
+
+    return ((int(shape[0]), int(shape[1])), str(np_dtype))
+
+
+def is_valid_npz_archive(npz_path: str, expected_key: str = "features") -> bool:
+    """Returns True iff `npz_path` passes `validate_npz_archive`, False on any corruption/missing error."""
+    try:
+        validate_npz_archive(npz_path, expected_key=expected_key)
+        return True
+    except (
+        FileNotFoundError,
+        zipfile.BadZipFile,
+        zlib.error,
+        struct.error,
+        OSError,
+        ValueError,
+        KeyError,
+        EOFError,
+    ):
+        return False
+
+
+def _assert_drive_mounted_if_colab_path(
+    target_path: str,
+    mount_root: str = "/content/drive",
+    mounts_file: str = "/proc/mounts",
+) -> None:
+    """
+    Colab Mount Guard (#064): If `target_path` (or its symlink-resolved target) is `/content/drive`
+    or under `/content/drive/`, verifies `/content/drive` is actively mounted before any write.
+    """
+    if not target_path or not mount_root:
+        return
+
+    norm_root = os.path.abspath(mount_root).rstrip("/") or "/"
+    real_root = os.path.realpath(mount_root).rstrip("/") or "/"
+    root_variants = {norm_root, real_root}
+
+    abs_target = os.path.abspath(target_path)
+    candidates = [abs_target, os.path.realpath(abs_target)]
+    cur = abs_target
+    suffix_parts: List[str] = []
+    while cur and cur != os.path.dirname(cur):
+        if os.path.islink(cur):
+            try:
+                raw_link = os.readlink(cur)
+                link_abs = (
+                    os.path.abspath(raw_link)
+                    if os.path.isabs(raw_link)
+                    else os.path.abspath(os.path.join(os.path.dirname(cur), raw_link))
+                )
+                joined_abs = (
+                    os.path.abspath(os.path.join(link_abs, *reversed(suffix_parts)))
+                    if suffix_parts
+                    else link_abs
+                )
+                candidates.extend([link_abs, os.path.realpath(cur), joined_abs])
+            except OSError:
+                pass
+        suffix_parts.append(os.path.basename(cur))
+        cur = os.path.dirname(cur)
+
+    matched = None
+    for cand in candidates:
+        cand_norm = cand.rstrip("/") or "/"
+        for r in root_variants:
+            if cand_norm == r or cand_norm.startswith(r + "/"):
+                matched = cand
+                break
+        if matched:
+            break
+
+    if not matched:
+        return
+
+    is_mounted = False
+    try:
+        if os.path.exists(mount_root) and os.path.ismount(mount_root):
+            is_mounted = True
+    except OSError:
+        pass
+
+    if not is_mounted and mounts_file and os.path.isfile(mounts_file):
+        try:
+            with open(mounts_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    mp = parts[1].replace("\\040", " ").rstrip("/") or "/"
+                    for r in root_variants:
+                        if mp == r or mp.startswith(r + "/"):
+                            is_mounted = True
+                            break
+                    if is_mounted:
+                        break
+        except OSError:
+            pass
+
+    if not is_mounted:
+        raise RuntimeError(
+            f"❌ [Colab Mount Guard] 致命安全拦截：修复目标 {target_path!r} (解析路径: {matched!r}) "
+            f"位于 {mount_root!r}，但检测到 Google Drive 当前未挂载！拒绝向本地容器盘写入伪云盘文件。"
+        )
+
+
+def _find_broken_npz_in_gdrive(gdrive_dir: str, cand_name: str) -> Optional[str]:
+    """
+    Searches `gdrive_dir` for an existing corrupt/0-byte `.npz` matching `cand_name`
+    so in-place repair overwrites the exact broken nested file rather than creating duplicates.
+    Never returns a healthy `.npz` file.
+    """
+    abs_gdrive = os.path.abspath(gdrive_dir)
+    direct_cand = os.path.abspath(os.path.join(abs_gdrive, cand_name))
+    if os.path.isfile(direct_cand) and not is_valid_npz_archive(direct_cand):
+        return direct_cand
+
+    cand_norm = cand_name.replace("\\", "/").lstrip("/")
+    c_parts = cand_norm.split("/")
+    c_tail2 = f"{c_parts[-2]}/{c_parts[-1]}" if len(c_parts) >= 2 else cand_norm
+    c_base = c_parts[-1]
+
+    matches: List[str] = []
+    for f in glob.glob(os.path.join(abs_gdrive, "**", c_base), recursive=True):
+        if _is_temp_or_incomplete_npz(f) or not os.path.isfile(f):
+            continue
+        abs_f = os.path.abspath(f)
+        rel_norm = os.path.relpath(abs_f, abs_gdrive).replace("\\", "/")
+        r_parts = rel_norm.split("/")
+        r_tail2 = f"{r_parts[-2]}/{r_parts[-1]}" if len(r_parts) >= 2 else rel_norm
+        if rel_norm == cand_norm or r_tail2 == c_tail2 or r_parts[-1] == c_base:
+            if not is_valid_npz_archive(abs_f):
+                matches.append(abs_f)
+
+    if not matches:
+        return None
+    matches.sort(key=lambda p: (len(p), p))
+    return matches[0]
+
+
+def repair_gdrive_chunk_from_remote(
+    gdrive_dir: str,
+    cand_name: str,
+    cache_dir: Optional[str] = None,
+    ms_repo_id: Optional[str] = None,
+    hf_repo_id: Optional[str] = None,
+    file_map: Optional[Dict[str, str]] = None,
+    broken_gdrive_path: Optional[str] = None,
+) -> str:
+    """
+    Self-heals a missing or corrupted `.npz` chunk in Google Drive mode:
+    1. Verifies `/content/drive` mount status if `gdrive_dir` points to Colab Drive.
+    2. Downloads `cand_name` from ModelScope (`ms_repo_id` or `catclever/emb_npy`) with
+       automatic fallback to Hugging Face (`hf_repo_id` or `drunkencat/emb_npy`), validating
+       the downloaded file with `validate_npz_archive`.
+    3. Atomically writes the verified chunk back to `gdrive_dir` (in-place at `broken_gdrive_path`
+       if inside `gdrive_dir`, via `<dest>.repair_<pid>_<tid>.tmp` + `os.replace`) without ever
+       touching healthy persistent files.
+    4. Stages a verified local NVMe copy into `cache_dir` (when `cache_dir != gdrive_dir`) and returns it.
+    """
+    if not gdrive_dir:
+        raise ValueError("gdrive_dir must be provided for repair_gdrive_chunk_from_remote")
+
+    _assert_drive_mounted_if_colab_path(gdrive_dir)
+    if broken_gdrive_path:
+        _assert_drive_mounted_if_colab_path(broken_gdrive_path)
+
+    eff_ms_repo = (ms_repo_id or "catclever/emb_npy").strip()
+    eff_hf_repo = (hf_repo_id or "drunkencat/emb_npy").strip()
+
+    staging_root = os.path.join(cache_dir or gdrive_dir, "_npz_repair_staging")
+    repair_work_dir = os.path.join(staging_root, str(threading.get_ident()))
+    os.makedirs(repair_work_dir, exist_ok=True)
+
+    print(
+        f"[DataLoader] 🛠️ 检测到 Google Drive 分块缺失或损坏 ({cand_name})，"
+        f"正在从远端源自动拉取修复并原子回写云盘..."
+    )
+
+    dl_path: Optional[str] = None
+    ms_err: Optional[Exception] = None
+    hf_err: Optional[Exception] = None
+
+    try:
+        try:
+            from modelscope.hub.file_download import dataset_file_download
+
+            for retry_idx in range(3):
+                try:
+                    cand_dl = dataset_file_download(
+                        eff_ms_repo, cand_name, cache_dir=repair_work_dir
+                    )
+                    validate_npz_archive(cand_dl)
+                    dl_path = cand_dl
+                    break
+                except Exception as e:
+                    ms_err = e
+                    if retry_idx < 2:
+                        time.sleep(0.2)
+        except Exception as e:
+            ms_err = e
+
+        if dl_path is None:
+            print(
+                f"[DataLoader] ⚠️ ModelScope 修复拉取未成功 ({ms_err})，"
+                f"自动切换 Hugging Face 备用源 ({eff_hf_repo})..."
+            )
+            for retry_idx in range(2):
+                try:
+                    cand_dl = _download_hf_dataset_file(
+                        eff_hf_repo, cand_name, repair_work_dir
+                    )
+                    validate_npz_archive(cand_dl)
+                    dl_path = cand_dl
+                    break
+                except Exception as e:
+                    hf_err = e
+                    if retry_idx < 1:
+                        time.sleep(0.2)
+
+        if dl_path is None:
+            raise RuntimeError(
+                f"[DataLoader] ❌ 远端分块自愈失败 ({cand_name}): "
+                f"ModelScope ({eff_ms_repo}) error={ms_err!r}; "
+                f"Hugging Face ({eff_hf_repo}) error={hf_err!r}"
+            )
+
+        real_dl = (
+            os.path.realpath(dl_path)
+            if os.path.islink(dl_path)
+            else os.path.abspath(dl_path)
+        )
+        validate_npz_archive(real_dl)
+
+        abs_gdrive = os.path.abspath(gdrive_dir)
+        gdrive_prefix = abs_gdrive.rstrip(os.sep) + os.sep
+        dest_gdrive: Optional[str] = None
+        if broken_gdrive_path:
+            abs_broken = os.path.abspath(broken_gdrive_path)
+            if abs_broken.startswith(gdrive_prefix):
+                dest_gdrive = abs_broken
+        if dest_gdrive is None:
+            dest_gdrive = _find_broken_npz_in_gdrive(abs_gdrive, cand_name)
+        if dest_gdrive is None:
+            dest_gdrive = os.path.abspath(os.path.join(abs_gdrive, cand_name))
+
+        _assert_drive_mounted_if_colab_path(dest_gdrive)
+
+        # Never touch dest_gdrive if another worker already healed it into a valid archive
+        if not is_valid_npz_archive(dest_gdrive):
+            os.makedirs(os.path.dirname(dest_gdrive), exist_ok=True)
+            tmp_gdrive = (
+                f"{dest_gdrive}.repair_{os.getpid()}_{threading.get_ident()}.tmp"
+            )
+            try:
+                shutil.copy2(real_dl, tmp_gdrive)
+                validate_npz_archive(tmp_gdrive)
+                os.replace(tmp_gdrive, dest_gdrive)
+            finally:
+                if os.path.exists(tmp_gdrive):
+                    try:
+                        os.remove(tmp_gdrive)
+                    except OSError:
+                        pass
+
+        if isinstance(file_map, dict):
+            rel_norm = os.path.relpath(dest_gdrive, abs_gdrive).replace("\\", "/")
+            r_parts = rel_norm.split("/")
+            r_tail2 = f"{r_parts[-2]}/{r_parts[-1]}" if len(r_parts) >= 2 else rel_norm
+            r_base = r_parts[-1]
+            cand_norm = cand_name.replace("\\", "/").lstrip("/")
+            file_map[rel_norm] = dest_gdrive
+            file_map[cand_norm] = dest_gdrive
+            file_map[r_tail2] = dest_gdrive
+            file_map[r_base] = dest_gdrive
+
+        if cache_dir and os.path.abspath(cache_dir) != abs_gdrive:
+            staged_path = os.path.abspath(os.path.join(cache_dir, cand_name))
+            os.makedirs(os.path.dirname(staged_path), exist_ok=True)
+            tmp_staged = (
+                f"{staged_path}.repair_{os.getpid()}_{threading.get_ident()}.tmp"
+            )
+            work_prefix = os.path.abspath(repair_work_dir).rstrip(os.sep) + os.sep
+            try:
+                if os.path.abspath(real_dl).startswith(work_prefix):
+                    try:
+                        os.replace(real_dl, tmp_staged)
+                    except OSError:
+                        shutil.copy2(real_dl, tmp_staged)
+                else:
+                    shutil.copy2(real_dl, tmp_staged)
+                validate_npz_archive(tmp_staged)
+                os.replace(tmp_staged, staged_path)
+            finally:
+                if os.path.exists(tmp_staged):
+                    try:
+                        os.remove(tmp_staged)
+                    except OSError:
+                        pass
+
+            print(
+                f"[DataLoader] ✅ 分块自愈完成：已修复云盘持久文件 ({dest_gdrive}) "
+                f"并就绪本地暂存 ({staged_path})"
+            )
+            return staged_path
+
+        print(f"[DataLoader] ✅ 分块自愈完成：已修复云盘持久文件 ({dest_gdrive})")
+        return dest_gdrive
+    finally:
+        shutil.rmtree(repair_work_dir, ignore_errors=True)
+        try:
+            os.rmdir(staging_root)
+        except OSError:
+            pass
 
 
 def _index_npz_directory(
@@ -242,7 +660,7 @@ class Phase1_MultiEmbDataLoader:
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
         self.shuffle = shuffle
-        self.seed = seed if seed is not None else int(__import__("time").time())
+        self.seed = seed if seed is not None else int(time.time())
         self.tokenizer = tokenizer
         self.embedding_only = bool(embedding_only)
         
@@ -371,7 +789,7 @@ class Phase1_ChunkedNpzDataLoader:
     3. 纯向量流式模式 (`embedding_only=True`)：免加载本地 Parquet 语料与逐批分词，直接由远端/本地 `.npz` 分块边界推导总样本数并流式产出多师向量。
     4. 统一多数据源架构：
        - `ms` (默认): ModelScope 零配置按需流式串流 (catclever/emb_npy)
-       - `gdrive`: Google Drive 持久目录挂载源，后台异步向本地 NVMe 临时目录 (`cache_dir`) 暂存 (Staging)，消费完立即清除本地暂存，严禁误删云盘原始文件
+       - `gdrive`: Google Drive 持久目录挂载源，后台异步向本地 NVMe 临时目录 (`cache_dir`) 暂存 (Staging)，消费完立即清除本地暂存，严禁误删云盘原始文件；支持残损/缺失单块自动远端拉取与原子自愈回写
        - `hf`: Hugging Face Hub 按需流式串流 (drunkencat/emb_npy)
        - `local`: 本地磁盘直接读取，不走临时暂存复制
     """
@@ -394,13 +812,14 @@ class Phase1_ChunkedNpzDataLoader:
                  embedding_only: bool = False,
                  hf_repo_id: str = None,
                  data_source: str = "ms",
-                 gdrive_dir: Optional[str] = None):
+                 gdrive_dir: Optional[str] = None,
+                 allow_gdrive_remote_repair: bool = True):
         
         self.backend = backend
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
         self.shuffle = shuffle
-        self.seed = seed if seed is not None else int(__import__("time").time())
+        self.seed = seed if seed is not None else int(time.time())
         self.models = models
         self.chunk_patterns = chunk_patterns or {}
         self.tokenizer = tokenizer
@@ -409,6 +828,7 @@ class Phase1_ChunkedNpzDataLoader:
         self.embedding_only = bool(embedding_only)
         self.npz_dir = local_npz_dir
         self.gdrive_dir = gdrive_dir
+        self.allow_gdrive_remote_repair = bool(allow_gdrive_remote_repair)
         self._gdrive_file_map: Dict[str, str] = {}
         self._local_file_map: Dict[str, str] = {}
 
@@ -429,6 +849,8 @@ class Phase1_ChunkedNpzDataLoader:
 
         self.ms_repo_id = ms_repo_id or ("catclever/emb_npy" if self.data_source == "ms" else None)
         self.hf_repo_id = hf_repo_id or ("drunkencat/emb_npy" if self.data_source == "hf" else None)
+        self._fallback_ms_repo_id = (ms_repo_id or "catclever/emb_npy").strip()
+        self._fallback_hf_repo_id = (hf_repo_id or "drunkencat/emb_npy").strip()
         
         # 3. 提取对应的全体文本数据 (embedding_only=True 时完全免加载 Parquet)
         if self.embedding_only:
@@ -555,7 +977,36 @@ class Phase1_ChunkedNpzDataLoader:
             
             if self._per_model_bounds:
                 common_starts = set.intersection(*[set(d.keys()) for d in self._per_model_bounds.values()])
-                for s in sorted(common_starts):
+                # Bug Fix (Task 069):
+                # 1) Problem: If a single teacher file for a 500k chunk on Google Drive was 0 bytes or
+                #    missing while the other 4 teachers existed, `set.intersection` silently dropped
+                #    all 500k samples from the epoch instead of repairing the missing teacher file.
+                # 2) Method: When `data_source == "gdrive"` and `allow_gdrive_remote_repair` is enabled,
+                #    compute `union_starts`, infer `end` from sibling teachers for any missing start `s`,
+                #    populate `self._per_model_bounds[m][s]`, and include `s` in `self.chunk_bounds`.
+                # 3) Caveats: Only heals macro-chunks already present in at least one teacher on Drive
+                #    (never fabricates ghost bounds from `._____temp` files, which are filtered above).
+                if self.data_source == "gdrive" and self.allow_gdrive_remote_repair:
+                    union_starts = set.union(*[set(d.keys()) for d in self._per_model_bounds.values()])
+                    missing_starts = sorted(union_starts - common_starts)
+                    for s in missing_starts:
+                        inferred_end = min(
+                            d[s] for d in self._per_model_bounds.values() if s in d
+                        )
+                        missing_models = [
+                            m for m in self.models if s not in self._per_model_bounds[m]
+                        ]
+                        for m in missing_models:
+                            self._per_model_bounds[m][s] = inferred_end
+                        print(
+                            f"[DataLoader] ⚠️ 云盘宏分块 start={s} 缺失/0字节教师路由 {missing_models}，"
+                            f"已自动纳入在线远端自愈队列 ({s}~{inferred_end})！"
+                        )
+                    effective_starts = union_starts
+                else:
+                    effective_starts = common_starts
+
+                for s in sorted(effective_starts):
                     min_end = min(self._per_model_bounds[m][s] for m in self.models)
                     self.chunk_bounds.append((s, min_end))
             
@@ -749,40 +1200,71 @@ class Phase1_ChunkedNpzDataLoader:
                     )
                     model_end = self._per_model_bounds.get(model_name, {}).get(start_idx, end_idx)
                     cand_name = pattern.format(start=start_idx, end=model_end)
+                    gdrive_resolved_for_repair: Optional[str] = None
                     
                     if self.data_source == "ms":
                         from modelscope.hub.file_download import dataset_file_download
                         path = dataset_file_download(self.ms_repo_id, cand_name, cache_dir=self.cache_dir)
                         cached_paths.append(path)
                     elif self.data_source == "gdrive":
-                        # Bug Fix (Task 068):
-                        # 1) Problem: Direct/flat `os.path.join(gdrive_dir, cand_name)` failed on nested
-                        #    ModelScope cache layouts (`<gdrive_dir>/catclever/emb_npy/...`).
-                        # 2) Method: Resolve via `resolve_gdrive_chunk_file` using `self._gdrive_file_map`
-                        #    (with lazy fallback scan) before NVMe staging.
-                        # 3) Caveats: Only staged copies under `cache_dir != gdrive_dir` are added to `cached_paths`;
-                        #    never modify or delete persistent originals inside `gdrive_dir`.
-                        gdrive_src = resolve_gdrive_chunk_file(
-                            self.gdrive_dir,
-                            cand_name,
-                            file_map=getattr(self, "_gdrive_file_map", None),
-                            source_label="Google Drive",
-                        )
-                        
+                        # Bug Fix (Task 068 & Task 069):
+                        # 1) Problem: Nested ModelScope paths required `resolve_gdrive_chunk_file`, and
+                        #    truncated/missing Google Drive `.npz` chunks crashed `_prefetch_worker` in an
+                        #    endless retry loop without healing the corrupt cloud file.
+                        # 2) Method: Resolve `gdrive_src` and validate via `validate_npz_archive(gdrive_src)`;
+                        #    on missing/corrupt archive when `allow_gdrive_remote_repair` is True, invoke
+                        #    `repair_gdrive_chunk_from_remote` to atomically heal Drive in-place and stage NVMe.
+                        # 3) Caveats: Healthy persistent files in `gdrive_dir` are never modified or added to
+                        #    `cached_paths`; staged NVMe copies are also validated with `is_valid_npz_archive`.
                         abs_cache = os.path.abspath(self.cache_dir)
                         abs_gdrive = os.path.abspath(self.gdrive_dir)
-                        if abs_cache != abs_gdrive:
-                            staged_path = os.path.join(self.cache_dir, cand_name)
-                            os.makedirs(os.path.dirname(staged_path), exist_ok=True)
-                            if (not os.path.exists(staged_path)) or (
-                                os.path.getsize(staged_path) != os.path.getsize(gdrive_src)
-                            ):
-                                shutil.copy2(gdrive_src, staged_path)
-                            path = staged_path
-                            cached_paths.append(staged_path)
+                        try:
+                            gdrive_src = resolve_gdrive_chunk_file(
+                                self.gdrive_dir,
+                                cand_name,
+                                file_map=getattr(self, "_gdrive_file_map", None),
+                                source_label="Google Drive",
+                            )
+                            gdrive_resolved_for_repair = gdrive_src
+                            validate_npz_archive(gdrive_src)
+                        except (
+                            FileNotFoundError,
+                            zipfile.BadZipFile,
+                            zlib.error,
+                            struct.error,
+                            OSError,
+                            ValueError,
+                            KeyError,
+                            EOFError,
+                        ):
+                            if not getattr(self, "allow_gdrive_remote_repair", True):
+                                raise
+                            path = repair_gdrive_chunk_from_remote(
+                                self.gdrive_dir,
+                                cand_name,
+                                cache_dir=self.cache_dir,
+                                ms_repo_id=getattr(self, "_fallback_ms_repo_id", "catclever/emb_npy"),
+                                hf_repo_id=getattr(self, "_fallback_hf_repo_id", "drunkencat/emb_npy"),
+                                file_map=getattr(self, "_gdrive_file_map", None),
+                                broken_gdrive_path=gdrive_resolved_for_repair,
+                            )
+                            if abs_cache != abs_gdrive:
+                                cached_paths.append(path)
                         else:
-                            # 缓存目录与云盘相同，直接读取，严禁加入 cached_paths 以免被清理
-                            path = gdrive_src
+                            if abs_cache != abs_gdrive:
+                                staged_path = os.path.join(self.cache_dir, cand_name)
+                                os.makedirs(os.path.dirname(staged_path), exist_ok=True)
+                                if (
+                                    (not os.path.exists(staged_path))
+                                    or (os.path.getsize(staged_path) != os.path.getsize(gdrive_src))
+                                    or (not is_valid_npz_archive(staged_path))
+                                ):
+                                    shutil.copy2(gdrive_src, staged_path)
+                                path = staged_path
+                                cached_paths.append(staged_path)
+                            else:
+                                # 缓存目录与云盘相同，直接读取，严禁加入 cached_paths 以免被清理
+                                path = gdrive_src
                     elif self.data_source == "hf":
                         path = _download_hf_dataset_file(self.hf_repo_id, cand_name, self.cache_dir)
                         cached_paths.append(path)
@@ -804,7 +1286,38 @@ class Phase1_ChunkedNpzDataLoader:
                             self._cleanup_cached_files(cached_paths)
                         return
 
-                    arr = np.load(path)['features']
+                    try:
+                        arr = np.load(path)['features']
+                    except (
+                        zipfile.BadZipFile,
+                        zlib.error,
+                        struct.error,
+                        OSError,
+                        ValueError,
+                        KeyError,
+                        EOFError,
+                    ):
+                        if self.data_source == "gdrive" and getattr(
+                            self, "allow_gdrive_remote_repair", True
+                        ):
+                            path = repair_gdrive_chunk_from_remote(
+                                self.gdrive_dir,
+                                cand_name,
+                                cache_dir=self.cache_dir,
+                                ms_repo_id=getattr(self, "_fallback_ms_repo_id", "catclever/emb_npy"),
+                                hf_repo_id=getattr(self, "_fallback_hf_repo_id", "drunkencat/emb_npy"),
+                                file_map=getattr(self, "_gdrive_file_map", None),
+                                broken_gdrive_path=gdrive_resolved_for_repair,
+                            )
+                            if (
+                                os.path.abspath(self.cache_dir) != os.path.abspath(self.gdrive_dir)
+                                and path not in cached_paths
+                            ):
+                                cached_paths.append(path)
+                            arr = np.load(path)['features']
+                        else:
+                            raise
+
                     if arr.shape[0] > cur_chunk_size:
                         arr = arr[:cur_chunk_size]
                     active_chunk_embs.append(arr)
@@ -932,7 +1445,7 @@ class Phase1_ChunkedNpzDataLoader:
             "active_macro_idx_ptr": getattr(self, "active_macro_idx_ptr", 0),
             "macro_chunk_indices": getattr(self, "macro_chunk_indices", np.array([])).tolist(),
             "active_micro_ptr": getattr(self, "active_micro_ptr", 0),
-            "seed_snapshot": getattr(self, "seed", int(__import__("time").time()))
+            "seed_snapshot": getattr(self, "seed", int(time.time()))
         }
         
     def load_state_dict(self, state: Dict[str, Any]):

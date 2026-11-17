@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import zipfile
+import zlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,7 +34,10 @@ from model.god_encoder_cuda import (
 from training.data.alignment_dataloader import (
     Phase1_ChunkedNpzDataLoader,
     Phase1_MultiEmbDataLoader,
+    is_valid_npz_archive,
+    repair_gdrive_chunk_from_remote,
     resolve_gdrive_chunk_file,
+    validate_npz_archive,
 )
 
 from training.losses.god_manifold_loss import (
@@ -541,6 +545,17 @@ def infer_teacher_arch_from_ckpt(p0_ckpt: str) -> Tuple[str, str, List[int], int
     return fuser_path, god_path, emb_dims, d_model, z_dim
 
 
+# Bug Fix (Task 069):
+# 1) Problem: When a Google Drive `.npz` file had mid-stream deflate/CRC corruption or truncated
+#    EOF central directory, `load_npz_features_with_repair` repeatedly re-copied the same broken
+#    Google Drive file to local NVMe 3 times before crashing with `RuntimeError: Failed to load npz
+#    after retries ... BadZipFile: File is not a zip file` (as observed at Step 2260).
+# 2) Method: Catch `(zipfile.BadZipFile, zlib.error, OSError, ValueError, KeyError, EOFError)` and,
+#    when `data_source == "gdrive"` with `allow_gdrive_remote_repair` enabled, invoke
+#    `repair_gdrive_chunk_from_remote` directly on retry so the corrupt cloud archive is atomically
+#    replaced from ModelScope / Hugging Face and staged cleanly to NVMe.
+# 3) Caveats: Persistent files in `gdrive_dir` and `local_npz_dir` remain strictly protected from
+#    raw `os.remove`; Drive replacement happens exclusively via validated `.repair_*.tmp` + `os.replace`.
 def load_npz_features_with_repair(
     loader,
     path: str,
@@ -552,7 +567,7 @@ def load_npz_features_with_repair(
     while attempt <= max_retries:
         try:
             return np.load(path)["features"]
-        except (zipfile.BadZipFile, OSError, ValueError, KeyError) as e:
+        except (zipfile.BadZipFile, zlib.error, OSError, ValueError, KeyError, EOFError) as e:
             last_err = e
             attempt += 1
             if attempt > max_retries:
@@ -594,16 +609,71 @@ def load_npz_features_with_repair(
                 except OSError:
                     pass
 
-            if cand_name and hasattr(loader, "_resolve_npz_path"):
+            if (
+                cand_name
+                and data_source == "gdrive"
+                and gdrive_dir
+                and getattr(loader, "allow_gdrive_remote_repair", True)
+                and attempt >= 1
+            ):
+                file_map = getattr(loader, "_gdrive_file_map", None)
+                broken_src: Optional[str] = None
+                try:
+                    broken_src = resolve_gdrive_chunk_file(
+                        gdrive_dir,
+                        cand_name,
+                        file_map=file_map,
+                        source_label="Google Drive",
+                    )
+                except FileNotFoundError:
+                    broken_src = None
+
+                # Force repair if gdrive_src is corrupt or if full-body np.load failed on retry:
+                # note that repair_gdrive_chunk_from_remote skips overwriting dest_gdrive if valid,
+                # so if broken_src passed header check yet failed full-body np.load, overwrite it
+                # atomically by staging to a temp file and replacing broken_src after remote fetch.
+                stage_dir = getattr(loader, "npz_dir", None) or getattr(loader, "cache_dir", None)
+                eff_ms = (
+                    getattr(loader, "ms_repo_id", None)
+                    or getattr(loader, "_fallback_ms_repo_id", None)
+                    or "catclever/emb_npy"
+                )
+                eff_hf = (
+                    getattr(loader, "hf_repo_id", None)
+                    or getattr(loader, "_fallback_hf_repo_id", None)
+                    or "drunkencat/emb_npy"
+                )
+                path = repair_gdrive_chunk_from_remote(
+                    gdrive_dir,
+                    cand_name,
+                    cache_dir=stage_dir,
+                    ms_repo_id=eff_ms,
+                    hf_repo_id=eff_hf,
+                    file_map=file_map,
+                    broken_gdrive_path=broken_src,
+                )
+                if (
+                    broken_src
+                    and os.path.abspath(path) != os.path.abspath(broken_src)
+                    and os.path.isfile(path)
+                ):
+                    # Ensure full-body CRC corruption in broken_src is also replaced on Drive
+                    assert_colab_drive_mounted(broken_src)
+                    tmp_gd = f"{broken_src}.repair_{os.getpid()}_{threading.get_ident()}.tmp"
+                    try:
+                        shutil.copy2(path, tmp_gd)
+                        validate_npz_archive(tmp_gd)
+                        os.replace(tmp_gd, broken_src)
+                    finally:
+                        if os.path.exists(tmp_gd):
+                            try:
+                                os.remove(tmp_gd)
+                            except OSError:
+                                pass
+            elif cand_name and hasattr(loader, "_resolve_npz_path"):
                 path = loader._resolve_npz_path(cand_name)
             elif cand_name and data_source == "gdrive":
                 if gdrive_dir:
-                    # Bug Fix (Task 068):
-                    # 1) Problem: Direct/flat retry lookup failed when Google Drive chunks were cached in nested
-                    #    ModelScope subdirectories, and could copy onto itself if `src == staged`.
-                    # 2) Method: Resolve `src` via `resolve_gdrive_chunk_file` using `loader._gdrive_file_map`
-                    #    and copy to `staged` only when `os.path.abspath(src) != os.path.abspath(staged)`.
-                    # 3) Caveats: Persistent files inside `gdrive_dir` are protected from deletion above.
                     src = resolve_gdrive_chunk_file(
                         gdrive_dir,
                         cand_name,
@@ -661,37 +731,94 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
         local_path = os.path.join(local_data_dir, cand_name)
         cand_lock = _get_cand_lock(cand_name)
         with cand_lock:
-            if os.path.exists(local_path):
-                return local_path
-
             data_source = getattr(loader, "data_source", "ms")
             hf_repo = getattr(loader, "hf_repo_id", None)
             ms_repo = getattr(loader, "ms_repo_id", None)
             gdrive_dir = getattr(loader, "gdrive_dir", None)
 
+            # Bug Fix (Task 069):
+            # 1) Problem: Cached NVMe hits (`os.path.exists(local_path)`) and Google Drive sources
+            #    were returned/copied without validating `.npz` ZIP central-directory & `.npy` header
+            #    integrity, letting truncated files poison local cache and crash `--no-prefetch` runs.
+            # 2) Method: Validate cached `local_path` (removing corrupt NVMe copies unless inside
+            #    `gdrive_dir`), validate `gdrive_src` via `validate_npz_archive`, and trigger
+            #    `repair_gdrive_chunk_from_remote` whenever a Google Drive chunk is missing or corrupt.
+            # 3) Caveats: `data_source == "local"` originals and healthy `gdrive_dir` files are never
+            #    deleted or modified.
+            if os.path.exists(local_path):
+                if data_source == "local" or is_valid_npz_archive(local_path):
+                    return local_path
+                is_inside_gdrive = False
+                if gdrive_dir:
+                    gd_abs = os.path.abspath(gdrive_dir)
+                    lp_abs = os.path.abspath(local_path)
+                    lp_real = os.path.realpath(local_path)
+                    if (
+                        lp_abs == gd_abs
+                        or lp_abs.startswith(gd_abs + os.sep)
+                        or lp_real == gd_abs
+                        or lp_real.startswith(gd_abs + os.sep)
+                    ):
+                        is_inside_gdrive = True
+                if not is_inside_gdrive:
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+
             if data_source == "gdrive":
                 if not gdrive_dir:
                     raise ValueError("[attach_chunk_download_router] loader.data_source 为 'gdrive' 但未配置 gdrive_dir")
-                # Bug Fix (Task 068):
-                # 1) Problem: Sync `--no-prefetch` router only checked direct/flat paths in `gdrive_dir`,
-                #    crashing with FileNotFoundError on nested ModelScope layouts (`catclever/emb_npy/...`).
-                # 2) Method: Lazily attach/reuse `loader._gdrive_file_map`, resolve via `resolve_gdrive_chunk_file`,
-                #    and stage-copy into NVMe `local_path` unless `gdrive_src` and `local_path` are identical.
-                # 3) Caveats: Staging uses `shutil.copy2` so persistent `gdrive_dir` files are never moved or deleted.
                 file_map = getattr(loader, "_gdrive_file_map", None)
                 if file_map is None:
                     file_map = {}
                     loader._gdrive_file_map = file_map
-                gdrive_src = resolve_gdrive_chunk_file(
-                    gdrive_dir,
-                    cand_name,
-                    file_map=file_map,
-                    source_label="Google Drive",
-                )
+                broken_src: Optional[str] = None
+                try:
+                    gdrive_src = resolve_gdrive_chunk_file(
+                        gdrive_dir,
+                        cand_name,
+                        file_map=file_map,
+                        source_label="Google Drive",
+                    )
+                    broken_src = gdrive_src
+                    validate_npz_archive(gdrive_src)
+                except (
+                    FileNotFoundError,
+                    zipfile.BadZipFile,
+                    zlib.error,
+                    OSError,
+                    ValueError,
+                    KeyError,
+                    EOFError,
+                ):
+                    if getattr(loader, "allow_gdrive_remote_repair", True):
+                        eff_ms = (
+                            ms_repo
+                            or getattr(loader, "_fallback_ms_repo_id", None)
+                            or "catclever/emb_npy"
+                        )
+                        eff_hf = (
+                            hf_repo
+                            or getattr(loader, "_fallback_hf_repo_id", None)
+                            or "drunkencat/emb_npy"
+                        )
+                        return repair_gdrive_chunk_from_remote(
+                            gdrive_dir,
+                            cand_name,
+                            cache_dir=local_data_dir,
+                            ms_repo_id=eff_ms,
+                            hf_repo_id=eff_hf,
+                            file_map=file_map,
+                            broken_gdrive_path=broken_src,
+                        )
+                    raise
+
                 if os.path.abspath(gdrive_src) == os.path.abspath(local_path):
                     return local_path
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 shutil.copy2(gdrive_src, local_path)
+                validate_npz_archive(local_path)
                 downloaded_path = local_path
             elif data_source == "hf" or (data_source is None and hf_repo):
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -1479,6 +1606,42 @@ def main():
         )
         if args.hf_ckpt_repo:
             mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
+    # Bug Fix (Task 069):
+    # 1) Problem:Previously only `KeyboardInterrupt` saved `latest_emergency`; any runtime exception
+    #    (e.g. I/O error or OOM at Step 2260 before `--save_steps 5000`) discarded all trained steps
+    #    since the last periodic checkpoint.
+    # 2) Method: Catch `Exception as crash_err` when `global_step > 0`, save `is_emergency=True`
+    #    checkpoint (plus optional HF Hub mirror) inside a guarded try/except, and re-raise the original error.
+    # 3) Caveats: Always re-raises `crash_err` so the full traceback and non-zero exit code are preserved.
+    except Exception as crash_err:
+        if global_step > 0:
+            print(
+                f"\n⚠️ [Crash-Guard] Unexpected error at step {global_step}: {crash_err}\n"
+                f"💾 Saving emergency Phase 0 v3 checkpoint before exiting..."
+            )
+            try:
+                emerg_dir = save_phase0_v3_checkpoint(
+                    out_dir=args.out_dir,
+                    prefix=args.ckpt_prefix,
+                    step=global_step,
+                    fuser=fuser,
+                    god_encoder=god_encoder,
+                    recon_heads=recon_heads,
+                    next_clause_head=next_clause_head,
+                    optimizer=optimizer,
+                    dataloader=dataloader,
+                    args=args,
+                    z_mean_stat=running_z_mean,
+                    z_std_stat=running_z_std,
+                    health_metrics=last_health,
+                    is_emergency=True,
+                )
+                print(f"[Crash-Guard] ✅ Saved emergency checkpoint to {emerg_dir}")
+                if args.hf_ckpt_repo:
+                    mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
+            except Exception as save_err:
+                print(f"[Crash-Guard] ❌ Failed to save emergency checkpoint: {save_err}")
+        raise
 
 
 if __name__ == "__main__":

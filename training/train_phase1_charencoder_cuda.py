@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import zipfile
+import zlib
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -26,7 +27,10 @@ if script_dir in sys.path and os.path.exists(os.path.join(script_dir, "model.py"
 from training.data.alignment_dataloader import (
     Phase1_ChunkedNpzDataLoader,
     Phase1_MultiEmbDataLoader,
+    is_valid_npz_archive,
+    repair_gdrive_chunk_from_remote,
     resolve_gdrive_chunk_file,
+    validate_npz_archive,
 )
 
 from training.core.char_tokenizer import CharTokenizer
@@ -506,6 +510,9 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
             return
         _last_temp_cleanup_at = now_ts
 
+        gdrive_dir_chk = getattr(loader, "gdrive_dir", None)
+        gd_abs_chk = os.path.abspath(gdrive_dir_chk) if gdrive_dir_chk else None
+
         roots = {
             os.path.join(local_data_dir, "._____temp"),
             os.path.join(download_cache_dir, "._____temp"),
@@ -516,6 +523,9 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
         }
         for root in roots:
             if not root or not os.path.exists(root):
+                continue
+            abs_r = os.path.abspath(root)
+            if gd_abs_chk and (abs_r == gd_abs_chk or abs_r.startswith(gd_abs_chk + os.sep)):
                 continue
             for dp, _, fs in os.walk(root, topdown=False):
                 for fn in fs:
@@ -531,6 +541,7 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
                         or fn.endswith(".tmp")
                         or fn.endswith(".partial")
                         or ".tmp." in fn
+                        or ".repair_" in fn
                     )
                     if is_temp:
                         try:
@@ -549,37 +560,92 @@ def attach_chunk_download_router(loader, local_data_dir: str, download_cache_dir
         local_path = os.path.join(local_data_dir, cand_name)
         cand_lock = _get_cand_lock(cand_name)
         with cand_lock:
-            if os.path.exists(local_path):
-                return local_path
-
             data_source = getattr(loader, "data_source", "ms")
             hf_repo = getattr(loader, "hf_repo_id", None)
             ms_repo = getattr(loader, "ms_repo_id", None)
             gdrive_dir = getattr(loader, "gdrive_dir", None)
 
+            # Bug Fix (Task 069):
+            # 1) Problem: Phase 1 router previously skipped `.npz` header/EOF validation on cached
+            #    `local_path` and `gdrive_src`, failing when Google Drive had truncated/missing chunks.
+            # 2) Method: Validate cached NVMe hits via `is_valid_npz_archive`, validate `gdrive_src`
+            #    via `validate_npz_archive`, and invoke `repair_gdrive_chunk_from_remote` to heal
+            #    corrupt/missing Google Drive chunks online from ModelScope / Hugging Face.
+            # 3) Caveats: Healthy persistent files in `gdrive_dir` and `local` mode are never modified.
+            if os.path.exists(local_path):
+                if data_source == "local" or is_valid_npz_archive(local_path):
+                    return local_path
+                is_inside_gdrive = False
+                if gdrive_dir:
+                    gd_abs = os.path.abspath(gdrive_dir)
+                    lp_abs = os.path.abspath(local_path)
+                    lp_real = os.path.realpath(local_path)
+                    if (
+                        lp_abs == gd_abs
+                        or lp_abs.startswith(gd_abs + os.sep)
+                        or lp_real == gd_abs
+                        or lp_real.startswith(gd_abs + os.sep)
+                    ):
+                        is_inside_gdrive = True
+                if not is_inside_gdrive:
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+
             if data_source == "gdrive":
                 if not gdrive_dir:
                     raise ValueError("[attach_chunk_download_router] loader.data_source 为 'gdrive' 但未配置 gdrive_dir")
-                # Bug Fix (Task 068):
-                # 1) Problem: Sync router in Phase 1 only checked direct/flat paths in `gdrive_dir`,
-                #    failing with FileNotFoundError on nested ModelScope cache structures (`catclever/emb_npy/...`).
-                # 2) Method: Maintain `loader._gdrive_file_map`, resolve via `resolve_gdrive_chunk_file`,
-                #    and copy to NVMe `local_path` only if `os.path.abspath(gdrive_src) != os.path.abspath(local_path)`.
-                # 3) Caveats: Staging uses `shutil.copy2`; persistent `gdrive_dir` originals are never moved or deleted.
                 file_map = getattr(loader, "_gdrive_file_map", None)
                 if file_map is None:
                     file_map = {}
                     loader._gdrive_file_map = file_map
-                gdrive_src = resolve_gdrive_chunk_file(
-                    gdrive_dir,
-                    cand_name,
-                    file_map=file_map,
-                    source_label="Google Drive",
-                )
+                broken_src: Optional[str] = None
+                try:
+                    gdrive_src = resolve_gdrive_chunk_file(
+                        gdrive_dir,
+                        cand_name,
+                        file_map=file_map,
+                        source_label="Google Drive",
+                    )
+                    broken_src = gdrive_src
+                    validate_npz_archive(gdrive_src)
+                except (
+                    FileNotFoundError,
+                    zipfile.BadZipFile,
+                    zlib.error,
+                    OSError,
+                    ValueError,
+                    KeyError,
+                    EOFError,
+                ):
+                    if getattr(loader, "allow_gdrive_remote_repair", True):
+                        eff_ms = (
+                            ms_repo
+                            or getattr(loader, "_fallback_ms_repo_id", None)
+                            or "catclever/emb_npy"
+                        )
+                        eff_hf = (
+                            hf_repo
+                            or getattr(loader, "_fallback_hf_repo_id", None)
+                            or "drunkencat/emb_npy"
+                        )
+                        return repair_gdrive_chunk_from_remote(
+                            gdrive_dir,
+                            cand_name,
+                            cache_dir=local_data_dir,
+                            ms_repo_id=eff_ms,
+                            hf_repo_id=eff_hf,
+                            file_map=file_map,
+                            broken_gdrive_path=broken_src,
+                        )
+                    raise
+
                 if os.path.abspath(gdrive_src) == os.path.abspath(local_path):
                     return local_path
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 shutil.copy2(gdrive_src, local_path)
+                validate_npz_archive(local_path)
                 downloaded_path = local_path
             elif data_source == "hf" or (data_source is None and hf_repo):
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -1036,6 +1102,35 @@ def main():
                 args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
             )
             mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
+    # Bug Fix (Task 069):
+    # 1) Problem: Runtime exceptions after hours of distillation exited without saving an emergency
+    #    checkpoint, losing all progress since the last `--save_steps 10000` boundary.
+    # 2) Method: Catch `Exception as crash_err` when `global_step > 0`, verify Drive mount, save
+    #    emergency student/subspace/optimizer state (plus optional HF mirror), and re-raise `crash_err`.
+    # 3) Caveats: Always re-raises the original exception so failures remain visible.
+    except Exception as crash_err:
+        if global_step > 0:
+            print(
+                f"\n⚠️ [Crash-Guard] Unexpected error at step {global_step}: {crash_err}\n"
+                f"💾 Saving emergency Phase 1 v2 checkpoint before exiting..."
+            )
+            try:
+                assert_colab_drive_mounted(args.out_dir)
+                checkpointer.save(step=global_step, is_emergency=True)
+                save_char_subspace_stats(
+                    student, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
+                )
+                save_torch_optimizer_state(
+                    optimizer, args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
+                )
+                if args.hf_ckpt_repo:
+                    emerg_dir = expected_checkpoint_dir(
+                        args.out_dir, args.ckpt_prefix, global_step, is_emergency=True
+                    )
+                    mirror_checkpoint_to_hf_hub(emerg_dir, args.hf_ckpt_repo)
+            except Exception as save_err:
+                print(f"[Crash-Guard] ❌ Failed to save emergency checkpoint: {save_err}")
+        raise
 
 
 if __name__ == "__main__":
