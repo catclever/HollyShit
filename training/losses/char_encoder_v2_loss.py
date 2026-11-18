@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 def make_word_order_corrupted_tokens(
@@ -195,10 +196,17 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
     on valid (`attention_mask > 0`) positions.
     """
 
-    def __init__(self, d_sub: int = 32, vocab_size: int = 32000, init_scale: float = 20.0):
+    def __init__(
+        self,
+        d_sub: int = 32,
+        vocab_size: int = 32000,
+        init_scale: float = 20.0,
+        chunk_tokens: int = 4096,
+    ):
         super().__init__()
         self.d_sub = d_sub
         self.vocab_size = vocab_size
+        self.chunk_tokens = int(chunk_tokens)
         self.char_prototypes = nn.Parameter(torch.randn(vocab_size, d_sub) * (d_sub**-0.5))
         self.char_bias = nn.Parameter(torch.zeros(vocab_size))
         self.logit_scale = nn.Parameter(torch.tensor(float(init_scale)))
@@ -210,6 +218,81 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
         w_norm = F.normalize(self.char_prototypes.float(), p=2, dim=-1)
         scale = self.logit_scale.float().clamp(min=1.0, max=60.0)
         return F.linear(h_norm, w_norm * scale, self.char_bias.float())
+
+    # Bug Fix / Optimization (Task 071):
+    # 1) Problem: Computing full unigram + bigram logits `[N_valid x vocab_size]` in one shot
+    #    materialized multi-GB logit and softmax backward buffers (e.g. >30 GB at Batch=1024,
+    #    L=256, vocab=32000), causing immediate CUDA OOM on A100/L4 GPUs.
+    # 2) Method: Slice tokens along the token dimension in chunks of `chunk_tokens` (default 4096),
+    #    accumulating `reduction="sum"` cross-entropy losses wrapped in `torch.utils.checkpoint`
+    #    (`use_reentrant=False`) while tracking top-1 accuracy under `torch.no_grad()`, then
+    #    dividing by `float(n_tok)`.
+    # 3) Caveats: `self.chunk_tokens` is a plain Python int so `state_dict()` keys remain untouched;
+    #    gradients are mathematically identical to unchunked CE up to float associativity (<1e-5).
+    def _chunked_ce_and_acc(
+        self,
+        h_in: torch.Tensor,
+        targets: torch.Tensor,
+        chunk_tokens: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        w_norm = F.normalize(self.char_prototypes.float(), p=2, dim=-1)
+        scale = self.logit_scale.float().clamp(min=1.0, max=60.0)
+        w_scaled = w_norm * scale
+        bias_f = self.char_bias.float()
+
+        n_tok = int(h_in.size(0))
+        step = max(int(chunk_tokens or self.chunk_tokens), 1)
+
+        if n_tok == 0:
+            return h_in.sum() * 0.0, torch.tensor(0.0, device=h_in.device)
+
+        if n_tok <= step:
+            logits = F.linear(F.normalize(h_in.float(), p=2, dim=-1), w_scaled, bias_f)
+            loss = F.cross_entropy(logits, targets)
+            with torch.no_grad():
+                acc = (logits.argmax(dim=-1) == targets).float().mean()
+            return loss, acc
+
+        if not torch.is_grad_enabled():
+            loss_sum = torch.tensor(0.0, device=h_in.device, dtype=torch.float32)
+            correct_sum = torch.tensor(0, device=h_in.device, dtype=torch.long)
+            for s in range(0, n_tok, step):
+                h_c = h_in[s : s + step]
+                t_c = targets[s : s + step]
+                logits_c = F.linear(F.normalize(h_c.float(), p=2, dim=-1), w_scaled, bias_f)
+                loss_sum = loss_sum + F.cross_entropy(logits_c, t_c, reduction="sum")
+                correct_sum = correct_sum + (logits_c.argmax(dim=-1) == t_c).sum()
+                del logits_c
+            return loss_sum / float(n_tok), correct_sum.float() / float(n_tok)
+
+        def _ce_chunk_fn(
+            h_c: torch.Tensor,
+            t_c: torch.Tensor,
+            w_s: torch.Tensor,
+            b_f: torch.Tensor,
+        ) -> torch.Tensor:
+            logits_c = F.linear(F.normalize(h_c.float(), p=2, dim=-1), w_s, b_f)
+            return F.cross_entropy(logits_c, t_c, reduction="sum")
+
+        loss_sum: Optional[torch.Tensor] = None
+        correct_sum = torch.tensor(0, device=h_in.device, dtype=torch.long)
+        for s in range(0, n_tok, step):
+            h_c = h_in[s : s + step]
+            t_c = targets[s : s + step]
+            with torch.no_grad():
+                logits_det = F.linear(
+                    F.normalize(h_c.detach().float(), p=2, dim=-1),
+                    w_scaled.detach(),
+                    bias_f.detach(),
+                )
+                correct_sum = correct_sum + (logits_det.argmax(dim=-1) == t_c).sum()
+                del logits_det
+            chunk_loss = grad_checkpoint(
+                _ce_chunk_fn, h_c, t_c, w_scaled, bias_f, use_reentrant=False
+            )
+            loss_sum = chunk_loss if loss_sum is None else (loss_sum + chunk_loss)
+
+        return loss_sum / float(n_tok), correct_sum.float() / float(n_tok)
 
     def compute_loss_and_acc(
         self,
@@ -225,11 +308,7 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
         h_valid = h_sub[valid_mask]
         tokens_valid = token_inputs[valid_mask].long().clamp(min=0, max=self.vocab_size - 1)
 
-        logits = self.forward(h_valid)
-        loss_id = F.cross_entropy(logits, tokens_valid)
-
-        with torch.no_grad():
-            top1_acc = (logits.argmax(dim=-1) == tokens_valid).float().mean()
+        loss_id, top1_acc = self._chunked_ce_and_acc(h_valid, tokens_valid)
 
         # Neighbor bigram transition prediction on valid adjacent token pairs
         adj_mask = valid_mask[:, :-1] & valid_mask[:, 1:]
@@ -237,8 +316,7 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
             h_curr = h_sub[:, :-1][adj_mask]
             next_tokens = token_inputs[:, 1:][adj_mask].long().clamp(min=0, max=self.vocab_size - 1)
             h_bigram = self.bigram_proj(h_curr.float())
-            bigram_logits = self.forward(h_bigram)
-            loss_bigram = F.cross_entropy(bigram_logits, next_tokens)
+            loss_bigram, _ = self._chunked_ce_and_acc(h_bigram, next_tokens)
             loss_total = loss_id + 0.25 * loss_bigram
         else:
             loss_total = loss_id
@@ -554,22 +632,36 @@ def evaluate_phase1_v2_health(
 
     explicit_mask = student._resolve_attention_mask(token_inputs, attention_mask)
 
+    # Bug Fix / Optimization (Task 071):
+    # 1) Problem: Retaining `h_auto`, `h_explicit`, and `dual_auto` live across the full health
+    #    evaluation kept redundant `[B, L, d_model]` tensors allocated alongside word-order and
+    #    anchor-head probes.
+    # 2) Method: Reduce `(encode_tokens(None) - encode_tokens(explicit_mask))` immediately into scalar
+    #    `h_diff_max`, extract `masked_vs_auto_mask_max_diff`, and `del dual_auto` immediately before
+    #    downstream checks.
+    # 3) Caveats: Evaluates identically under `torch.no_grad()` with zero change to reported metrics.
     # Verify auto-masking invariance: encode_tokens(x, None) vs encode_tokens(x, explicit_mask)
-    h_auto = student.encode_tokens(token_inputs, None)
-    h_explicit = student.encode_tokens(token_inputs, explicit_mask)
+    h_diff_max = float(
+        (student.encode_tokens(token_inputs, None) - student.encode_tokens(token_inputs, explicit_mask))
+        .abs()
+        .max()
+        .item()
+    )
     dual_auto = student.encode_dual(token_inputs, None)
     dual_explicit = student.encode_dual(token_inputs, explicit_mask)
 
     masked_vs_auto_mask_max_diff = float(
         max(
-            (h_auto - h_explicit).abs().max().item(),
+            h_diff_max,
             (dual_auto["z_god"] - dual_explicit["z_god"]).abs().max().item(),
             (dual_auto["h_sub"] - dual_explicit["h_sub"]).abs().max().item(),
         )
     )
+    del dual_auto
 
     z_pred = dual_explicit["z_god"].float()
     h_sub = dual_explicit["h_sub"].float()
+    del dual_explicit
     z_t = z_target_truth.detach().float()
 
     # 1. Teacher alignment cosine
@@ -591,6 +683,7 @@ def evaluate_phase1_v2_health(
     )
     dual_corrupt = student.encode_dual(corrupted_tokens, explicit_mask)
     z_corrupt = dual_corrupt["z_god"].float()
+    del dual_corrupt
 
     shuffled_order_cos = float(F.cosine_similarity(z_pred, z_corrupt, dim=-1).mean().item())
     if order_head is not None:

@@ -3,6 +3,15 @@ import glob
 import json
 import math
 import os
+
+# Optimization (Task 071):
+# 1) Problem: PyTorch's default CUDA caching allocator fragments large variable-size buffers
+#    across batches and chunked vocab cross-entropy steps, risking CUDA OOM on L4/A100.
+# 2) Method: Default `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` immediately after
+#    `import os` and prior to `import torch` via `os.environ.setdefault`.
+# 3) Caveats: Must be set before `import torch` initializes the CUDA caching allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import re
 import shutil
 import sys
@@ -1699,6 +1708,12 @@ def get_distill_parser():
         choices=["auto", "bf16", "fp16", "fp32"],
         help="CUDA mixed precision mode: 'auto' uses bf16 on Ampere+ (L4/A100) and fp16 on T4",
     )
+    parser.add_argument(
+        "--grad_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable layer-wise gradient checkpointing on TinyCharEncoderCUDA (pass --no-grad_checkpoint to disable)",
+    )
     return parser
 
 
@@ -1781,6 +1796,12 @@ def main():
         d_sub=args.student_d_sub,
         pad_token_id=pad_token_id,
     ).to(device)
+    # Optimization (Task 071):
+    # 1) Problem: Uncheckpointed 6-layer dual-pass activations exceed L4/A100 VRAM at Batch=512/1024.
+    # 2) Method: Apply `args.grad_checkpoint` (default True) via `student.set_gradient_checkpointing(...)`.
+    # 3) Caveats: Trades ~20-30% recomputation for major activation VRAM savings with identical grads.
+    student.set_gradient_checkpointing(bool(args.grad_checkpoint))
+    print(f"[Student] Layer gradient checkpointing: {'ENABLED' if args.grad_checkpoint else 'DISABLED'}")
 
     order_head = OrderDirectionHeadCUDA(z_dim=z_dim).to(device)
     next_clause_head = AsymmetricNextClauseHeadCUDA(z_dim=z_dim).to(device)

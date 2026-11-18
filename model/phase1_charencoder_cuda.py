@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 def load_mlx_safetensors_into_torch(torch_module: nn.Module, safetensor_path: str):
@@ -163,6 +164,7 @@ class TinyCharEncoderCUDA(nn.Module):
         self.z_dim = z_dim
         self.d_sub = d_sub
         self.pad_token_id = int(pad_token_id)
+        self.gradient_checkpointing: bool = False
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([RoPETransformerLayerCUDA(d_model, n_heads) for _ in range(n_layers)])
@@ -177,6 +179,9 @@ class TinyCharEncoderCUDA(nn.Module):
 
         # Spherical initialization for embedding table
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=d_model**-0.5)
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = bool(enabled)
 
     def get_config(self) -> dict:
         return {
@@ -217,8 +222,23 @@ class TinyCharEncoderCUDA(nn.Module):
         mask = self._resolve_attention_mask(x, attention_mask)
         h = self.get_normalized_embeddings(x)
 
-        for layer in self.layers:
-            h = layer(h, mask)
+        # Bug Fix / Optimization (Task 071):
+        # 1) Problem: Phase 1 v2 runs two 6-layer `d_model=1024` forward passes per step (intact +
+        #    word-order corrupted) at Batch=512/1024, keeping intermediate QKV/MLP activations for
+        #    all 12 layer passes simultaneously in VRAM and risking CUDA OOM on L4/A100.
+        # 2) Method: When `self.gradient_checkpointing` is enabled in training with grad active,
+        #    wrap each `RoPETransformerLayerCUDA` call with `torch.utils.checkpoint.checkpoint`
+        #    (`use_reentrant=False`), ensuring `h.requires_grad` if embeddings are frozen.
+        # 3) Caveats: `RoPETransformerLayerCUDA` contains no stochastic ops and `gradient_checkpointing`
+        #    is a plain bool attribute, so `state_dict()` keys and gradients match uncheckpointed runs.
+        if getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled():
+            if not h.requires_grad:
+                h = h.detach().requires_grad_(True)
+            for layer in self.layers:
+                h = grad_checkpoint(layer, h, mask, use_reentrant=False)
+        else:
+            for layer in self.layers:
+                h = layer(h, mask)
 
         h = self.final_ln(h)
         valid_mask = (mask > 0).unsqueeze(-1)
