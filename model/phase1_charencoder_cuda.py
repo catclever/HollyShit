@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import os
 from typing import Dict, Optional, Tuple
 import torch
@@ -326,10 +327,17 @@ class TinyCharEncoderCUDA(nn.Module):
         Stiefel manifold penalty ||W_sub W_sub^T - I_{d_sub}||_F^2 keeping the 32
         character subspace basis rows strictly orthonormal.
         """
-        w = self.char_subspace_proj.weight.float()
-        gram = torch.matmul(w, w.t())
-        eye = torch.eye(self.d_sub, device=w.device, dtype=w.dtype)
-        return ((gram - eye) ** 2).sum()
+        dev_type = self.char_subspace_proj.weight.device.type
+        ctx = (
+            torch.autocast(device_type=dev_type, enabled=False)
+            if dev_type in ("cuda", "cpu", "mps", "xpu")
+            else nullcontext()
+        )
+        with ctx:
+            w = self.char_subspace_proj.weight.float()
+            gram = torch.matmul(w, w.t())
+            eye = torch.eye(self.d_sub, device=w.device, dtype=w.dtype)
+            return ((gram - eye) ** 2).sum()
 
     @torch.no_grad()
     def update_char_token_mean(

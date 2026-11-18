@@ -1,8 +1,20 @@
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
+
+
+def _fp32_autocast_off(device_type: str):
+    """
+    Exits `torch.autocast` so downstream `torch.matmul`, `F.linear`, covariance whitening,
+    and `torch.linalg.eigvalsh` stay strictly in `float32` even when the caller wraps the
+    student forward + loss step in `torch.autocast(dtype=torch.bfloat16 / float16)`.
+    """
+    if device_type in ("cuda", "cpu", "mps", "xpu"):
+        return torch.autocast(device_type=device_type, enabled=False)
+    return nullcontext()
 
 
 def make_word_order_corrupted_tokens(
@@ -80,31 +92,33 @@ class OrderDirectionHeadCUDA(nn.Module):
     def forward(
         self, z_first: torch.Tensor, z_second: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if z_second is None:
-            if z_first.size(-1) != 2 * self.z_dim:
-                raise ValueError(
-                    f"Expected concatenated input of last dim {2 * self.z_dim}, got {z_first.size(-1)}"
-                )
-            z_first, z_second = z_first.chunk(2, dim=-1)
+        with _fp32_autocast_off(z_first.device.type):
+            if z_second is None:
+                if z_first.size(-1) != 2 * self.z_dim:
+                    raise ValueError(
+                        f"Expected concatenated input of last dim {2 * self.z_dim}, got {z_first.size(-1)}"
+                    )
+                z_first, z_second = z_first.chunk(2, dim=-1)
 
-        za = F.normalize(z_first.float(), p=2, dim=-1)
-        zb = F.normalize(z_second.float(), p=2, dim=-1)
-        feat = torch.cat([za, zb, za - zb], dim=-1)
-        return self.net(feat).squeeze(-1)
+            za = F.normalize(z_first.float(), p=2, dim=-1)
+            zb = F.normalize(z_second.float(), p=2, dim=-1)
+            feat = torch.cat([za, zb, za - zb], dim=-1)
+            return self.net(feat).squeeze(-1)
 
     def compute_loss_and_acc(
         self, z_pred: torch.Tensor, z_corrupt: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits_pos = self.forward(z_pred, z_corrupt)
-        logits_neg = self.forward(z_corrupt, z_pred)
+        with _fp32_autocast_off(z_pred.device.type):
+            logits_pos = self.forward(z_pred, z_corrupt)
+            logits_neg = self.forward(z_corrupt, z_pred)
 
-        loss_pos = F.binary_cross_entropy_with_logits(logits_pos, torch.ones_like(logits_pos))
-        loss_neg = F.binary_cross_entropy_with_logits(logits_neg, torch.zeros_like(logits_neg))
-        loss = 0.5 * (loss_pos + loss_neg)
+            loss_pos = F.binary_cross_entropy_with_logits(logits_pos, torch.ones_like(logits_pos))
+            loss_neg = F.binary_cross_entropy_with_logits(logits_neg, torch.zeros_like(logits_neg))
+            loss = 0.5 * (loss_pos + loss_neg)
 
-        with torch.no_grad():
-            acc = 0.5 * ((logits_pos > 0).float().mean() + (logits_neg < 0).float().mean())
-        return loss, acc
+            with torch.no_grad():
+                acc = 0.5 * ((logits_pos > 0).float().mean() + (logits_neg < 0).float().mean())
+            return loss, acc
 
 
 class AsymmetricNextClauseHeadCUDA(nn.Module):
@@ -122,8 +136,9 @@ class AsymmetricNextClauseHeadCUDA(nn.Module):
         nn.init.eye_(self.w_fwd.weight)
 
     def forward(self, z_t: torch.Tensor) -> torch.Tensor:
-        z_norm = F.normalize(z_t.float(), p=2, dim=-1)
-        return F.normalize(self.w_fwd(z_norm), p=2, dim=-1)
+        with _fp32_autocast_off(z_t.device.type):
+            z_norm = F.normalize(z_t.float(), p=2, dim=-1)
+            return F.normalize(self.w_fwd(z_norm), p=2, dim=-1)
 
     def compute_loss(
         self,
@@ -133,60 +148,61 @@ class AsymmetricNextClauseHeadCUDA(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B = z_all.size(0)
         device = z_all.device
-        if B < 2:
-            zero = z_all.sum() * 0.0
-            return zero, {
-                "next_top1_acc": torch.tensor(1.0, device=device),
-                "next_fwd_vs_rev_acc": torch.tensor(1.0, device=device),
-            }
-
-        if contiguous_pairs is None:
-            idx_t = torch.arange(0, B - 1, device=device, dtype=torch.long)
-            idx_next = idx_t + 1
-        else:
-            if contiguous_pairs.numel() == 0:
-                zero = z_all.sum() * 0.0
+        with _fp32_autocast_off(device.type):
+            if B < 2:
+                zero = z_all.float().sum() * 0.0
                 return zero, {
                     "next_top1_acc": torch.tensor(1.0, device=device),
                     "next_fwd_vs_rev_acc": torch.tensor(1.0, device=device),
                 }
-            idx_t = contiguous_pairs[:, 0].long().to(device)
-            idx_next = contiguous_pairs[:, 1].long().to(device)
 
-        q_t = self.forward(z_all[idx_t])
-        k_all = F.normalize(z_all.float(), p=2, dim=-1)
+            if contiguous_pairs is None:
+                idx_t = torch.arange(0, B - 1, device=device, dtype=torch.long)
+                idx_next = idx_t + 1
+            else:
+                if contiguous_pairs.numel() == 0:
+                    zero = z_all.float().sum() * 0.0
+                    return zero, {
+                        "next_top1_acc": torch.tensor(1.0, device=device),
+                        "next_fwd_vs_rev_acc": torch.tensor(1.0, device=device),
+                    }
+                idx_t = contiguous_pairs[:, 0].long().to(device)
+                idx_next = contiguous_pairs[:, 1].long().to(device)
 
-        logits = torch.matmul(q_t, k_all.t()) / self.temperature
-        # Mask out self-index idx_t so the query cannot trivially retrieve itself
-        self_mask = torch.zeros_like(logits, dtype=torch.bool)
-        self_mask.scatter_(1, idx_t.unsqueeze(1), True)
-        logits = logits.masked_fill(self_mask, -1e4)
+            q_t = self.forward(z_all[idx_t])
+            k_all = F.normalize(z_all.float(), p=2, dim=-1)
 
-        loss_infonce = F.cross_entropy(logits, idx_next)
+            logits = torch.matmul(q_t, k_all.t()) / self.temperature
+            # Mask out self-index idx_t so the query cannot trivially retrieve itself
+            self_mask = torch.zeros_like(logits, dtype=torch.bool)
+            self_mask.scatter_(1, idx_t.unsqueeze(1), True)
+            logits = logits.masked_fill(self_mask, -1e4)
 
-        # Asymmetric directional margin: forward (t -> t+1) > reverse (t+1 -> t) and (t -> t-1)
-        k_next = k_all[idx_next]
-        k_curr = k_all[idx_t]
-        q_next = self.forward(z_all[idx_next])
+            loss_infonce = F.cross_entropy(logits, idx_next)
 
-        sim_fwd = (q_t * k_next).sum(dim=-1)
-        sim_rev = (q_next * k_curr).sum(dim=-1)
-        loss_dir = F.relu(direction_margin - (sim_fwd - sim_rev)).mean()
+            # Asymmetric directional margin: forward (t -> t+1) > reverse (t+1 -> t) and (t -> t-1)
+            k_next = k_all[idx_next]
+            k_curr = k_all[idx_t]
+            q_next = self.forward(z_all[idx_next])
 
-        has_prev = idx_t > 0
-        if has_prev.any():
-            idx_prev = (idx_t[has_prev] - 1).clamp(min=0)
-            sim_prev = (q_t[has_prev] * k_all[idx_prev]).sum(dim=-1)
-            loss_dir = loss_dir + F.relu(direction_margin - (sim_fwd[has_prev] - sim_prev)).mean()
+            sim_fwd = (q_t * k_next).sum(dim=-1)
+            sim_rev = (q_next * k_curr).sum(dim=-1)
+            loss_dir = F.relu(direction_margin - (sim_fwd - sim_rev)).mean()
 
-        with torch.no_grad():
-            top1_acc = (logits.argmax(dim=-1) == idx_next).float().mean()
-            dir_acc = (sim_fwd > sim_rev).float().mean()
+            has_prev = idx_t > 0
+            if has_prev.any():
+                idx_prev = (idx_t[has_prev] - 1).clamp(min=0)
+                sim_prev = (q_t[has_prev] * k_all[idx_prev]).sum(dim=-1)
+                loss_dir = loss_dir + F.relu(direction_margin - (sim_fwd[has_prev] - sim_prev)).mean()
 
-        return loss_infonce + loss_dir, {
-            "next_top1_acc": top1_acc,
-            "next_fwd_vs_rev_acc": dir_acc,
-        }
+            with torch.no_grad():
+                top1_acc = (logits.argmax(dim=-1) == idx_next).float().mean()
+                dir_acc = (sim_fwd > sim_rev).float().mean()
+
+            return loss_infonce + loss_dir, {
+                "next_top1_acc": top1_acc,
+                "next_fwd_vs_rev_acc": dir_acc,
+            }
 
 
 class CharSubspaceAnchorHeadCUDA(nn.Module):
@@ -214,10 +230,11 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
         nn.init.orthogonal_(self.bigram_proj.weight)
 
     def forward(self, h_sub: torch.Tensor) -> torch.Tensor:
-        h_norm = F.normalize(h_sub.float(), p=2, dim=-1)
-        w_norm = F.normalize(self.char_prototypes.float(), p=2, dim=-1)
-        scale = self.logit_scale.float().clamp(min=1.0, max=60.0)
-        return F.linear(h_norm, w_norm * scale, self.char_bias.float())
+        with _fp32_autocast_off(h_sub.device.type):
+            h_norm = F.normalize(h_sub.float(), p=2, dim=-1)
+            w_norm = F.normalize(self.char_prototypes.float(), p=2, dim=-1)
+            scale = self.logit_scale.float().clamp(min=1.0, max=60.0)
+            return F.linear(h_norm, w_norm * scale, self.char_bias.float())
 
     # Bug Fix / Optimization (Task 071):
     # 1) Problem: Computing full unigram + bigram logits `[N_valid x vocab_size]` in one shot
@@ -235,64 +252,66 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
         targets: torch.Tensor,
         chunk_tokens: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        w_norm = F.normalize(self.char_prototypes.float(), p=2, dim=-1)
-        scale = self.logit_scale.float().clamp(min=1.0, max=60.0)
-        w_scaled = w_norm * scale
-        bias_f = self.char_bias.float()
+        with _fp32_autocast_off(h_in.device.type):
+            w_norm = F.normalize(self.char_prototypes.float(), p=2, dim=-1)
+            scale = self.logit_scale.float().clamp(min=1.0, max=60.0)
+            w_scaled = w_norm * scale
+            bias_f = self.char_bias.float()
 
-        n_tok = int(h_in.size(0))
-        step = max(int(chunk_tokens or self.chunk_tokens), 1)
+            n_tok = int(h_in.size(0))
+            step = max(int(chunk_tokens or self.chunk_tokens), 1)
 
-        if n_tok == 0:
-            return h_in.sum() * 0.0, torch.tensor(0.0, device=h_in.device)
+            if n_tok == 0:
+                return h_in.float().sum() * 0.0, torch.tensor(0.0, device=h_in.device)
 
-        if n_tok <= step:
-            logits = F.linear(F.normalize(h_in.float(), p=2, dim=-1), w_scaled, bias_f)
-            loss = F.cross_entropy(logits, targets)
-            with torch.no_grad():
-                acc = (logits.argmax(dim=-1) == targets).float().mean()
-            return loss, acc
+            if n_tok <= step:
+                logits = F.linear(F.normalize(h_in.float(), p=2, dim=-1), w_scaled, bias_f)
+                loss = F.cross_entropy(logits, targets)
+                with torch.no_grad():
+                    acc = (logits.argmax(dim=-1) == targets).float().mean()
+                return loss, acc
 
-        if not torch.is_grad_enabled():
-            loss_sum = torch.tensor(0.0, device=h_in.device, dtype=torch.float32)
+            if not torch.is_grad_enabled():
+                loss_sum = torch.tensor(0.0, device=h_in.device, dtype=torch.float32)
+                correct_sum = torch.tensor(0, device=h_in.device, dtype=torch.long)
+                for s in range(0, n_tok, step):
+                    h_c = h_in[s : s + step]
+                    t_c = targets[s : s + step]
+                    logits_c = F.linear(F.normalize(h_c.float(), p=2, dim=-1), w_scaled, bias_f)
+                    loss_sum = loss_sum + F.cross_entropy(logits_c, t_c, reduction="sum")
+                    correct_sum = correct_sum + (logits_c.argmax(dim=-1) == t_c).sum()
+                    del logits_c
+                return loss_sum / float(n_tok), correct_sum.float() / float(n_tok)
+
+            def _ce_chunk_fn(
+                h_c: torch.Tensor,
+                t_c: torch.Tensor,
+                w_s: torch.Tensor,
+                b_f: torch.Tensor,
+            ) -> torch.Tensor:
+                with _fp32_autocast_off(h_c.device.type):
+                    logits_c = F.linear(F.normalize(h_c.float(), p=2, dim=-1), w_s, b_f)
+                    return F.cross_entropy(logits_c, t_c, reduction="sum")
+
+            loss_sum: Optional[torch.Tensor] = None
             correct_sum = torch.tensor(0, device=h_in.device, dtype=torch.long)
             for s in range(0, n_tok, step):
                 h_c = h_in[s : s + step]
                 t_c = targets[s : s + step]
-                logits_c = F.linear(F.normalize(h_c.float(), p=2, dim=-1), w_scaled, bias_f)
-                loss_sum = loss_sum + F.cross_entropy(logits_c, t_c, reduction="sum")
-                correct_sum = correct_sum + (logits_c.argmax(dim=-1) == t_c).sum()
-                del logits_c
-            return loss_sum / float(n_tok), correct_sum.float() / float(n_tok)
-
-        def _ce_chunk_fn(
-            h_c: torch.Tensor,
-            t_c: torch.Tensor,
-            w_s: torch.Tensor,
-            b_f: torch.Tensor,
-        ) -> torch.Tensor:
-            logits_c = F.linear(F.normalize(h_c.float(), p=2, dim=-1), w_s, b_f)
-            return F.cross_entropy(logits_c, t_c, reduction="sum")
-
-        loss_sum: Optional[torch.Tensor] = None
-        correct_sum = torch.tensor(0, device=h_in.device, dtype=torch.long)
-        for s in range(0, n_tok, step):
-            h_c = h_in[s : s + step]
-            t_c = targets[s : s + step]
-            with torch.no_grad():
-                logits_det = F.linear(
-                    F.normalize(h_c.detach().float(), p=2, dim=-1),
-                    w_scaled.detach(),
-                    bias_f.detach(),
+                with torch.no_grad():
+                    logits_det = F.linear(
+                        F.normalize(h_c.detach().float(), p=2, dim=-1),
+                        w_scaled.detach(),
+                        bias_f.detach(),
+                    )
+                    correct_sum = correct_sum + (logits_det.argmax(dim=-1) == t_c).sum()
+                    del logits_det
+                chunk_loss = grad_checkpoint(
+                    _ce_chunk_fn, h_c, t_c, w_scaled, bias_f, use_reentrant=False
                 )
-                correct_sum = correct_sum + (logits_det.argmax(dim=-1) == t_c).sum()
-                del logits_det
-            chunk_loss = grad_checkpoint(
-                _ce_chunk_fn, h_c, t_c, w_scaled, bias_f, use_reentrant=False
-            )
-            loss_sum = chunk_loss if loss_sum is None else (loss_sum + chunk_loss)
+                loss_sum = chunk_loss if loss_sum is None else (loss_sum + chunk_loss)
 
-        return loss_sum / float(n_tok), correct_sum.float() / float(n_tok)
+            return loss_sum / float(n_tok), correct_sum.float() / float(n_tok)
 
     def compute_loss_and_acc(
         self,
@@ -300,37 +319,41 @@ class CharSubspaceAnchorHeadCUDA(nn.Module):
         token_inputs: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        valid_mask = attention_mask > 0
-        if not valid_mask.any():
-            zero = h_sub.sum() * 0.0
-            return zero, torch.tensor(0.0, device=h_sub.device)
+        with _fp32_autocast_off(h_sub.device.type):
+            valid_mask = attention_mask > 0
+            if not valid_mask.any():
+                zero = h_sub.float().sum() * 0.0
+                return zero, torch.tensor(0.0, device=h_sub.device)
 
-        h_valid = h_sub[valid_mask]
-        tokens_valid = token_inputs[valid_mask].long().clamp(min=0, max=self.vocab_size - 1)
+            h_valid = h_sub[valid_mask]
+            tokens_valid = token_inputs[valid_mask].long().clamp(min=0, max=self.vocab_size - 1)
 
-        loss_id, top1_acc = self._chunked_ce_and_acc(h_valid, tokens_valid)
+            loss_id, top1_acc = self._chunked_ce_and_acc(h_valid, tokens_valid)
 
-        # Neighbor bigram transition prediction on valid adjacent token pairs
-        adj_mask = valid_mask[:, :-1] & valid_mask[:, 1:]
-        if adj_mask.any():
-            h_curr = h_sub[:, :-1][adj_mask]
-            next_tokens = token_inputs[:, 1:][adj_mask].long().clamp(min=0, max=self.vocab_size - 1)
-            h_bigram = self.bigram_proj(h_curr.float())
-            loss_bigram, _ = self._chunked_ce_and_acc(h_bigram, next_tokens)
-            loss_total = loss_id + 0.25 * loss_bigram
-        else:
-            loss_total = loss_id
+            # Neighbor bigram transition prediction on valid adjacent token pairs
+            adj_mask = valid_mask[:, :-1] & valid_mask[:, 1:]
+            if adj_mask.any():
+                h_curr = h_sub[:, :-1][adj_mask]
+                next_tokens = (
+                    token_inputs[:, 1:][adj_mask].long().clamp(min=0, max=self.vocab_size - 1)
+                )
+                h_bigram = self.bigram_proj(h_curr.float())
+                loss_bigram, _ = self._chunked_ce_and_acc(h_bigram, next_tokens)
+                loss_total = loss_id + 0.25 * loss_bigram
+            else:
+                loss_total = loss_id
 
-        return loss_total, top1_acc
+            return loss_total, top1_acc
 
 
 def compute_centered_cosine_matrix(x: torch.Tensor) -> torch.Tensor:
     """Computes batch-centered L2-normalized cosine similarity matrix S in R^{B x B}."""
-    x_f = x.float()
-    if x_f.size(0) > 1:
-        x_f = x_f - x_f.mean(dim=0, keepdim=True)
-    x_norm = F.normalize(x_f, p=2, dim=-1)
-    return torch.matmul(x_norm, x_norm.t())
+    with _fp32_autocast_off(x.device.type):
+        x_f = x.float()
+        if x_f.size(0) > 1:
+            x_f = x_f - x_f.mean(dim=0, keepdim=True)
+        x_norm = F.normalize(x_f, p=2, dim=-1)
+        return torch.matmul(x_norm, x_norm.t())
 
 
 def compute_teacher_consensus_similarity(
@@ -342,19 +365,20 @@ def compute_teacher_consensus_similarity(
     Builds the 5-teacher consensus centered cosine similarity matrix S_bar in R^{B x B}.
     Falls back to `z_target_truth` centered similarity if `batch_embs` is empty/None.
     """
-    if not batch_embs:
-        return compute_centered_cosine_matrix(z_target_truth.detach())
+    with _fp32_autocast_off(z_target_truth.device.type):
+        if not batch_embs:
+            return compute_centered_cosine_matrix(z_target_truth.detach())
 
-    sim_list: List[torch.Tensor] = []
-    for emb in batch_embs:
-        sim_list.append(compute_centered_cosine_matrix(emb.detach()))
+        sim_list: List[torch.Tensor] = []
+        for emb in batch_embs:
+            sim_list.append(compute_centered_cosine_matrix(emb.detach()))
 
-    sim_stack = torch.stack(sim_list, dim=0)
-    if weights is not None and len(weights) == len(sim_list):
-        w = torch.tensor(weights, dtype=sim_stack.dtype, device=sim_stack.device)
-        w = w / w.sum().clamp(min=1e-8)
-        return (sim_stack * w.view(-1, 1, 1)).sum(dim=0)
-    return sim_stack.mean(dim=0)
+        sim_stack = torch.stack(sim_list, dim=0)
+        if weights is not None and len(weights) == len(sim_list):
+            w = torch.tensor(weights, dtype=sim_stack.dtype, device=sim_stack.device)
+            w = w / w.sum().clamp(min=1e-8)
+            return (sim_stack * w.view(-1, 1, 1)).sum(dim=0)
+        return sim_stack.mean(dim=0)
 
 
 def compute_relational_distill_loss(
@@ -369,30 +393,39 @@ def compute_relational_distill_loss(
     (Soft InfoNCE) + Frobenius MSE.
     """
     B = z_pred.size(0)
-    if B < 2:
-        return z_pred.sum() * 0.0
+    with _fp32_autocast_off(z_pred.device.type):
+        if B < 2:
+            return z_pred.float().sum() * 0.0
 
-    s_z = compute_centered_cosine_matrix(z_pred)
-    s_p = compute_centered_cosine_matrix(s_pool)
-    s_t = s_teacher.detach().float()
+        s_z = compute_centered_cosine_matrix(z_pred)
+        s_p = compute_centered_cosine_matrix(s_pool)
+        s_t = s_teacher.detach().float()
 
-    loss_frob = 0.5 * (F.mse_loss(s_z, s_t) + F.mse_loss(s_p, s_t))
+        loss_frob = 0.5 * (F.mse_loss(s_z, s_t) + F.mse_loss(s_p, s_t))
 
-    off_diag = ~torch.eye(B, dtype=torch.bool, device=z_pred.device)
-    s_t_off = s_t[off_diag].view(B, B - 1)
-    s_z_off = s_z[off_diag].view(B, B - 1)
-    s_p_off = s_p[off_diag].view(B, B - 1)
+        off_diag = ~torch.eye(B, dtype=torch.bool, device=z_pred.device)
+        s_t_off = s_t[off_diag].view(B, B - 1)
+        s_z_off = s_z[off_diag].view(B, B - 1)
+        s_p_off = s_p[off_diag].view(B, B - 1)
 
-    p_t = F.softmax(s_t_off / temperature, dim=-1)
-    kl_z = F.kl_div(F.log_softmax(s_z_off / temperature, dim=-1), p_t, reduction="batchmean") * (
-        temperature**2
-    )
-    kl_p = F.kl_div(F.log_softmax(s_p_off / temperature, dim=-1), p_t, reduction="batchmean") * (
-        temperature**2
-    )
-    return loss_frob + 0.5 * (kl_z + kl_p)
+        p_t = F.softmax(s_t_off / temperature, dim=-1)
+        kl_z = F.kl_div(F.log_softmax(s_z_off / temperature, dim=-1), p_t, reduction="batchmean") * (
+            temperature**2
+        )
+        kl_p = F.kl_div(F.log_softmax(s_p_off / temperature, dim=-1), p_t, reduction="batchmean") * (
+            temperature**2
+        )
+        return loss_frob + 0.5 * (kl_z + kl_p)
 
 
+# Bug Fix (Task 072):
+# 1) Problem: Under `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`, `torch.matmul`
+#    automatically downcasts even `.float()` operands (`h_centered`) back to `BFloat16`, both
+#    degrading `32x32` covariance accumulation across ~40k tokens and raising
+#    `NotImplementedError: "linalg_eigh_cuda" not implemented for 'BFloat16'` in `eigvalsh(cov)`.
+# 2) Method: Exit `autocast` via `_fp32_autocast_off(h_sub.device.type)` and explicitly pass
+#    `cov.to(dtype=torch.float32)` into `torch.linalg.eigvalsh`.
+# 3) Caveats: Transformer backbone (`encode_tokens` / `encode_dual`) stays in fast `bfloat16`.
 def compute_token_subspace_vicreg_loss(
     h_sub: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -407,44 +440,46 @@ def compute_token_subspace_vicreg_loss(
       - Enforces zero off-diagonal covariance across the 32 channels.
       - Adds Stiefel manifold orthogonality penalty `ortho_loss`.
     """
-    valid_mask = attention_mask > 0
-    h_valid = h_sub[valid_mask].float()
-    N_valid, d_sub = h_valid.shape
+    with _fp32_autocast_off(h_sub.device.type):
+        valid_mask = attention_mask > 0
+        h_valid = h_sub[valid_mask].float()
+        N_valid, d_sub = h_valid.shape
+        ortho_f = ortho_loss.float()
 
-    if N_valid <= 2:
-        zero = h_sub.sum() * 0.0 + ortho_loss
-        return zero, {
-            "subspace_pc1_var_ratio": torch.tensor(1.0 / d_sub, device=h_sub.device),
-            "subspace_participation_ratio": torch.tensor(float(d_sub), device=h_sub.device),
+        if N_valid <= 2:
+            zero = h_sub.float().sum() * 0.0 + ortho_f
+            return zero, {
+                "subspace_pc1_var_ratio": torch.tensor(1.0 / d_sub, device=h_sub.device),
+                "subspace_participation_ratio": torch.tensor(float(d_sub), device=h_sub.device),
+            }
+
+        h_mean = h_valid.mean(dim=0, keepdim=True)
+        h_centered = h_valid - h_mean
+
+        # Keep residual mean near zero after char_token_mean subtraction
+        mean_drift_loss = (h_mean.pow(2)).mean()
+
+        var = h_centered.var(dim=0, unbiased=False)
+        std = torch.sqrt(var + 1e-4)
+        var_hinge = F.relu(target_std - std).mean()
+        var_equal = ((std - target_std) ** 2).mean() + 0.25 * ((var - (target_std**2)) ** 2).mean()
+
+        cov = torch.matmul(h_centered.t(), h_centered) / float(max(N_valid - 1, 1))
+        off_diag_mask = ~torch.eye(d_sub, dtype=torch.bool, device=cov.device)
+        cov_off_loss = (cov[off_diag_mask] ** 2).mean() * float(d_sub)
+
+        loss_char_iso = var_hinge + var_equal + cov_off_loss + 0.1 * mean_drift_loss + ortho_f
+
+        with torch.no_grad():
+            eigvals = torch.linalg.eigvalsh(cov.to(dtype=torch.float32)).clamp(min=0.0)
+            eig_sum = eigvals.sum().clamp(min=1e-12)
+            pc1_ratio = eigvals[-1] / eig_sum
+            pr = (eig_sum**2) / (eigvals.pow(2).sum().clamp(min=1e-12))
+
+        return loss_char_iso, {
+            "subspace_pc1_var_ratio": pc1_ratio,
+            "subspace_participation_ratio": pr,
         }
-
-    h_mean = h_valid.mean(dim=0, keepdim=True)
-    h_centered = h_valid - h_mean
-
-    # Keep residual mean near zero after char_token_mean subtraction
-    mean_drift_loss = (h_mean.pow(2)).mean()
-
-    var = h_centered.var(dim=0, unbiased=False)
-    std = torch.sqrt(var + 1e-4)
-    var_hinge = F.relu(target_std - std).mean()
-    var_equal = ((std - target_std) ** 2).mean() + 0.25 * ((var - (target_std**2)) ** 2).mean()
-
-    cov = torch.matmul(h_centered.t(), h_centered) / float(max(N_valid - 1, 1))
-    off_diag_mask = ~torch.eye(d_sub, dtype=torch.bool, device=cov.device)
-    cov_off_loss = (cov[off_diag_mask] ** 2).mean() * float(d_sub)
-
-    loss_char_iso = var_hinge + var_equal + cov_off_loss + 0.1 * mean_drift_loss + ortho_loss
-
-    with torch.no_grad():
-        eigvals = torch.linalg.eigvalsh(cov).clamp(min=0.0)
-        eig_sum = eigvals.sum().clamp(min=1e-12)
-        pc1_ratio = eigvals[-1] / eig_sum
-        pr = (eig_sum**2) / (eigvals.pow(2).sum().clamp(min=1e-12))
-
-    return loss_char_iso, {
-        "subspace_pc1_var_ratio": pc1_ratio,
-        "subspace_participation_ratio": pr,
-    }
 
 
 def compute_phase1_v2_distill_loss(
@@ -489,87 +524,92 @@ def compute_phase1_v2_distill_loss(
     z_pred = student.out_proj(s_pool)
     h_sub = student._project_char_subspace_from_tokens(h_tokens, mask, center=True)
 
-    # 1. Semantic Target Distillation (loss_distill)
-    z_t = z_target_truth.detach().float()
-    z_p = z_pred.float()
-    target_energy = z_t.pow(2).sum(dim=-1).mean().clamp(min=1.0)
-    loss_mse_scaled = F.mse_loss(z_p, z_t, reduction="none").sum(dim=-1).mean() / target_energy
-    cos_z_god = F.cosine_similarity(z_p, z_t, dim=-1)
-    loss_cos = (1.0 - cos_z_god).mean()
-    if s_pool.size(-1) == z_t.size(-1):
-        loss_s_cos = (1.0 - F.cosine_similarity(s_pool.float(), z_t, dim=-1)).mean()
-        loss_distill = loss_mse_scaled + loss_cos + 0.25 * loss_s_cos
-    else:
-        loss_distill = loss_mse_scaled + loss_cos
-
-    # 2. Relational Topology Distillation (loss_rel)
-    s_teacher = compute_teacher_consensus_similarity(batch_embs, z_t)
-    loss_rel = compute_relational_distill_loss(z_p, s_pool.float(), s_teacher)
-
-    # 3. Anti-BoW Word-Order Hard-Negative Contrastive Loss (loss_order)
+    # Keep hard-negative 6-layer Transformer forward inside caller's AMP context for TensorCore speed,
+    # then exit autocast so all manifold/covariance/similarity/probe losses run strictly in float32.
     corrupted_tokens = make_word_order_corrupted_tokens(
         token_inputs, mask, pad_token_id=getattr(student, "pad_token_id", 0)
     )
     dual_corrupt = student.encode_dual(corrupted_tokens, mask)
-    z_corrupt = dual_corrupt["z_god"].float()
-    s_corrupt = dual_corrupt["s_pool"].float()
 
-    cos_order = F.cosine_similarity(z_p, z_corrupt, dim=-1)
-    cos_order_detach = F.cosine_similarity(z_p.detach(), z_corrupt, dim=-1)
-    cos_s_order = F.cosine_similarity(s_pool.float(), s_corrupt, dim=-1)
-    cos_target_corrupt = F.cosine_similarity(z_t, z_corrupt, dim=-1)
+    with _fp32_autocast_off(token_inputs.device.type):
+        # 1. Semantic Target Distillation (loss_distill)
+        z_t = z_target_truth.detach().float()
+        z_p = z_pred.float()
+        s_pool_f = s_pool.float()
+        target_energy = z_t.pow(2).sum(dim=-1).mean().clamp(min=1.0)
+        loss_mse_scaled = F.mse_loss(z_p, z_t, reduction="none").sum(dim=-1).mean() / target_energy
+        cos_z_god = F.cosine_similarity(z_p, z_t, dim=-1)
+        loss_cos = (1.0 - cos_z_god).mean()
+        if s_pool_f.size(-1) == z_t.size(-1):
+            loss_s_cos = (1.0 - F.cosine_similarity(s_pool_f, z_t, dim=-1)).mean()
+            loss_distill = loss_mse_scaled + loss_cos + 0.25 * loss_s_cos
+        else:
+            loss_distill = loss_mse_scaled + loss_cos
 
-    margin_viol = (
-        F.relu(cos_order - order_margin)
-        + F.relu(cos_order_detach - order_margin)
-        + 0.5 * F.relu(cos_s_order - order_margin)
-        + 0.5 * F.relu(cos_target_corrupt - order_margin)
-    )
-    loss_order_margin = (margin_viol + margin_viol.pow(2)).mean()
+        # 2. Relational Topology Distillation (loss_rel)
+        s_teacher = compute_teacher_consensus_similarity(batch_embs, z_t)
+        loss_rel = compute_relational_distill_loss(z_p, s_pool_f, s_teacher)
 
-    if order_head is not None:
-        loss_order_disc, order_discrim_acc = order_head.compute_loss_and_acc(z_p, z_corrupt)
-    else:
-        loss_order_disc = z_p.sum() * 0.0
-        order_discrim_acc = (cos_z_god > cos_target_corrupt).float().mean()
+        # 3. Anti-BoW Word-Order Hard-Negative Contrastive Loss (loss_order)
+        z_corrupt = dual_corrupt["z_god"].float()
+        s_corrupt = dual_corrupt["s_pool"].float()
 
-    loss_order = loss_order_margin + loss_order_disc
+        cos_order = F.cosine_similarity(z_p, z_corrupt, dim=-1)
+        cos_order_detach = F.cosine_similarity(z_p.detach(), z_corrupt, dim=-1)
+        cos_s_order = F.cosine_similarity(s_pool_f, s_corrupt, dim=-1)
+        cos_target_corrupt = F.cosine_similarity(z_t, z_corrupt, dim=-1)
 
-    # 4. Asymmetric Discourse Progression Contrastive Loss (loss_next)
-    if next_clause_head is not None:
-        loss_next, next_metrics = next_clause_head.compute_loss(
-            z_p, contiguous_pairs=contiguous_pairs
+        margin_viol = (
+            F.relu(cos_order - order_margin)
+            + F.relu(cos_order_detach - order_margin)
+            + 0.5 * F.relu(cos_s_order - order_margin)
+            + 0.5 * F.relu(cos_target_corrupt - order_margin)
         )
-    else:
-        loss_next = z_p.sum() * 0.0
-        next_metrics = {
-            "next_top1_acc": torch.tensor(0.0, device=z_p.device),
-            "next_fwd_vs_rev_acc": torch.tensor(0.0, device=z_p.device),
-        }
+        loss_order_margin = (margin_viol + margin_viol.pow(2)).mean()
 
-    # 5. Token-Level Isotropic 32-D Subspace Loss (loss_char_iso)
-    ortho_loss = student.orthogonal_subspace_loss()
-    loss_char_iso, iso_metrics = compute_token_subspace_vicreg_loss(
-        h_sub, mask, ortho_loss=ortho_loss
-    )
+        if order_head is not None:
+            loss_order_disc, order_discrim_acc = order_head.compute_loss_and_acc(z_p, z_corrupt)
+        else:
+            loss_order_disc = z_p.sum() * 0.0
+            order_discrim_acc = (cos_z_god > cos_target_corrupt).float().mean()
 
-    # 6. Token Anchor Probe Loss (loss_char_id)
-    if char_anchor_head is not None:
-        loss_char_id, char_top1_acc = char_anchor_head.compute_loss_and_acc(
-            h_sub, token_inputs, mask
+        loss_order = loss_order_margin + loss_order_disc
+
+        # 4. Asymmetric Discourse Progression Contrastive Loss (loss_next)
+        if next_clause_head is not None:
+            loss_next, next_metrics = next_clause_head.compute_loss(
+                z_p, contiguous_pairs=contiguous_pairs
+            )
+        else:
+            loss_next = z_p.sum() * 0.0
+            next_metrics = {
+                "next_top1_acc": torch.tensor(0.0, device=z_p.device),
+                "next_fwd_vs_rev_acc": torch.tensor(0.0, device=z_p.device),
+            }
+
+        # 5. Token-Level Isotropic 32-D Subspace Loss (loss_char_iso)
+        ortho_loss = student.orthogonal_subspace_loss()
+        loss_char_iso, iso_metrics = compute_token_subspace_vicreg_loss(
+            h_sub, mask, ortho_loss=ortho_loss
         )
-    else:
-        loss_char_id = h_sub.sum() * 0.0
-        char_top1_acc = torch.tensor(0.0, device=h_sub.device)
 
-    total_loss = (
-        w_distill * loss_distill
-        + w_rel * loss_rel
-        + w_order * loss_order
-        + w_next * loss_next
-        + w_char_iso * loss_char_iso
-        + w_char_id * loss_char_id
-    )
+        # 6. Token Anchor Probe Loss (loss_char_id)
+        if char_anchor_head is not None:
+            loss_char_id, char_top1_acc = char_anchor_head.compute_loss_and_acc(
+                h_sub, token_inputs, mask
+            )
+        else:
+            loss_char_id = h_sub.float().sum() * 0.0
+            char_top1_acc = torch.tensor(0.0, device=h_sub.device)
+
+        total_loss = (
+            w_distill * loss_distill
+            + w_rel * loss_rel
+            + w_order * loss_order
+            + w_next * loss_next
+            + w_char_iso * loss_char_iso
+            + w_char_id * loss_char_id
+        )
 
     metrics = {
         "loss_total": total_loss.detach(),
@@ -664,20 +704,6 @@ def evaluate_phase1_v2_health(
     del dual_explicit
     z_t = z_target_truth.detach().float()
 
-    # 1. Teacher alignment cosine
-    z_god_cos = float(F.cosine_similarity(z_pred, z_t, dim=-1).mean().item())
-
-    # 2. Relational Spearman correlation with 5-teacher consensus matrix
-    B = z_pred.size(0)
-    if B >= 3:
-        s_stu = compute_centered_cosine_matrix(z_pred)
-        s_tea = compute_teacher_consensus_similarity(batch_embs, z_t)
-        off_diag = ~torch.eye(B, dtype=torch.bool, device=z_pred.device)
-        relational_spearman = _spearman_rank_corr(s_stu[off_diag], s_tea[off_diag])
-    else:
-        relational_spearman = 1.0
-
-    # 3. Shuffled word-order self-cosine & order discrimination accuracy
     corrupted_tokens = make_word_order_corrupted_tokens(
         token_inputs, explicit_mask, pad_token_id=getattr(student, "pad_token_id", 0)
     )
@@ -685,49 +711,66 @@ def evaluate_phase1_v2_health(
     z_corrupt = dual_corrupt["z_god"].float()
     del dual_corrupt
 
-    shuffled_order_cos = float(F.cosine_similarity(z_pred, z_corrupt, dim=-1).mean().item())
-    if order_head is not None:
-        _, acc_t = order_head.compute_loss_and_acc(z_pred, z_corrupt)
-        order_discrim_acc = float(acc_t.item())
-    else:
-        cos_orig = F.cosine_similarity(z_pred, z_t, dim=-1)
-        cos_corr = F.cosine_similarity(z_corrupt, z_t, dim=-1)
-        order_discrim_acc = float((cos_orig > cos_corr).float().mean().item())
+    with _fp32_autocast_off(token_inputs.device.type):
+        # 1. Teacher alignment cosine
+        z_god_cos = float(F.cosine_similarity(z_pred, z_t, dim=-1).mean().item())
 
-    # 4. 32-D Subspace PC1 variance ratio & participation ratio on valid tokens
-    valid_mask = explicit_mask > 0
-    h_valid = h_sub[valid_mask]
-    n_valid, d_sub = h_valid.shape
-    if n_valid > 2:
-        h_centered = h_valid - h_valid.mean(dim=0, keepdim=True)
-        cov = torch.matmul(h_centered.t(), h_centered) / float(max(n_valid - 1, 1))
-        eigvals = torch.linalg.eigvalsh(cov).clamp(min=0.0)
-        eig_sum = eigvals.sum().clamp(min=1e-12)
-        subspace_pc1_var_ratio = float((eigvals[-1] / eig_sum).item())
-        subspace_participation_ratio = float(
-            ((eig_sum**2) / eigvals.pow(2).sum().clamp(min=1e-12)).item()
-        )
-    else:
-        subspace_pc1_var_ratio = 1.0 / float(d_sub)
-        subspace_participation_ratio = float(d_sub)
+        # 2. Relational Spearman correlation with 5-teacher consensus matrix
+        B = z_pred.size(0)
+        if B >= 3:
+            s_stu = compute_centered_cosine_matrix(z_pred)
+            s_tea = compute_teacher_consensus_similarity(batch_embs, z_t)
+            off_diag = ~torch.eye(B, dtype=torch.bool, device=z_pred.device)
+            relational_spearman = _spearman_rank_corr(s_stu[off_diag], s_tea[off_diag])
+        else:
+            relational_spearman = 1.0
 
-    # 5. Character identity top-1 accuracy from 32-D h_sub alone
-    if char_anchor_head is not None and n_valid > 0:
-        _, acc_char = char_anchor_head.compute_loss_and_acc(h_sub, token_inputs, explicit_mask)
-        subspace_char_top1_acc = float(acc_char.item())
-    elif n_valid > 0:
-        # Nearest class-centroid cosine probe on valid 32-D tokens
-        tokens_valid = token_inputs[valid_mask].long()
-        unique_ids, inv_idx = torch.unique(tokens_valid, return_inverse=True)
-        h_norm = F.normalize(h_valid, p=2, dim=-1)
-        centroids = torch.zeros(unique_ids.numel(), d_sub, device=h_valid.device, dtype=h_valid.dtype)
-        centroids.index_add_(0, inv_idx, h_norm)
-        centroids = F.normalize(centroids, p=2, dim=-1)
-        sims = torch.matmul(h_norm, centroids.t())
-        preds = unique_ids[sims.argmax(dim=-1)]
-        subspace_char_top1_acc = float((preds == tokens_valid).float().mean().item())
-    else:
-        subspace_char_top1_acc = 0.0
+        # 3. Shuffled word-order self-cosine & order discrimination accuracy
+        shuffled_order_cos = float(F.cosine_similarity(z_pred, z_corrupt, dim=-1).mean().item())
+        if order_head is not None:
+            _, acc_t = order_head.compute_loss_and_acc(z_pred, z_corrupt)
+            order_discrim_acc = float(acc_t.item())
+        else:
+            cos_orig = F.cosine_similarity(z_pred, z_t, dim=-1)
+            cos_corr = F.cosine_similarity(z_corrupt, z_t, dim=-1)
+            order_discrim_acc = float((cos_orig > cos_corr).float().mean().item())
+
+        # 4. 32-D Subspace PC1 variance ratio & participation ratio on valid tokens
+        valid_mask = explicit_mask > 0
+        h_valid = h_sub[valid_mask].float()
+        n_valid, d_sub = h_valid.shape
+        if n_valid > 2:
+            h_centered = h_valid - h_valid.mean(dim=0, keepdim=True)
+            cov = torch.matmul(h_centered.t(), h_centered) / float(max(n_valid - 1, 1))
+            eigvals = torch.linalg.eigvalsh(cov.to(dtype=torch.float32)).clamp(min=0.0)
+            eig_sum = eigvals.sum().clamp(min=1e-12)
+            subspace_pc1_var_ratio = float((eigvals[-1] / eig_sum).item())
+            subspace_participation_ratio = float(
+                ((eig_sum**2) / eigvals.pow(2).sum().clamp(min=1e-12)).item()
+            )
+        else:
+            subspace_pc1_var_ratio = 1.0 / float(d_sub)
+            subspace_participation_ratio = float(d_sub)
+
+        # 5. Character identity top-1 accuracy from 32-D h_sub alone
+        if char_anchor_head is not None and n_valid > 0:
+            _, acc_char = char_anchor_head.compute_loss_and_acc(h_sub, token_inputs, explicit_mask)
+            subspace_char_top1_acc = float(acc_char.item())
+        elif n_valid > 0:
+            # Nearest class-centroid cosine probe on valid 32-D tokens
+            tokens_valid = token_inputs[valid_mask].long()
+            unique_ids, inv_idx = torch.unique(tokens_valid, return_inverse=True)
+            h_norm = F.normalize(h_valid, p=2, dim=-1)
+            centroids = torch.zeros(
+                unique_ids.numel(), d_sub, device=h_valid.device, dtype=torch.float32
+            )
+            centroids.index_add_(0, inv_idx, h_norm)
+            centroids = F.normalize(centroids, p=2, dim=-1)
+            sims = torch.matmul(h_norm, centroids.t())
+            preds = unique_ids[sims.argmax(dim=-1)]
+            subspace_char_top1_acc = float((preds == tokens_valid).float().mean().item())
+        else:
+            subspace_char_top1_acc = 0.0
 
     if was_training:
         student.train()
